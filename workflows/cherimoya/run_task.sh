@@ -14,6 +14,7 @@
 #            ChromBPNet's measures on ChromBPNet's test peaks for the fold. It
 #            needs ChromBPNet's full model for that fold; until it exists the
 #            stage exits 3 ("waiting"), not 1, and a later run picks it up.
+#   A fold directory another run is working on is skipped with exit 4.
 #
 # Input:  <workdir>/fit.json, <workdir>/compare.json (make_jobs.py)
 # Output: <workdir>/cherimoya.fold_<k>.{torch,final.torch,log,detailed.log},
@@ -32,6 +33,11 @@ stages="${2:-all}"
 repo_root="${RVI_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "${workdir}" || { echo "ERROR: no directory ${workdir}" >&2; exit 1; }
 [[ -f fit.json && -f compare.json ]] || { echo "ERROR: ${workdir} has no fit.json/compare.json; run make_jobs.py" >&2; exit 1; }
+
+# One run per fold directory at a time: a second run would see no test
+# performance file yet and clear the first one's outputs.
+exec 9> .task.lock
+flock -n 9 || { echo "[$(date)] ${workdir}: another run holds it, skipped"; exit 4; }
 
 fold="${workdir%/}"
 fold="${fold##*/fold_}"

@@ -79,10 +79,15 @@ status="${box_dir}/status.tsv"
 printf 'dataset\tfold\tstages\texit\tseconds\tgpu\n' > "${status}"
 
 # Node-local scratch for temp files and the shared compile caches. A killed job
-# skips the EXIT trap, so clear what earlier runs of ours left first.
+# skips the EXIT trap, so clear what earlier jobs of ours left first -- but not
+# what another run in this same job is still using.
 scratch_root=/dev/shm
 [[ -d /raid && -w /raid ]] && scratch_root=/raid
-rm -rf "${scratch_root}/${USER}/cheri."* 2>/dev/null
+for old in "${scratch_root}/${USER}/cheri."*; do
+    [[ -d "${old}" ]] || continue
+    old_job="${old##*/cheri.}"
+    [[ "${old_job%%.*}" != "${SLURM_JOB_ID:-local}" ]] && rm -rf "${old}"
+done
 scratch="${scratch_root}/${USER}/cheri.${box_id}"
 export TMPDIR="${scratch}/tmp" TORCHINDUCTOR_CACHE_DIR="${scratch}/inductor" TRITON_CACHE_DIR="${scratch}/triton"
 mkdir -p "${TMPDIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
@@ -126,6 +131,7 @@ worker() {
             taskset -c "${cores}" bash "${repo_root}/workflows/cherimoya/run_task.sh" "${workdir}" "${stages}" \
             >> "${box_dir}/logs/${dataset}.fold_${fold}.log" 2>&1
         rc=$?
+        (( rc == 4 )) && continue   # another run has this fold
         (
             flock -x 8
             printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${dataset}" "${fold}" "${stages}" "${rc}" "$(( SECONDS - t0 ))" "${gpu}" >> "${status}"

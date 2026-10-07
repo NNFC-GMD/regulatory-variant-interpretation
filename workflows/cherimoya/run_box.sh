@@ -26,6 +26,7 @@
 #   CHERI_CORE_OFFSET     cores to skip, counted in the allowed set (default 0)
 #   CHERI_ONLY            only these datasets, space-separated (default: every ready row)
 #   CHERI_MAX_TASKS       stop after this many tasks have started (default: no limit)
+#   CHERI_ORDER           forward (default) or reverse: the order the queue is taken in
 #
 # Output: under ${CHERI_ROOT}/box/<job id>/: logs/<dataset>.fold_<k>.log,
 #         status.tsv (dataset, fold, exit, seconds, gpu), resources.tsv; and
@@ -99,6 +100,12 @@ awk -F'\t' -v only=" ${CHERI_ONLY:-} " -v stages="${stages}" '
     only != "  " && index(only, " " $1 " ") == 0 { next }
     stages == "compare" || $4 == "yes" { print $1 "\t" $2 "\t" $3 }
 ' "${tasks_tsv}" > "${queue}"
+# A second runner beside a first can take the list from the other end
+# (CHERI_ORDER=reverse), so the two meet in the middle instead of contending
+# for the same next fold (the fold lock would make one of them skip it).
+if [[ "${CHERI_ORDER:-forward}" == "reverse" ]]; then
+    tac "${queue}" > "${queue}.rev" && mv "${queue}.rev" "${queue}"
+fi
 n_tasks="$(wc -l < "${queue}")"
 echo "[$(date)] box ${box_id} on $(hostname): ${n_tasks} task(s), stages ${stages}," \
      "GPUs ${gpus[*]} x ${slots_per_gpu} slot(s), ${cores_per_slot} cores each from core ${core_offset}"

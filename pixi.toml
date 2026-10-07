@@ -1,0 +1,47 @@
+[workspace]
+name = "regulatory-variant-interpretation"
+description = "Sequence-to-function models of chromatin accessibility, for interpreting regulatory variants"
+channels = ["conda-forge", "bioconda"]
+platforms = ["linux-64"]
+
+# Environments:
+#
+#   default     lint and tests; no torch, no GPU
+#   cherimoya   training, evaluation and the ChromBPNet comparison
+#               (workflows/cherimoya/); CUDA 13 torch, NVIDIA driver >= 580
+#
+# Each tool environment has its own solve group, so one tool's pins cannot move
+# another's.
+
+[dependencies]
+python = ">=3.12,<3.14"
+numpy = ">=2.0"
+scipy = ">=1.12"
+pyyaml = ">=6.0"
+pytest = ">=8"
+ruff = ">=0.6"
+shellcheck = ">=0.10"
+
+# Cherimoya (jmschrei/cherimoya), pinned: its README warns that versions may
+# break checkpoint loading, so a model trained here reloads only with this one.
+# torch from PyPI: the default Linux wheel of 2.14.0 is the CUDA 13.0 build
+# (NVIDIA driver >= 580), and it brings the triton Cherimoya's kernels need.
+# Everything else (tangermeme, lightning, pyfaidx, pyBigWig, h5py, ...) comes in
+# as Cherimoya's own requirements.
+[feature.cherimoya.dependencies]
+python = ">=3.12,<3.13"
+pyyaml = ">=6.0"
+
+[feature.cherimoya.pypi-dependencies]
+cherimoya = "==0.3.0"
+torch = "==2.14.0"
+
+[environments]
+cherimoya = { features = ["cherimoya"], no-default-feature = true, solve-group = "cherimoya" }
+
+[tasks]
+lint = "ruff check workflows tests"
+fmt = "ruff format workflows tests"
+check-bash = "bash -c 'for f in workflows/*/*.sh workflows/*/*.sbatch; do bash -n \"$f\" || exit 1; done; shellcheck -S warning workflows/*/*.sh workflows/*/*.sbatch'"
+test = "pytest -q tests"
+check = { depends-on = ["check-bash", "lint", "test"] }

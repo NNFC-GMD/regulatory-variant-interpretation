@@ -85,7 +85,15 @@ CHERI_ROOT=<out-root> CHERI_GPUS=7 CHERI_SLOTS_PER_GPU=1 CHERI_CORE_OFFSET=200 \
 CHERI_ROOT=<out-root> CHERI_STAGES=compare ... run_box.sh
 
 pixi run -e cherimoya python workflows/cherimoya/summarize.py --root <out-root> --out-dir <dir>
+pixi run -e cherimoya python workflows/cherimoya/plot_comparison.py \
+    --paired <dir>/comparison_paired.tsv --out <dir>/comparison_counts
 ```
+
+`plot_comparison.py` draws one scatter panel per measure, ChromBPNet on x and
+Cherimoya on y. The default measures are counts Pearson and Spearman. There is
+one dot per dataset and fold, so a fully scored dataset shows five dots. Each
+dataset gets an Okabe-Ito colour plus a marker shape that changes every eight
+datasets.
 
 Each fold's outputs land in `<out-root>/<dataset>/fold_<k>/`:
 

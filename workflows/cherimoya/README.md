@@ -219,3 +219,35 @@ of a sibling fold already converted. Each file goes through `.partial` and a
 rename, the provenance last; a rerun whose sources and outputs still match the
 provenance does nothing, and `--force` converts again. It streams the npz files
 in blocks: about 2 GB of RAM and 20 s per 40,000 rows at W = 1000.
+
+Two checks of a whole dataset come with it, each writing a JSON report to
+`<output_dir>/validation/` and exiting 0 only when everything passes:
+
+- `--check-dataset <dataset> --root <out-root> [--against chrombpnet|fasta]`,
+  before 06.0: every fold converted from its current attribution, one idx mask
+  and one bed (byte for byte) across the folds, then the centring, base order
+  and rows. Against ChromBPNet's own 05.0 files of the same fold (found through
+  the fold's `compare.json`), joined by peak name: the ohe equals ChromBPNet's
+  `raw/seq[:, :, 557:1557]` at W = 1000, on every row of the first fold and
+  2,000 rows of the others, and the rows only ChromBPNet has are exactly those
+  with a column of zeros. Against the genome, for datasets ChromBPNet did not
+  interpret: on 2,000 rows of every fold, the one-hot of the window's central
+  W bases is the ohe, and every dropped row's window holds a letter other than
+  A, C, G or T.
+- `--check-average <dataset> --root <out-root>`, after 06.0: the average has
+  the first fold's rows and raw/seq, and on 1,000 rows its float16 values are
+  the average recomputed from the npz files with 06.0's arithmetic, bit for bit.
+
+`downstream.sh <list.txt> [...]` runs a box's datasets through all of it and
+then through igvf_tf_chrombpnet's own 06.0, 07.0 and 08.0 step files, unchanged
+(`REPO_ROOT` names the checkout; `CHERI_ROOT` and `BOX_DIR` are required too):
+once `attr_status.py` calls every fold DONE, it converts the folds, runs the
+dataset check, 06.0 and the average check, then 07.0 beside 08.0 in the
+background (at most `CHERI_08_MAX` 08.0 runs at once on the node, taken in list
+order) and goes on with the next dataset. Each step is pinned to the least busy
+CPUs it may use (`pick_cores.py`), with its thread counts set and no GPU, and
+leaves a marker in `<output_dir>/.done/` and a row (exit, seconds, max RSS) in
+`${BOX_DIR}/cheri_downstream.tsv`. A rerun skips what is marked, moves an
+output without its marker aside (`.incomplete.<time>`) and redoes that step
+and the ones after it. Datasets waiting for their attribution wait while an
+attribution runner holds the box; the script's header lists every knob.

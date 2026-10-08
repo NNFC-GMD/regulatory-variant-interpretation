@@ -15,11 +15,13 @@
 #
 # A task whose ChromBPNet model is not trained yet trains, then leaves its
 # comparison waiting (run_task.sh exit 3); a later run with CHERI_STAGES=compare
-# picks those up. Tasks skip finished stages, so resubmitting resumes.
+# picks those up. CHERI_STAGES=attribute waits the same way for folds whose fit
+# is not done. Tasks skip finished stages, so resubmitting resumes.
 #
 # Knobs (environment):
 #   CHERI_ROOT            make_jobs.py's --out-root (required)
-#   CHERI_STAGES          fit,compare (default), fit, or compare
+#   CHERI_STAGES          fit,compare (default), fit, compare, or attribute
+#                         (run_task.sh's stages; attribute's own knobs are in run_task.sh)
 #   CHERI_GPUS            GPU indices to use, comma-separated (default: all)
 #   CHERI_SLOTS_PER_GPU   concurrent tasks per GPU (default 2)
 #   CHERI_CORES_PER_SLOT  cores pinned per task (default 8)
@@ -175,6 +177,6 @@ for gpu in "${gpus[@]}"; do
 done
 wait "${pids[@]}"
 
-awk -F'\t' 'NR > 1 { n[$4 == 0 ? "done" : $4 == 3 ? "waiting for ChromBPNet" : "failed"]++ }
+awk -F'\t' 'NR > 1 { n[$4 == 0 ? "done" : $4 == 3 ? "waiting" : "failed"]++ }
     END { for (k in n) printf "  %s: %d\n", k, n[k] }' "${status}"
 echo "[$(date)] box ${box_id} finished; status ${status}"

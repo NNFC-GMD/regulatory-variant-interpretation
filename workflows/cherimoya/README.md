@@ -109,21 +109,78 @@ The box log, `status.tsv` and `resources.tsv` go to `<out-root>/box/<job>/`.
 whose ChromBPNet fold is not trained yet exits 3 ("waiting") instead of
 failing.
 
-## Downstream (not run yet)
+## Downstream: attribution, and ChromBPNet's own steps after it
 
-Cherimoya's own `pipeline` stops after TF-MoDISco and motif marginalisation,
-with no Fi-NeMo. Its outputs are compatible with the tools the ChromBPNet
-pipeline runs after training, though:
+After training, every fold goes through the steps igvf_tf_chrombpnet runs
+after ChromBPNet's: DeepLIFT/SHAP on the counts head over every peak, the
+fold average (06.0), the bigwig (07.0), TF-MoDISco (08.0), the cross-dataset
+compendium (09.0), Fi-NeMo (10.0) and its report (11.0). The attributions come
+from `attribute_fast.py` (`cherimoya attribute` computed by `cheri_dls`, each
+run audited against the stock `deep_lift_shap` on 8 peaks); 06.0-11.0 are
+igvf_tf_chrombpnet's own step files, run on the attributions converted to
+its 05.0 layout.
 
-- `cherimoya attribute` writes the one-hot and hypothetical-contribution
-  `.npz` pair that TF-MoDISco reads;
-- Fi-NeMo accepts regions in that same format.
+```bash
+# once: each fold's attribute.json, each dataset's igvf config, the compendium lists
+python workflows/cherimoya/make_downstream.py \
+    --cheri-root <out-root> \
+    --chrombpnet-configs <chrombpnet configs>/*/config.yaml \
+    --shared <datasets compared with ChromBPNet, one per line> \
+    --compendia <compendia root>
 
-So the downstream can match igvf_tf_chrombpnet step for step:
+# sign the engine off once (after a full fold is checked): the sha256 of its three files
+python workflows/cherimoya/attr_status.py --write-pin workflows/cherimoya --root <out-root>
 
-1. DeepLIFT/SHAP on the counts head over all peaks, per fold;
-2. the fold average;
-3. TF-MoDISco (the NNFC-GMD/tfmodisco fork 08.0 uses);
-4. Fi-NeMo.
+# attribute every trained fold; repeat passes until every fold is done or failed
+CHERI_ROOT=<out-root> CHERI_STAGES=attribute CHERI_SLOTS_PER_GPU=1 CHERI_CORES_PER_SLOT=4 \
+    srun --jobid <job> --overlap bash workflows/cherimoya/run_box.sh
+python workflows/cherimoya/attr_status.py --root <out-root> --summary [--settled]
+```
 
-None of it is wired up here yet.
+What `make_downstream.py` writes, per fold, in `<out-root>/<dataset>/fold_<k>/attribute.json`:
+
+- the fold's model (`cherimoya.fold_<k>.torch`) and its peaks file (fit.json's
+  `loci`, the narrowPeak ChromBPNet's 05.0 scores too);
+- every chromosome of the fold's training, validation and test lists
+  (Cherimoya's default is training and validation only), and every peak must
+  lie on one, so the idx mask has one entry per narrowPeak row;
+- a window of `attr_window` = 1000 bp around the summit, the narrowest that
+  holds the bases 08.0 (`modisco -w 500`) and 10.0 (`--region-width 1000`)
+  read;
+- 20 shuffles (checked against ChromBPNet's `interpret.args.json`), the counts
+  head, `random_state` 1234 + 100 x fold: tangermeme seeds reference k of
+  every peak with `random_state + k`, so folds closer than 20 apart would share
+  references and the fold average would not average reference noise out;
+- `batch_size` 64, which only sets the engine's head rows (2 x 64, as
+  validated); the audit's stock run is capped at 20. A stock
+  `cherimoya attribute` rerun of the JSON must set `batch_size` 20: stock at 64
+  needs about 15.5 GB of GPU memory;
+- the outputs `attr.ohe.npz`, `attr.attr.npz` and `attr.idx.npy` in the fold
+  directory, plus attribute_fast.py's `attr.attr.deltas.npy` and
+  `attr.attr.meta.json`;
+- the `fast` block: reference precision, `mem_budget_gb` 7.5 (about 7 GB of GPU
+  memory), 3 reference workers (4 cores per process), audit 8.
+
+It also writes `<out-root>/configs/<dataset>/config.yaml`, the minimal igvf
+config for 06.0-11.0 (`output_dir` `<out-root>/<dataset>/downstream`, counts
+only, no bias suffix), and `<compendia>/inputs/`: the shared and other dataset
+lists and the `label<TAB>config.yaml` lists of each compendium (`cbp_` and
+`cheri_` labels).
+
+`run_task.sh <fold> attribute` (not part of `all`) waits (exit 3) until the
+fit is done, skips a fold `attr_status.py` calls DONE, refuses an engine whose
+files do not hash to the pin, clears the fold's earlier attribution files and
+runs `attribute_fast.py`. A failed audit exits 1 and keeps the outputs; later
+runs leave that fold alone unless `CHERI_ATTR_RERUN_FAILED=1`. From a worktree
+without installed environments, set `CHERI_PIXI_MANIFEST` to the main
+checkout's `pixi.toml`; `CHERI_ATTRIBUTE_FAST` names the engine to run and
+`CHERI_ATTR_ARGS` adds flags (e.g. `--seqs-per-step 4` for a second process on
+a GPU).
+
+`attr_status.py` is the one definition of DONE: the four outputs and the meta,
+the meta newer than the model (a refit makes the attribution stale), a passed
+audit, finite outputs of shape (kept, 4, W) that agree with the idx mask, one
+mask entry per peak, the parameters and seeds of `attribute.json`, and the
+engine's sha256 equal to the pin `<out-root>/attribution_engine.json`. States:
+done, running, waiting, stale, failed, missing. A fold attributed by the stock
+command instead is accepted through `attr.attr.stock.json` (see its doc).

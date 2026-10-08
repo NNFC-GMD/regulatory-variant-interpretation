@@ -53,6 +53,12 @@ Also covered:
   steps run at the halved S and the results equal, bit for bit, a deterministic engine that ran at that S from the
   start. Injected in the second step, the first step's peaks keep S = 4 and the rest run at 2, bit for bit as the
   S = 4 and S = 2 engines compute them, and every peak is attributed once.
+- The reference pool starts before the warm-up. On a small deterministic run with produced references (2 workers),
+  whose warm-up is held to at least WARMUP_FLOOR_S, the first step does not wait for references (first_wait_s 0, no
+  stall at all), and the results equal, bit for bit, the same engine's run with the same references injected. With
+  the pool started after the warm-up, as before, the first step would wait for the workers to spawn.
+- The pool draws chunks of the planned S before the warm-up. A warm-up that halves S = 5 to 2 re-cuts them: the run
+  takes the 7 steps and 1 padded peak of an engine planned at S = 2, with its results bit for bit.
 
 Measured values are written to the terminal.
 """
@@ -64,11 +70,13 @@ import re
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+np = pytest.importorskip("numpy")
 torch = pytest.importorskip("torch")
 pytest.importorskip("tangermeme")
 pytest.importorskip("cherimoya")
@@ -78,6 +86,7 @@ sys.path.insert(0, str(REPO / "workflows" / "cherimoya"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cheri_dls  # noqa: E402
+import dls_refs  # noqa: E402
 import dls_tiny  # noqa: E402
 from cherimoya import Cherimoya  # noqa: E402
 
@@ -96,6 +105,7 @@ D3_FACTOR = 1.3
 D4_MAX = 1e-5
 REAL_K, REAL_S, REAL_PEAKS = 20, 4, 13  # 13 peaks in steps of 4: 3 full steps and 1 padded
 REAL_LENGTH = 2114
+WARMUP_FLOOR_S = 15.0  # the pool-overlap test holds its warm-up to at least this; a real-model compile takes 5-45 s
 CHILD_TIMEOUT_S = 1800
 RETAINED_MAX = 100e6  # bytes a run may leave allocated: cotangent, weights, cuBLAS workspaces; a step is 3 GB
 
@@ -609,3 +619,72 @@ def test_oom_in_a_step_halves_the_step_and_retries_it(pytestconfig):
         ours = getattr(got, name)
         assert torch.equal(ours[:4], getattr(by_4, name)[:4]), name
         assert torch.equal(ours[4:], getattr(by_2, name)[4:]), name
+
+
+# The reference pool and the warm-up ---------------------------------------------------------------------------------
+
+
+def _hold_warm_up(engine: cheri_dls.Engine, seconds: float) -> dict:
+    """Make engine's warm-up last at least `seconds`, as a cold compile of the real model does; returns its timings."""
+    timing: dict = {}
+    warm_up = engine._warm_up
+
+    def held(*args, **kwargs):
+        began = time.perf_counter()
+        S = warm_up(*args, **kwargs)
+        timing["warm_up_s"] = time.perf_counter() - began
+        time.sleep(max(0.0, seconds - timing["warm_up_s"]))
+        timing["held_s"] = time.perf_counter() - began
+        return S
+
+    engine._warm_up = held
+    return timing
+
+
+def test_the_reference_pool_draws_during_the_warm_up(pytestconfig):
+    """Produced references, 2 workers: the first step finds its references drawn, and the results are unchanged."""
+    X, R = _case("C", "shuffled")  # dls_tiny's shuffles are deep_lift_shap's own draw, with random_state 0
+    start, end = _window(X.shape[-1], X.shape[-1] // 4)
+    engine = _tiny_engine(
+        "C", seqs_per_step=4, precision="fp32", deterministic=True, n_shuffles=K_TINY, random_state=0, ref_workers=2
+    )
+    timing = _hold_warm_up(engine, WARMUP_FLOOR_S)
+    produced = engine.run(X, start, end)
+    del engine._warm_up  # the injected run warms up as usual
+    stats = produced.meta["reference_stats"]
+    injected = engine.run(X, start, end, references=R)
+    _report(
+        pytestconfig,
+        f"pool during the warm-up: warm-up {timing['warm_up_s']:.1f} s, held to {timing['held_s']:.1f} s; reference "
+        f"stats {stats}; steps {produced.meta['steps']}, padded {produced.meta['padded_peaks']}",
+    )
+    assert produced.meta["references"] == "produced" and injected.meta["references"] == "injected"
+    assert stats["first_wait_s"] == 0.0 and stats["stalls"] == 0 and stats["chunks"] == 4
+    for name in ("attr", "deltas", "y_x", "y_r"):
+        assert torch.equal(getattr(produced, name), getattr(injected, name)), name
+    for key in ("steps", "padded_peaks", "seqs_per_step", "host_syncs"):
+        assert produced.meta[key] == injected.meta[key], key
+
+
+def test_a_warm_up_halving_recuts_the_pools_chunks(pytestconfig):
+    """S = 5 halves to 2 in the warm-up, after the pool started drawing chunks of 5 peaks."""
+    X, R = _case("C", "shuffled")
+    start, end = _window(X.shape[-1], X.shape[-1] // 4)
+    kwargs = dict(precision="fp32", deterministic=True, n_shuffles=K_TINY, random_state=0)
+    engine = _tiny_engine("C", seqs_per_step=5, ref_workers=2, **kwargs)
+    calls = _inject_oom(engine, at_call=1, when_s=5)
+    got = engine.run(X, start, end, keep_references=list(range(len(X))))
+    expected = _tiny_engine("C", seqs_per_step=2, **kwargs).run(X, start, end, references=R)
+    _report(
+        pytestconfig,
+        f"warm-up halving 5 -> 2 with the pool drawing chunks of 5: device steps by S {calls}; steps "
+        f"{got.meta['steps']}, padded {got.meta['padded_peaks']} (an S = 2 engine: {expected.meta['steps']}, "
+        f"{expected.meta['padded_peaks']})",
+    )
+    assert got.meta["oom"] == [{"step": "warm-up", "from": 5, "to": 2}]
+    assert calls == [5, 2] + [2] * 7
+    steps = (got.meta["steps"], got.meta["padded_peaks"])
+    assert steps == (expected.meta["steps"], expected.meta["padded_peaks"]) == (7, 1)
+    np.testing.assert_array_equal(got.references, dls_refs.onehot_to_tokens(R))
+    for name in ("attr", "deltas", "y_x", "y_r"):
+        assert torch.equal(getattr(got, name), getattr(expected, name)), name

@@ -169,7 +169,8 @@ class RefProducer:
 
     Use it as a context manager, or call start() and close(). One producer serves any number of chunks() runs.
     `stats` describes the latest run: chunks, pairs, stalls (chunks not ready when asked for), wait_s (time the
-    consumer spent blocked on them) and max_in_flight.
+    consumer spent blocked on them), first_wait_s (the part of it spent on the first chunk, 0.0 when that chunk was
+    ready: a start-up stall) and max_in_flight.
     """
 
     def __init__(self, workers: int | None = None, *, ahead: int = 3) -> None:
@@ -237,6 +238,7 @@ class RefProducer:
             "pairs": len(tokens) * n_shuffles,
             "stalls": 0,
             "wait_s": 0.0,
+            "first_wait_s": None,
             "max_in_flight": 0,
         }
         self.stats = stats
@@ -262,11 +264,15 @@ class RefProducer:
         try:
             while pending:
                 a, b, future = pending.popleft()
+                waited = 0.0
                 if not future.done():
                     stats["stalls"] += 1
                     start = time.perf_counter()
                     future.exception()  # waits without raising, so the wait is counted either way
-                    stats["wait_s"] += time.perf_counter() - start
+                    waited = time.perf_counter() - start
+                    stats["wait_s"] += waited
+                if stats["first_wait_s"] is None:
+                    stats["first_wait_s"] = waited
                 refs = future.result()
                 self._fill(pool, pending, bounds, task, stats)
                 yield a, b, refs
@@ -280,8 +286,11 @@ class RefProducer:
         for a, b in bounds:
             start = time.perf_counter()
             refs = shuffle_tokens(tokens[a:b], n_shuffles, random_state)
+            waited = time.perf_counter() - start
             stats["stalls"] += 1
-            stats["wait_s"] += time.perf_counter() - start
+            stats["wait_s"] += waited
+            if stats["first_wait_s"] is None:
+                stats["first_wait_s"] = waited
             yield a, b, refs
 
 

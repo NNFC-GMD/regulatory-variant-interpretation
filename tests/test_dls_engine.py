@@ -65,7 +65,9 @@ only to float32 accuracy.
 
 Also covered:
 - references produced by dls_refs.RefProducer, in process and in a 2-process pool, equal the injected shuffles bit
-  for bit;
+  for bit; a run keeps the references of the peaks it is asked to (keep_references, for attribute_fast.py's audit);
+  the pool starts before the counts cotangent (and, on CUDA, before the warm-up); _recut re-cuts the pool's chunks
+  when the warm-up halves the step size;
 - the engine's argument checks, numpy inputs, and group None on a one-group model;
 - a single summary warning for high deltas, with tangermeme's strict comparison against the threshold;
 - the GPU engine's pieces that need no GPU: forward_stats="cpu_mirror" and compile="default" are refused where they
@@ -89,6 +91,7 @@ from pathlib import Path
 
 import pytest
 
+np = pytest.importorskip("numpy")
 torch = pytest.importorskip("torch")
 pytest.importorskip("tangermeme")
 pytest.importorskip("cherimoya")
@@ -97,6 +100,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "workflows" / "cher
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cheri_dls  # noqa: E402
+import dls_refs  # noqa: E402
 import dls_tiny  # noqa: E402
 from cherimoya import ControlWrapper, LogCountWrapper  # noqa: E402
 from cherimoya.cheri import CONV_NORM_EPS, _cheri_conv  # noqa: E402
@@ -885,6 +889,76 @@ def test_produced_references_are_the_injected_shuffles(workers, pytestconfig):
         f"RefProducer, {workers} worker(s): {N_SEQUENCES * k} pairs bitwise equal to the injected shuffles "
         f"(raw and run); reference stats {produced_run.meta['reference_stats']}",
     )
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_a_run_keeps_the_references_it_used(workers):
+    """keep_references: the run returns the references of the kept peaks as it used them, produced or injected.
+
+    attribute_fast.py's audit injects these into the stock deep_lift_shap. Config B, steps of 4, K = 3: the kept peaks
+    straddle the steps, and the last one sits in the padded step.
+    """
+    rs, k = 7, 3
+    X = dls_tiny.sequences("B")
+    R = dls_tiny.shuffled_references(X, k, random_state=rs)
+    keep = [0, 3, 4, 9, 12]
+    start, end = _window("B")
+    engine = _engine("B", torch.float32, n_shuffles=k, random_state=rs, ref_workers=workers, seqs_per_step=4)
+    produced = engine.run(X, start, end, keep_references=keep)
+    injected = engine.run(X, start, end, references=R, keep_references=np.array(keep))
+    expected = dls_refs.onehot_to_tokens(R[keep])
+    for result in (produced, injected):
+        assert result.references.dtype == np.uint8 and result.references.shape == (len(keep), k, X.shape[-1])
+        np.testing.assert_array_equal(result.references, expected)
+        assert result.meta["kept_references"] == len(keep)
+    assert torch.equal(produced.attr, injected.attr)
+    assert engine.run(X, start, end, references=R).references is None
+    assert engine.run(X, start, end, references=R, keep_references=[]).references.shape == (0, k, X.shape[-1])
+    for bad in ([3, 1], [0, 0], [-1], [13], [[1, 2]], [0.5], np.array([True, False])):
+        with pytest.raises(ValueError, match="keep_references"):
+            engine.run(X, start, end, references=R, keep_references=bad)
+
+
+def test_the_reference_pool_starts_before_the_counts_cotangent_and_the_steps(monkeypatch):
+    """_execute starts the reference pool first, so on CUDA its first chunks are drawn during the warm-up's compile.
+
+    On the CPU there is no warm-up; the order is the same code path: the pool's chunks() has been called, and has
+    submitted its first chunks, by the time the counts cotangent is computed.
+    """
+    calls = []
+    real_chunks, real_cotangent = dls_refs.RefProducer.chunks, cheri_dls.Engine._counts_cotangent
+
+    def chunks(self, *args, **kwargs):
+        calls.append("chunks")
+        return real_chunks(self, *args, **kwargs)
+
+    def cotangent(self, length):
+        calls.append("cotangent")
+        return real_cotangent(self, length)
+
+    monkeypatch.setattr(dls_refs.RefProducer, "chunks", chunks)
+    monkeypatch.setattr(cheri_dls.Engine, "_counts_cotangent", cotangent)
+    X = dls_tiny.sequences("A")[:5]
+    engine = _engine("A", torch.float32, n_shuffles=2, ref_workers=0, seqs_per_step=2)
+    result = engine.run(X, *_window("A"))
+    assert calls == ["chunks", "cotangent"]
+    assert result.meta["references"] == "produced" and result.meta["steps"] == 3
+
+
+def test_recut_cuts_consecutive_chunks_into_steps_of_the_new_size():
+    """_recut: what the engine does to the pool's chunks when the warm-up halves S (from 5 to 2 here)."""
+    rng = np.random.default_rng(0)
+    refs = rng.integers(0, 4, size=(13, 3, 7), dtype=np.uint8)
+    chunks = [(a, min(a + 5, 13), refs[a : a + 5]) for a in range(0, 13, 5)]
+    got = list(cheri_dls._recut(iter(chunks), 2))
+    assert [(a, b) for a, b, _ in got] == [(a, min(a + 2, 13)) for a in range(0, 13, 2)]
+    for a, b, r in got:
+        np.testing.assert_array_equal(r, refs[a:b])
+    assert [(a, b) for a, b, _ in cheri_dls._recut(iter(chunks), 5)] == [(0, 5), (5, 10), (10, 13)]
+    assert [(a, b) for a, b, _ in cheri_dls._recut(iter(chunks), 1)] == [(a, a + 1) for a in range(13)]
+    assert list(cheri_dls._recut(iter([]), 2)) == []
+    with pytest.raises(RuntimeError, match="consecutive"):
+        list(cheri_dls._recut(iter([chunks[0], chunks[2]]), 2))
 
 
 def test_engine_arguments():

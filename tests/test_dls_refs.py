@@ -195,9 +195,12 @@ def test_shuffle_tokens_in_process_matches_tangermeme(sequences, truth):
 
     with dls_refs.RefProducer(workers=0) as producer:
         parts = list(producer.chunks(tokens[rows], K, RANDOM_STATES[1], SEQS_PER_CHUNK))
+        stats = dict(producer.stats)
     assert [(a, b) for a, b, _ in parts] == [
         (a, min(a + SEQS_PER_CHUNK, len(rows))) for a in range(0, len(rows), SEQS_PER_CHUNK)
     ]
+    # in process, every chunk is drawn when it is asked for: each one is a stall, the first one too
+    assert stats["stalls"] == stats["chunks"] and 0.0 < stats["first_wait_s"] <= stats["wait_s"]
     got = np.concatenate([refs for _, _, refs in parts])
     assert not _mismatches(names, got, truth[RANDOM_STATES[1]], rows)
 
@@ -222,6 +225,8 @@ def test_pool_references_equal_tangermeme(sequences, truth, workers, pytestconfi
             assert bounds == expected_bounds
             stats = dict(producer.stats)
             assert stats["max_in_flight"] == min(producer.window, len(expected_bounds))
+            assert 0.0 <= stats["first_wait_s"] <= stats["wait_s"]
+            assert (stats["first_wait_s"] > 0.0) <= (stats["stalls"] > 0)
 
             bad = _mismatches(names, got, truth[rs], list(range(n)))
             assert not bad, f"{len(bad)} of {n * K} pairs differ from tangermeme (random_state={rs}): {bad[:5]}"
@@ -230,7 +235,8 @@ def test_pool_references_equal_tangermeme(sequences, truth, workers, pytestconfi
                 pytestconfig,
                 f"{workers} worker(s), random_state={rs} ({'cold pool, includes spawn' if run == 0 else 'warm pool'}): "
                 f"{pairs}/{pairs} pairs equal; {pairs / seconds:.0f} pairs/s = {pairs / seconds / workers:.0f} "
-                f"per worker; consumer waited {stats['wait_s']:.2f} s on {stats['stalls']} of {stats['chunks']} chunks",
+                f"per worker; consumer waited {stats['wait_s']:.2f} s on {stats['stalls']} of {stats['chunks']} chunks "
+                f"({stats['first_wait_s']:.2f} s on the first)",
             )
 
 

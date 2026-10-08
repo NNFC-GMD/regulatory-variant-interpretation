@@ -63,12 +63,12 @@ a whole set of peaks, on the CPU or on a CUDA GPU (§4-§12). The counts head is
   - On CUDA, forward_save, backward_pass and epilogue run under torch.compile as fwd_c, bwd_c and epi_c (§11):
     fullgraph, static shapes, default mode, the weights passed as arguments, so the 9 blocks unroll into one graph
     each way and every GEMM stays an extern cuBLAS call. iconv, its input gradient and the counts head stay eager.
-    Each run starts with a warm-up step on random tokens, which compiles, lets cudnn.benchmark time its algorithms
-    and meets any out-of-memory error before the reference pool starts. The steps are pipelined: uint8 tokens go to
-    the GPU from pinned buffers on a copy stream, results come back non_blocking into pinned buffers, and the host
-    waits once per step, on the previous step's event, averaging that step while the GPU runs the next. An
-    out-of-memory error empties the allocator's cache, halves S (shapes change, so the passes recompile) and retries
-    the step.
+    Each run starts the reference pool, then a warm-up step on random tokens, which compiles, lets cudnn.benchmark
+    time its algorithms and meets any out-of-memory error while the pool draws the first references. The steps are
+    pipelined: uint8 tokens go to the GPU from pinned buffers on a copy stream, results come back non_blocking into
+    pinned buffers, and the host waits once per step, on the previous step's event, averaging that step while the GPU
+    runs the next. An out-of-memory error empties the allocator's cache, halves S (shapes change, so the passes
+    recompile) and retries the step.
 
 Deliberate differences from the reference:
 - The counts head casts the pooled stream to the count Linear's dtype, where CH/cherimoya.py:458 calls ``.float()``.
@@ -981,6 +981,54 @@ def _substeps(a: int, b: int, refs: np.ndarray, S: int) -> Iterator[tuple[int, i
         yield a + j, min(a + j + S, b), refs[j : j + S]
 
 
+def _recut(chunks: Iterator[tuple[int, int, np.ndarray]], S: int) -> Iterator[tuple[int, int, np.ndarray]]:
+    """Consecutive chunks (a, b, references of peaks [a, b)), re-cut into chunks of S peaks: [a0, a0 + S), ...
+
+    The reference pool starts drawing before the warm-up, in chunks of the planned step size. When the warm-up halves
+    that size, the engine re-cuts the chunks with this, so the run takes exactly the steps, and pads exactly the peaks,
+    it would have had the pool drawn chunks of the new size. Only the last chunk is shorter.
+    """
+    held: list[np.ndarray] = []
+    a: int | None = None
+    n = 0
+    for start, b, refs in chunks:
+        if a is None:
+            a = start
+        if start != a + n or b - start != len(refs):
+            raise RuntimeError(f"reference chunks are not consecutive: got [{start}, {b}) after [{a}, {a + n})")
+        held.append(refs)
+        n += b - start
+        while n >= S:
+            block = held[0] if len(held) == 1 else np.concatenate(held)
+            yield a, a + S, block[:S]
+            held = [block[S:]] if len(block) > S else []
+            a, n = a + S, n - S
+    if n:
+        yield a, a + n, held[0] if len(held) == 1 else np.concatenate(held)
+
+
+def _keeping(
+    chunks: Iterator[tuple[int, int, np.ndarray]], keep: np.ndarray, out: np.ndarray
+) -> Iterator[tuple[int, int, np.ndarray]]:
+    """Pass chunks through, copying the references of the peaks in `keep` (sorted) into out[i] as they go by."""
+    for a, b, refs in chunks:
+        lo, hi = np.searchsorted(keep, [a, b])
+        for i in range(lo, hi):
+            out[i] = refs[keep[i] - a]
+        yield a, b, refs
+
+
+def _keep_indices(keep: object, n: int) -> np.ndarray:
+    """keep_references as a sorted int64 array of distinct peak indices in [0, n), or ValueError."""
+    k = np.asarray(keep)
+    if k.ndim != 1 or (k.size and not np.issubdtype(k.dtype, np.integer)):
+        raise ValueError(f"keep_references must be a 1-D sequence of peak indices, got {keep!r}")
+    k = k.astype(np.int64)
+    if k.size and (k[0] < 0 or k[-1] >= n or bool((np.diff(k) <= 0).any())):
+        raise ValueError(f"keep_references must be increasing peak indices in [0, {n}), got {k.tolist()}")
+    return k
+
+
 class RawResult(NamedTuple):
     """Engine.raw()'s output: CPU tensors in the engine's dtype."""
 
@@ -999,6 +1047,7 @@ class Result(NamedTuple):
     y_x: torch.Tensor  # (N,)
     y_r: torch.Tensor  # (N, K)
     meta: dict  # debug's keys, plus the window, the wall time and pairs/s
+    references: np.ndarray | None = None  # (len(keep_references), K, L) uint8 tokens of the kept peaks' references
 
 
 class _StepOutputs(NamedTuple):
@@ -1068,9 +1117,10 @@ class Engine:
       fullgraph=True, dynamic=False and the default mode, one isolated set of compiled entries per engine. The
       weights are arguments, so the 9 blocks unroll into one graph each way, and every GEMM stays an extern cuBLAS
       call. iconv, its input gradient and the counts head run eagerly, with exactly the reference's ops.
-    - Every run() or raw() call first runs a warm-up step on random tokens. It compiles (from the Inductor cache when
-      it can), lets cudnn.benchmark time its algorithms, and meets an out-of-memory error before the reference pool
-      starts. Its time is recorded as compile_s. Compiling leaves the traced step's tensors in reference cycles, so a
+    - Every run() or raw() call starts the reference pool, then runs a warm-up step on random tokens. It compiles
+      (from the Inductor cache when it can), lets cudnn.benchmark time its algorithms, and meets an out-of-memory
+      error, while the pool draws the first chunks of references, so the first steps do not wait for the pool to
+      start. Its time is recorded as compile_s. Compiling leaves the traced step's tensors in reference cycles, so a
       gc.collect() follows every step that compiled.
     - Steps are pipelined. A step's uint8 tokens are written into a pinned buffer and copied to the device on a copy
       stream; the step waits for that copy on the GPU, runs, and copies its results non_blocking into pinned buffers.
@@ -1222,18 +1272,27 @@ class Engine:
         end: int,
         *,
         references: torch.Tensor | np.ndarray | None = None,
+        keep_references: object = None,
     ) -> Result:
         """Hypothetical attributions over the window [start, end), averaged over each sequence's references.
 
         This is ``deep_lift_shap(wrapper, X, hypothetical=True, ...)[:, :, start:end]`` as `cherimoya attribute` calls
         it (attribute.py:88-101), before its ``.float()``. X and references are as in raw(). Also returns the
         convergence deltas and outputs per pair, and warns once if any delta exceeds warning_threshold.
+
+        keep_references: increasing peak indices whose references the run keeps, as it used them, in
+        Result.references: (len, K, L) uint8 tokens (dls_refs.tokens_to_onehot expands them). attribute_fast.py's
+        audit injects them into the stock deep_lift_shap.
         """
         x_tokens, ref_tokens, K = self._tokens(X, references)
         N, L = x_tokens.shape
         if not 0 <= operator.index(start) < operator.index(end) <= L:
             raise ValueError(f"the window [{start}, {end}) must be non-empty and inside [0, {L})")
         start, end = int(start), int(end)
+        keep = None
+        if keep_references is not None:
+            indices = _keep_indices(keep_references, N)
+            keep = (indices, np.empty((len(indices), K, L), np.uint8))
         dtype = self.weights.dtype
         attr = torch.empty(N, 4, end - start, dtype=dtype)
         y_x, y_r, deltas = torch.empty(N, dtype=dtype), torch.empty(N, K, dtype=dtype), torch.empty(N, K, dtype=dtype)
@@ -1243,7 +1302,7 @@ class Engine:
             attr[a:b] = mean_over_references(out.values[:n], start, L)
             y_x[a:b], y_r[a:b], deltas[a:b] = out.y_x[:n], out.y_r[:n], out.delta[:n]
 
-        meta = self._execute(x_tokens, ref_tokens, K, (start, end), consume)
+        meta = self._execute(x_tokens, ref_tokens, K, (start, end), consume, keep)
         meta["window"] = [start, end]
         meta["deltas"] = delta_summary(deltas, self.warning_threshold)
         logger.info(
@@ -1260,7 +1319,7 @@ class Engine:
         )
         if meta["deltas"]["above"]:
             warnings.warn(delta_warning(meta["deltas"]), RuntimeWarning, stacklevel=2)
-        return Result(attr, deltas, y_x, y_r, meta)
+        return Result(attr, deltas, y_x, y_r, meta, None if keep is None else keep[1])
 
     def step_size(self, n_peaks: int, length: int, n_refs: int) -> int:
         """S, the peaks per step a run of n_peaks peaks of `length`, with n_refs references each, starts with.
@@ -1307,11 +1366,18 @@ class Engine:
         K: int,
         window: tuple[int, int] | None,
         consume: Callable[[int, int, _StepOutputs], None],
+        keep: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> dict:
         """Run every step of a raw() (window None) or run() call under the engine's precision mode.
 
         consume(a, b, out) receives each step's results for peaks [a, b), in order; out has S >= b - a rows and its
-        buffers are reused, so consume copies what it keeps. Returns the call's record (_describe).
+        buffers are reused, so consume copies what it keeps. keep, (sorted peak indices, a (len, K, L) uint8 array),
+        receives those peaks' references as the run uses them. Returns the call's record (_describe).
+
+        The reference pool starts before the counts cotangent and the warm-up, so the references are drawn while the
+        warm-up compiles and cudnn.benchmark times its algorithms, and the first steps do not wait for the pool to
+        start. References depend only on (peak, k), never on the chunking, so the results are those of a pool started
+        after the warm-up. If the warm-up halves S, the pool's chunks, cut for the planned S, are re-cut (_recut).
         """
         N, L = x_tokens.shape
         cuda = self.weights.device.type == "cuda"
@@ -1324,14 +1390,16 @@ class Engine:
             )
             S = self.step_size(N, L, K)
             record = self._describe(N, L, K, S) | {"precision_flags": flags}
+            chunks = stack.enter_context(self._reference_chunks(x_tokens, ref_tokens, K, S, record, keep))
             G0 = self._counts_cotangent(L)
             if cuda:
+                planned = S
                 S = self._warm_up(S, K, L, G0, window, record)
-            with self._reference_chunks(x_tokens, ref_tokens, K, S, record) as chunks:
-                if cuda:
-                    self._steps_cuda(chunks, x_tokens, K, L, S, G0, window, consume, record)
-                else:
-                    self._steps_cpu(chunks, x_tokens, K, S, G0, window, consume, record)
+                if S != planned:
+                    chunks = _recut(chunks, S)
+                self._steps_cuda(chunks, x_tokens, K, L, S, G0, window, consume, record)
+            else:
+                self._steps_cpu(chunks, x_tokens, K, S, G0, window, consume, record)
         record["seconds"] = time.perf_counter() - began
         record["pairs_per_s"] = N * K / record["seconds"]
         return record
@@ -1383,8 +1451,9 @@ class Engine:
         """One step on random tokens before a CUDA run; returns the step size the run then uses.
 
         It compiles the passes for this S, lets cudnn.benchmark time its algorithms, and halves S on an out-of-memory
-        error, all before the reference pool starts. The tokens are drawn on the device, so the warm-up copies nothing
-        from the host, and its results are dropped. It waits for the device once, on an event.
+        error, all before the first step, while the reference pool draws the first chunks. The tokens are drawn on the
+        device, so the warm-up copies nothing from the host, and its results are dropped. It waits for the device once,
+        on an event.
         """
         device = self.weights.device
         generator = torch.Generator(device=device)
@@ -1555,20 +1624,33 @@ class Engine:
 
     @contextlib.contextmanager
     def _reference_chunks(
-        self, x_tokens: np.ndarray, ref_tokens: np.ndarray | None, K: int, S: int, record: dict
+        self,
+        x_tokens: np.ndarray,
+        ref_tokens: np.ndarray | None,
+        K: int,
+        S: int,
+        record: dict,
+        keep: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> Iterator[Iterator[tuple[int, int, np.ndarray]]]:
         """An iterator of (a, b, references of peaks [a, b) as (b - a, K, L) tokens), over chunks of S peaks in order.
 
-        Injected references are sliced. Otherwise a RefProducer draws them, ahead of use, and closes its pool on exit.
+        Injected references are sliced. Otherwise a RefProducer draws them, ahead of use, and closes its pool on exit;
+        its first chunks are submitted on entry, so the pool works while the caller does other things. With keep
+        (sorted peak indices, an output array), those peaks' references are copied into the array as they pass.
         """
         N = len(x_tokens)
+        if keep is not None:
+            record["kept_references"] = len(keep[0])
         if ref_tokens is not None:
             record["references"] = "injected"
+            if keep is not None:
+                keep[1][:] = ref_tokens[keep[0]]
             yield ((a, min(a + S, N), ref_tokens[a : a + S]) for a in range(0, N, S))
             return
         record["references"] = "produced"
         with dls_refs.RefProducer(self.ref_workers) as producer:
-            yield producer.chunks(x_tokens, K, self.random_state, S)
+            chunks = producer.chunks(x_tokens, K, self.random_state, S)
+            yield chunks if keep is None else _keeping(chunks, *keep)
             record["reference_stats"] = dict(producer.stats)
 
     def _tokens(

@@ -740,7 +740,10 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def _f(value, spec: str = ".3g") -> str:
-    return "-" if value is None else format(value, spec)
+    """A number in `spec`; None as '-', and a string (a column a tool has no value for) as it is."""
+    if value is None:
+        return "-"
+    return value if isinstance(value, str) else format(value, spec)
 
 
 def markdown(report: dict, records: list[dict], runs: dict, plan: dict, notes: str | None) -> str:
@@ -785,7 +788,7 @@ def markdown(report: dict, records: list[dict], runs: dict, plan: dict, notes: s
         lines.append(
             f"| {r['run']} | {r['tool']} | {r['cache']} | {r['peaks']} | {r['pairs']} | "
             f"{_f(r['steady_pairs_per_s'], '.1f')} | {_f(r['wall_s'], '.1f')} | {_f(r['startup_s'], '.1f')} | "
-            f"{_f(r['compile_s'], '.1f')} | {_cell(r['self_check_s'])} | {_f(r['write_s'], '.1f')} | "
+            f"{_f(r['compile_s'], '.1f')} | {_f(r['self_check_s'], '.1f')} | {_f(r['write_s'], '.1f')} | "
             f"{_f(r['peak_rss_gb'], '.2f')} | {r['peak_gpu_mib']} | {r['co_tenants']} ({r['co_tenant_mib']}) | "
             f"{_f(r['other_cpu_cores'], '.2f')} cores | {r['start_et'][11:19]} - {r['end_et'][11:19]} |"
         )

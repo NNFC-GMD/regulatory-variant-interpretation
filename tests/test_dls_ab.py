@@ -341,3 +341,6 @@ def test_run_and_report_end_to_end_with_fake_tools(tmp_path, monkeypatch):
     text = md.read_text()
     assert "**shared GPU**" in text and "G1, shared-GPU clause" in text and "**PASS**" in text
     assert "## Projections (C1 rates, shared GPU)" in text and "## Deviations" in text
+    runs_table = [line for line in text.splitlines() if line.startswith("| 2 | fast |")]
+    assert len(runs_table) == 2 and runs_table[0].split(" | ")[9] == "10.0"  # self-check s, one decimal
+    assert [line for line in text.splitlines() if line.startswith("| 1 | stock |")][0].split(" | ")[9] == "-"

@@ -66,8 +66,8 @@ only to float32 accuracy.
 Also covered:
 - references produced by dls_refs.RefProducer, in process and in a 2-process pool, equal the injected shuffles bit
   for bit;
-- the engine's argument checks;
-- a single summary warning for high deltas.
+- the engine's argument checks, numpy inputs, and group None on a one-group model;
+- a single summary warning for high deltas, with tangermeme's strict comparison against the threshold.
 
 Measured values are written to the terminal.
 """
@@ -909,7 +909,8 @@ def test_engine_arguments():
     with_n[1, :, 7] = 0
     bad_inputs = {
         "not one-hot": (X * 2, None, "one-hot"),
-        "an N in X": (with_n, None, "unknown"),
+        "an N in X": (with_n, R, "unknown"),  # with references=None tangermeme's shuffle would refuse it as well
+        "an N in X, references drawn": (with_n, None, "unknown"),
         "X of 3 channels": (X[:, :3], None, "shape"),
         "no sequences": (X[:0], None, "at least one"),
         "references for other sequences": (X, R[:2], "references"),
@@ -944,12 +945,29 @@ def test_engine_arguments():
     assert torch.equal(result.attr, expected.attr)
 
 
+def test_engine_takes_numpy_inputs_and_group_none():
+    """numpy one-hots work like tensors; group None on a one-group model attributes that group (target 0)."""
+    model = dls_tiny.tiny_model("A")
+    X = dls_tiny.sequences("A")[:3]
+    R = dls_tiny.shuffled_references(X, 2)
+    expected = cheri_dls.Engine(model, group=0).raw(X, R)
+    for group, x, r in ((0, X.numpy(), R.numpy()), (None, X, R)):
+        got = cheri_dls.Engine(model, group=group).raw(x, r)
+        for name in ("m", "y_x", "y_r", "deltas"):
+            assert torch.equal(getattr(got, name), getattr(expected, name)), (group, name)
+
+
 def test_run_warns_once_for_high_deltas():
-    """One summary RuntimeWarning per run when any delta exceeds the threshold, none for a threshold of None (§9)."""
+    """One summary RuntimeWarning per run when any delta exceeds the threshold, none for a threshold of None (§9).
+
+    A delta exceeds the threshold only if it is strictly greater, as in tangermeme (deep_lift_shap.py:744). So a
+    threshold equal to the run's largest delta gives no warning.
+    """
     model = dls_tiny.tiny_model("A")
     X = dls_tiny.sequences("A")[:4]
     R = dls_tiny.shuffled_references(X, 3)
-    for threshold, warns in ((0.0, True), (None, False), (1.0, False)):
+    largest = float(cheri_dls.Engine(model, warning_threshold=None).run(X, 0, X.shape[-1], references=R).deltas.max())
+    for threshold, warns in ((0.0, True), (None, False), (1.0, False), (largest, False)):
         engine = cheri_dls.Engine(model, warning_threshold=threshold, seqs_per_step=3)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -957,7 +975,7 @@ def test_run_warns_once_for_high_deltas():
         messages = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
         summary = result.meta["deltas"]
         assert summary["pairs"] == 12 and summary["threshold"] == threshold
-        assert summary["max"] == float(result.deltas.max())
+        assert summary["max"] == float(result.deltas.max()) == largest
         if warns:
             assert len(messages) == 1, messages
             assert re.fullmatch(
@@ -966,3 +984,4 @@ def test_run_warns_once_for_high_deltas():
             assert summary["above"] == int((result.deltas > 0).sum())
         else:
             assert messages == []
+            assert summary["above"] == (None if threshold is None else 0)

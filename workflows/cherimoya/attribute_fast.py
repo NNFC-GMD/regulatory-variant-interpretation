@@ -16,12 +16,13 @@ stock command's merge_parameters passes unknown keys through, so the optional "f
 
 What it does, in the stock command's order (attribute.py below is cherimoya_cli/commands/attribute.py):
 1. merge_parameters with the stock defaults. `skip` returns at once (attribute.py:21-23).
-2. The stock algorithm check. saturation_mutagenesis is handed to the stock command unchanged.
+2. The stock algorithm check. saturation_mutagenesis is handed to the stock command unchanged, and so is output
+   "profile": cheri_dls implements the counts head only, so the profile head runs the stock path (tangermeme's
+   deep_lift_shap), and a warning says so. Neither reads the "fast" options.
 3. Checks that need nothing loaded:
    - The "fast" options are resolved: the JSON's optional "fast" object, overridden by the flags above.
    - dtype must be float32 or null (the model's dtype, float32). bfloat16 and float16 are refused: tangermeme runs
      them under autocast, which computes a different function. float64 is accepted on the CPU only (tests).
-   - output "profile" is refused for now: cheri_dls implements the counts head only.
    - The three output directories must exist (the stock command would fail on that only after attributing).
 4. ``Cherimoya.load(model, device="cpu", compile=False)`` (cheri_dls.load_model); the engine copies the weights to
    the device, and the module itself moves there for the self-check. JSON `compile` is ignored, as the stock command
@@ -84,8 +85,7 @@ Deliberate differences from the stock command:
   2.5e-4 (as a warning in fp32 precision), but do not gate.
 - A stale idx file (the done marker of an earlier run) is removed before the new ohe file is written, so the marker
   never sits next to a partial set of new files.
-- output "profile" and dtypes other than float32 are refused, and the output directories are checked, before the
-  model is loaded.
+- dtypes other than float32 are refused, and the output directories are checked, before the model is loaded.
 - The audit's departures from design §14: batch_size min(JSON, 20) rather than 64 (the 8 GB rule); a warning above a
   median rel-L2 of 3e-4 in either precision, rather than 1e-3 in reference precision only; and the references are
   checked against tangermeme's own draw before they are injected. The forward self-check stays a strict-fp32 gate of
@@ -726,14 +726,18 @@ def run(args: argparse.Namespace) -> dict | None:
 
         logger.info("algorithm saturation_mutagenesis: running the stock `cherimoya attribute` unchanged")
         return stock_attribute.run(args)
+    if parameters["output"] == "profile":
+        from cherimoya_cli.commands import attribute as stock_attribute
+
+        logger.warning(
+            "output 'profile': cheri_dls attributes the counts head only, so the profile head runs the stock "
+            '`cherimoya attribute` path (tangermeme\'s deep_lift_shap), unchanged and at its speed; the "fast" '
+            "options and flags do not apply to it"
+        )
+        return stock_attribute.run(args)
 
     options = fast_options(parameters.get("fast"), args)
     dtype = engine_dtype(parameters["dtype"], parameters["device"])
-    if parameters["output"] == "profile":
-        raise NotImplementedError(
-            "attribute_fast.py attributes the counts head only; output 'profile' is not implemented in cheri_dls "
-            "yet. Run `cherimoya attribute -p <json>` for profile attributions."
-        )
     _check_output_dirs(parameters)
 
     import cheri_dls  # imports cherimoya and tangermeme, after NUMBA_CACHE_DIR is set (module doc)

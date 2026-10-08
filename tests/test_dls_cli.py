@@ -22,8 +22,9 @@ The per-peak comparison and its 3e-4 median warning are checked on synthetic arr
 Also covered:
 - The order of the writes: ohe, attr, then idx (the done marker), then the deltas sidecar; the meta sidecar and the
   self-check's record; a stale done marker is removed before the new files are written.
-- skip returns before anything is loaded; saturation_mutagenesis runs the stock command; bfloat16 and float16 are
-  refused, float64 only on the CPU, output "profile" refused, and all of these before the model is loaded.
+- skip returns before anything is loaded; saturation_mutagenesis and output "profile" run the stock command (profile
+  files array_equal to the stock's); bfloat16 and float16 are refused, float64 only on the CPU, both before the model
+  is loaded.
 - A JSON with a "fast" block gives the stock command the same files as one without it.
 - The "fast" options: defaults, the JSON block, flag overrides, unknown and later-round keys refused.
 - One summary convergence warning, none for warning_threshold null; the stock group error for a multi-group model
@@ -378,10 +379,25 @@ def test_float64_runs_on_the_cpu(request, inputs, stock_runs, tmp_path):
     assert record["self_check"]["pass"]
 
 
-def test_profile_is_refused_before_the_model_is_loaded(inputs, tmp_path):
-    path = write_params(inputs, tmp_path, "profile", output="profile", model=MISSING_MODEL)
-    with pytest.raises(NotImplementedError, match="counts head only"):
-        attribute_fast.run(ns(path))
+def test_profile_runs_the_stock_command(inputs, stock_runs, tmp_path, caplog, monkeypatch):
+    """output "profile" is handed to the stock `cherimoya attribute`, with a warning that says so: its three files
+    equal, array for array, a stock run of the same JSON, and attribute_fast.py writes no sidecar of its own."""
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the engine must not run for the profile head")
+
+    monkeypatch.setattr(cheri_dls, "Engine", forbidden)
+    stock = stock_runs(64, output="profile")
+    path = write_params(inputs, tmp_path, "profile", output="profile", fast={"precision": "fp32", "audit": 8})
+    with caplog.at_level("WARNING", logger="attribute_fast"):
+        assert attribute_fast.run(ns(path)) is None
+    assert any("profile head runs the stock" in r.getMessage() for r in caplog.records)
+    ours = load_outputs(path)
+    for name in ("ohe", "attr", "idx"):
+        assert ours[name].dtype == stock[name].dtype and np.array_equal(ours[name], stock[name]), name
+    assert ours["attr"].shape == (KEPT.sum(), 4, ATTR_WINDOW) and ours["attr_keys"] == ["arr_0"]
+    _, _, _, deltas_file, meta_file = output_paths(path)
+    assert not deltas_file.exists() and not meta_file.exists()
 
 
 def test_a_missing_output_directory_is_refused_before_the_model_is_loaded(inputs, tmp_path):

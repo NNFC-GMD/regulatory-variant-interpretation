@@ -456,12 +456,11 @@ def _device_record(device) -> dict:
 
 
 def _rss() -> dict:
+    """This process's peak RSS. RUSAGE_CHILDREN is not reported: Linux counts a spawned worker's RSS from before its
+    exec, when it still maps the parent's pages, so for the reference workers it repeats the parent's figure."""
     import resource
 
-    return {
-        "rss_max_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
-        "children_rss_max_bytes": resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024,
-    }
+    return {"rss_max_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}
 
 
 def _write_json(path: str, obj: dict) -> None:

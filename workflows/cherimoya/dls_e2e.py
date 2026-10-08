@@ -26,6 +26,7 @@ Subcommands, all run inside a box; only `run` needs a GPU:
     threshold (torch prints them with 4 significant digits), and reads E8's bounds against them as context.
   - Context: attribute_fast's meta sidecar (step size, timings, self-check, deltas), the wall times and peak memory
     of both runs, and, with --engine-attr, the attributions against an earlier engine run of the same peaks.
+    --notes appends a Markdown file (deviations, notes) to the report.
 
     python workflows/cherimoya/dls_e2e.py prepare -p attribute.json --out-dir <e9> --set batch_size=20 \\
         --fast '{"mem_budget_gb": 7.5, "ref_workers": 3}'
@@ -375,7 +376,8 @@ def cmd_compare(args: argparse.Namespace) -> int:
     report["criteria"] = rows
     report["pass"] = all(r["pass"] for r in rows)
     _write_json(out / "e9_report.json", report)
-    (out / "e9_report.md").write_text(_markdown(report, params))
+    notes = Path(args.notes).read_text() if args.notes else None
+    (out / "e9_report.md").write_text(_markdown(report, params, notes))
     for r in rows:
         logger.info(
             "%-28s %-6s measured %s, bound %s",
@@ -400,7 +402,7 @@ def _gb(value) -> str:
     return "-" if value is None else f"{value / 1e9:.2f} GB"
 
 
-def _markdown(report: dict, params: dict) -> str:
+def _markdown(report: dict, params: dict, notes: str | None = None) -> str:
     runs, w = report.get("runs", {}), report.get("stock_warnings")
     meta = report.get("fast_meta")
     lines = [
@@ -476,7 +478,7 @@ def _markdown(report: dict, params: dict) -> str:
             f"- GPU memory: steps at most {_gb(m.get('step_peak_bytes'))} (estimate {_gb(m.get('step_estimate_bytes'))}"
             f"); process max allocated {_gb(m.get('gpu_max_allocated_bytes'))}, reserved "
             f"{_gb(m.get('gpu_max_reserved_bytes'))}; before the run {_gb(m.get('gpu_max_allocated_bytes_before_run'))}"
-            f". Max RSS {_gb(m.get('rss_max_bytes'))}, reference workers {_gb(m.get('children_rss_max_bytes'))}.",
+            f". Max RSS {_gb(m.get('rss_max_bytes'))}.",
             f"- Deltas: {d.get('above')} of {d.get('pairs')} pairs above {d.get('threshold')} (max {_fmt(d.get('max'))}, "
             f"p50 {_fmt(d.get('p50'))}, p99 {_fmt(d.get('p99'))}).",
             f"- Self-check: {'passed' if sc['pass'] else 'FAILED'}; strict fp32 max |dy| {sc['max_abs_fp32']:.3g} "
@@ -497,6 +499,8 @@ def _markdown(report: dict, params: dict) -> str:
             f"{e8['bounds']['max']:.4g}: {'PASS' if e8['pass'] else 'FAIL'}.",
         ]
     lines += ["", "## Environment", "", "```", json.dumps(runs.get("env", {}), indent=2), "```", ""]
+    if notes:
+        lines += [notes.rstrip(), ""]
     return "\n".join(lines)
 
 
@@ -519,6 +523,7 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     c.add_argument("--out-dir", required=True)
     c.add_argument("--floors", required=True, help="the validation harness's report.json (floors)")
     c.add_argument("--engine-attr", help="an earlier engine run's attributions (.npy), for context")
+    c.add_argument("--notes", help="a Markdown file appended to e9_report.md (deviations, notes)")
     return parser.parse_args(argv)
 
 

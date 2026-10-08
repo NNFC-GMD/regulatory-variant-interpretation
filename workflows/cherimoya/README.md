@@ -251,3 +251,24 @@ leaves a marker in `<output_dir>/.done/` and a row (exit, seconds, max RSS) in
 output without its marker aside (`.incomplete.<time>`) and redoes that step
 and the ones after it. Datasets waiting for their attribution wait while an
 attribution runner holds the box; the script's header lists every knob.
+
+`qc_modisco_folds.sh [<list.txt> ...]` adds the per-fold motif QC at
+ChromBPNet's own scale (igvf_tf_chrombpnet's 04.4/04.5: 30,000 peaks, 5,000
+seqlets, a 400-bp window), for the datasets ChromBPNet interpreted (default
+`${BOX_DIR}/attribution_datasets.txt`). For each fold once `attr_status.py`
+calls it DONE, `subset_scores.py` takes the fold's attribution on the peaks of
+ChromBPNet's QC subsample of the same fold (`auxiliary/30K_subsample_peaks.bed`
+of the ChromBPNet fold named by `compare.json`), in that order and joined by
+peak name, and writes
+`<output_dir>/full_models/<dataset>_<peak_type>_fold_<k>/auxiliary/interpret_subsample/cherimoya.counts_scores.h5`
+(raw int8, shap and projected_shap float16, gzip; each row bit for bit the
+converted fold's row of that peak), its bed (the subsample's lines Cherimoya
+kept) and a provenance record. It checks the rows against ChromBPNet's own QC
+scores of the fold: the ohe equals their `raw/seq[:, :, 557:1557]`, and the
+peaks Cherimoya dropped have a column of zeros there. The igvf checkout's
+`src/motif_qc.py` then runs on it exactly as 04.5 runs it (`--prefix
+cherimoya`, into `.../evaluation/motif_qc_counts/`), at most `CHERI_QC_MAX`
+(4) folds at once with 16 threads each under `nice 19`. A fold is done when
+`cherimoya_qc.done.json` there names the current scores and their sources are
+unchanged; a fold attributed again has its QC directory moved aside and is
+redone. Rows go to `${BOX_DIR}/cheri_qc.tsv`; the header lists every knob.

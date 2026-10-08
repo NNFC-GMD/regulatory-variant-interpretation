@@ -67,7 +67,11 @@ Also covered:
 - references produced by dls_refs.RefProducer, in process and in a 2-process pool, equal the injected shuffles bit
   for bit;
 - the engine's argument checks, numpy inputs, and group None on a one-group model;
-- a single summary warning for high deltas, with tangermeme's strict comparison against the threshold.
+- a single summary warning for high deltas, with tangermeme's strict comparison against the threshold;
+- the GPU engine's pieces that need no GPU: forward_stats="cpu_mirror" and compile="default" are refused where they
+  do not apply, precision_mode() sets, logs and restores the precision flags and gives each mode its own Inductor cache
+  directory, step_bytes() is design section 6.4's estimate (0.93 GB per peak on the real model at K = 20), and
+  auto_seqs_per_step() is section 11's rule. tests/test_dls_gpu.py covers the rest on a GPU.
 
 Measured values are written to the terminal.
 """
@@ -76,6 +80,8 @@ from __future__ import annotations
 
 import copy
 import functools
+import logging
+import os
 import re
 import sys
 import warnings
@@ -306,6 +312,17 @@ def test_forward_stats_resolution_and_validation(batches):
     assert cheri_dls.resolve_forward_stats("auto", "cpu") == "cpu_mirror"
     assert cheri_dls.resolve_forward_stats("auto", torch.device("cuda", 0)) == "two_pass"
     assert cheri_dls.resolve_forward_stats("one_pass", "cpu") == "one_pass"
+    assert cheri_dls.resolve_forward_stats("two_pass", "cuda") == "two_pass"
+    for cuda in ("cuda", torch.device("cuda", 0)):
+        with pytest.raises(ValueError, match="cpu_mirror"):
+            cheri_dls.resolve_forward_stats("cpu_mirror", cuda)  # the CPU path's mirror means nothing on CUDA
+    assert cheri_dls.resolve_compile("auto", "cpu") == "none" and cheri_dls.resolve_compile("auto", "cuda") == "default"
+    assert cheri_dls.resolve_compile("none", "cuda") == "none"
+    with pytest.raises(ValueError, match="compile"):
+        cheri_dls.resolve_compile("default", "cpu")
+    for bad in ("max-autotune", "", None):
+        with pytest.raises(ValueError, match="compile"):
+            cheri_dls.resolve_compile(bad, "cuda")
     w = cheri_dls.CheriWeights.from_model(dls_tiny.tiny_model("A"))
     for bad in ("three_pass", "", None):
         with pytest.raises(ValueError, match="forward_stats"):
@@ -337,6 +354,7 @@ def test_weights_are_the_module_tensors(config):
         w = cheri_dls.CheriWeights.from_model(model)
         for ours, theirs in zip(_weights_tensors(w), _module_tensors(model), strict=True):
             assert torch.equal(ours, theirs) and ours.dtype == dtype and not ours.requires_grad
+            assert ours.data_ptr() != theirs.data_ptr()  # copies, even on the model's own device
         assert [b.d for b in w.blocks] == [2**i for i in range(cfg.n_layers)]
         assert (w.T, w.rs, w.eps) == (model.trimming, model.residual_scale, CONV_NORM_EPS)
         assert (w.C, w.H, w.n_ctl) == (cfg.n_filters, cfg.expansion * cfg.n_filters, cfg.n_control_tracks)
@@ -895,6 +913,20 @@ def test_engine_arguments():
                 cheri_dls.Engine(model, group=1, **{name: bad})
     with pytest.raises(ValueError, match="forward_stats"):
         cheri_dls.Engine(model, group=1, forward_stats="three_pass")
+    for name, bad in (
+        ("precision", "tf32"),
+        ("precision", None),
+        ("compile", "default"),  # compiled passes run on CUDA only
+        ("compile", "max-autotune"),
+        ("mem_budget_gb", 0),
+        ("mem_budget_gb", -1.0),
+        ("mem_budget_gb", True),
+        ("mem_budget_gb", "8"),
+        ("deterministic", 1),
+        ("deterministic", None),
+    ):
+        with pytest.raises(ValueError, match=name):
+            cheri_dls.Engine(model, group=1, **{name: bad})
     with pytest.raises(ValueError, match="random_state"):
         cheri_dls.Engine(model, group=1, random_state=1.5)
     with pytest.raises(ValueError, match="warning_threshold"):
@@ -905,6 +937,12 @@ def test_engine_arguments():
 
     engine = cheri_dls.Engine(model, group=1, n_shuffles=2, ref_workers=0)
     assert (engine.forward_stats, engine.random_state, engine.head_rows) == ("cpu_mirror", 0, 128)
+    assert (engine.precision, engine.compile, engine.deterministic, engine.mem_budget_gb) == (
+        "reference",
+        "none",
+        False,
+        12.0,
+    )
     with_n = X.clone()
     with_n[1, :, 7] = 0
     bad_inputs = {
@@ -985,3 +1023,81 @@ def test_run_warns_once_for_high_deltas():
         else:
             assert messages == []
             assert summary["above"] == (None if threshold is None else 0)
+
+
+# The GPU engine's pieces that need no GPU ----------------------------------------------------------------------------
+
+_FLAGS = (
+    "torch.get_float32_matmul_precision()",
+    "torch.backends.cuda.matmul.allow_tf32",
+    "torch.backends.cudnn.allow_tf32",
+    "torch.backends.cudnn.benchmark",
+    "torch.backends.cudnn.deterministic",
+)
+
+
+def test_precision_mode_sets_logs_and_restores_the_flags(tmp_path, monkeypatch, caplog):
+    """Design section 12's table, the log of every flag, the restore on exit, and one Inductor cache dir per mode."""
+    root = tmp_path / "inductor"
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(root))
+    before = cheri_dls.precision_flags()
+    assert before["torch.get_float32_matmul_precision()"] == "high"  # what `import cherimoya` set
+    expected = {
+        ("reference", False): ("high", True, True, True, False),
+        ("fp32", False): ("highest", False, False, True, False),
+        ("reference", True): ("high", True, True, False, True),
+        ("fp32", True): ("highest", False, False, False, True),
+    }
+    for (mode, deterministic), values in expected.items():
+        with caplog.at_level(logging.INFO, logger="cheri_dls"):
+            caplog.clear()
+            with cheri_dls.precision_mode(mode, deterministic=deterministic) as flags:
+                inside = cheri_dls.precision_flags()
+                cache_dir = os.environ["TORCHINDUCTOR_CACHE_DIR"]
+            logged = caplog.text
+        assert tuple(flags[name] for name in _FLAGS) == values, (mode, deterministic)
+        assert inside == flags
+        assert cache_dir == str(root / f"cheri_dls_{mode}") == cheri_dls.inductor_cache_dir(mode, root)
+        assert flags["$TORCHINDUCTOR_CACHE_DIR"] == cache_dir and (root / f"cheri_dls_{mode}").is_dir()
+        for name in _FLAGS + ("torch.backends.cuda.matmul.fp32_precision", "torch.backends.cudnn.conv.fp32_precision"):
+            assert name in logged
+        assert f"precision mode {mode}" in logged and "restored" in logged
+        assert cheri_dls.precision_flags() == before  # restored, the environment included
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(root)
+
+    with pytest.raises(RuntimeError, match="body"), cheri_dls.precision_mode("fp32", inductor_cache=False) as flags:
+        assert flags["$TORCHINDUCTOR_CACHE_DIR"] == str(root)  # inductor_cache=False leaves the directory alone
+        raise RuntimeError("body")
+    assert cheri_dls.precision_flags() == before  # restored after an exception too
+    with pytest.raises(ValueError, match="precision"), cheri_dls.precision_mode("bf16"):
+        pass
+    nested = cheri_dls.inductor_cache_dir("fp32", root / "cheri_dls_reference")
+    assert nested == str(root / "cheri_dls_fp32")  # a mode's own directory is never nested in another's
+
+
+def test_step_bytes_is_the_design_estimate_and_sizes_the_steps():
+    """Section 6.4: 0.93 GB per peak for the real model at K = 20; section 11: S = clamp(floor(budget/peak), 1, 32)."""
+    real = dict(K=20, L=2114, C=128, H=256, n_blocks=9)
+    per_peak = cheri_dls.step_bytes(1, **real)
+    L, C, H = 2114, 128, 256
+    saved = 4 * L * (C + 9 * (C + H))  # 30.3 MB per row in section 6.4
+    fwd, bwd = 4 * L * (4 * C + H), 4 * L * (3 * C + 2 * H)  # about 6.5 MB per row and 7.6 MB per pair
+    assert round(saved / 1e6, 1) == 30.3 and round(fwd / 1e6, 1) == 6.5 and round(bwd / 1e6, 1) == 7.6
+    assert per_peak == 21 * (saved + fwd + 16 * L + L) + 20 * (bwd + 16 * L)
+    assert round(per_peak / 1e9, 2) == 0.93
+    for S in (1, 4, 8, 32):
+        assert cheri_dls.step_bytes(S, **real) == S * per_peak
+
+    free = 80e9
+    assert cheri_dls.auto_seqs_per_step(free, 8.0, per_peak) == 8  # 8 GB / 0.926 GB
+    assert cheri_dls.auto_seqs_per_step(free, 12.0, per_peak) == 12  # the design's S of about 12 on a free H100
+    assert cheri_dls.auto_seqs_per_step(10e9, 12.0, per_peak) == 6  # 0.6 x 10 GB free
+    assert cheri_dls.auto_seqs_per_step(free, 0.1, per_peak) == 1  # never below 1
+    assert cheri_dls.auto_seqs_per_step(1e12, 1e3, per_peak) == 32  # never above 32
+
+    model = dls_tiny.tiny_model("A")
+    engine = cheri_dls.Engine(model, seqs_per_step=5)
+    assert engine.step_size(13, 256, 5) == 5 and engine.step_size(3, 256, 5) == 3
+    assert cheri_dls.Engine(model).step_size(100, 256, 5) == cheri_dls.AUTO_SEQS_PER_STEP  # "auto" on the CPU
+    w = engine.weights
+    assert engine.step_estimate(4, 5, 256) == cheri_dls.step_bytes(4, 5, 256, w.C, w.H, 3)

@@ -10,10 +10,16 @@ The GPUs are shared with training jobs. So this module caps its process's cachin
 processes cap themselves the same way. TORCHINDUCTOR_COMPILE_THREADS=1 keeps Inductor from forking a compile pool.
 
 D1. Compiled against eager, both on the GPU in the strict "fp32" precision mode (cuBLAS and cuDNN without TF32), on
-    the tiny models A, B and C of tests/dls_tiny.py: 13 sequences, K = 5 references, shuffled or random. The per-pair
-    rel-L2 of the raw multipliers must be <= 1e-6, and so must the per-sequence rel-L2 of run()'s attributions.
-    Bitwise equality is not expected: Inductor's fused reductions sum in another order than eager's, and inside
-    compiled code gelu_backward is a decomposition, within about an ulp of the eager kernel (probe P5).
+    the tiny models A, B and C of tests/dls_tiny.py: 13 sequences, K = 5 references, shuffled or random. As revised
+    after round 2 (analyses/attr_pilot/design/revisions.md), the bound is accuracy-relative. Against an fp64 truth on
+    the same inputs and references (the engine on the CPU in float64, two_pass, dls_tiny.enable_float64), compiled
+    must be no farther than 1.2 x eager, at the median and at the max of the per-pair raw rel-L2. A sanity ceiling
+    holds the two paths within 1e-3 of each other per pair. The original bound, per-pair rel-L2 <= 1e-6 between the
+    paths, is reported only: every fp32 evaluation of these models sits 1e-6 to 1e-4 per pair from the fp64 truth,
+    because the rescale rule's secants (g(z_x) - g(z_r)) / (z_x - z_r) turn ulp-level differences in a GELU input into
+    relative errors of about ulp / |z_x - z_r|. Bitwise equality is not expected either: Inductor's fused reductions
+    sum in another order than eager's, and inside compiled code gelu_backward is a decomposition, within about an ulp
+    of the eager kernel (probe P5). run()'s attributions are reported per sequence.
 D2. The real architecture (C = 128, H = 256, 9 blocks, L = 2114, T = 557) with random weights, K = 20, steps of
     S = 4 peaks, in the default "reference" precision mode. Two run()s of 13 peaks each, each a warm-up step and 4
     steps:
@@ -33,8 +39,11 @@ D5. deterministic=True: run() twice on one engine and once on a fresh engine, in
     CUBLAS_WORKSPACE_CONFIG before CUDA initializes, which this pytest process, having used CUDA, cannot.
 
 Also covered:
-- The eager engine on the GPU against the eager engine on the CPU, both in fp32 mode with two_pass statistics: per-pair
-  rel-L2 <= 1e-5. The CPU engine's cpu_mirror statistics, the path checked against tangermeme, are reported too.
+- The eager engine on the GPU against the eager engine on the CPU, both in fp32 mode with two_pass statistics, on the
+  same accuracy-relative criterion as D1 (revised after round 2): the GPU no farther from the fp64 truth than 1.2 x the
+  CPU at the median and the max of the per-pair raw rel-L2, and the two within 1e-3 per pair. The original bound,
+  per-pair rel-L2 <= 1e-5 between them, is reported only, and so is the CPU engine's cpu_mirror path, the one checked
+  against tangermeme.
 - forward_stats="cpu_mirror" is refused on CUDA, and "auto" resolves to "two_pass" there.
 - One host synchronization per step: D2's second run runs under torch.cuda.set_sync_debug_mode("error"), which
   raises on any implicit synchronization (.item(), a blocking copy). The engine's one wait per step, on the previous
@@ -42,8 +51,8 @@ Also covered:
 - seqs_per_step="auto" takes the largest S whose step_bytes fits mem_budget_gb and 0.6 of the available memory.
 - Out of memory: an OutOfMemoryError in the warm-up or in a step halves S and retries. Injected in the warm-up, all
   steps run at the halved S and the results equal, bit for bit, a deterministic engine that ran at that S from the
-  start. Injected in the second step, the first step's peaks keep S = 4 and the rest run at 2; the results stay
-  within D1's bound of the S = 2 engine, and every peak is attributed once.
+  start. Injected in the second step, the first step's peaks keep S = 4 and the rest run at 2, bit for bit as the
+  S = 4 and S = 2 engines compute them, and every peak is attributed once.
 
 Measured values are written to the terminal.
 """
@@ -78,11 +87,13 @@ GPU_MEM_CAP_GB = 6.0  # this process's caching allocator, in GB of 1e9 bytes
 MEM_BUDGET_GB = 6.0  # every engine's mem_budget_gb
 K_TINY = 5
 HEAD_ROWS = 14  # the CPU engine tests' head rows, 2 x their oracle batch of 7
-D1_MAX = 1e-6
-ACCURACY_FACTOR = 1.2  # E7(a): d(ours, T64) <= 1.2 x d(reference, T64) at the median and the max
+D1_ORIGINAL_MAX = 1e-6  # D1's original bound between compiled and eager, per pair; reported only since the revision
+GPU_CPU_ORIGINAL_MAX = 1e-5  # the original GPU-CPU bound, per pair; reported only since the revision
+ACCURACY_FACTOR = 1.2  # revised D1 and GPU-CPU: d(a, truth) <= 1.2 x d(b, truth) at the median and the max
+SANITY_MAX = 1e-3  # revised D1 and GPU-CPU: per-pair raw rel-L2 between the two paths, at the max
+RERUN_MAX = 1e-6  # two run()s of one engine in reference mode, per sequence
 D3_FACTOR = 1.3
 D4_MAX = 1e-5
-GPU_CPU_MAX = 1e-5
 REAL_K, REAL_S, REAL_PEAKS = 20, 4, 13  # 13 peaks in steps of 4: 3 full steps and 1 padded
 REAL_LENGTH = 2114
 CHILD_TIMEOUT_S = 1800
@@ -182,22 +193,29 @@ def _q(t: torch.Tensor) -> str:
     return f"median {float(t.median()):.3g} max {float(t.max()):.3g}"
 
 
-def _accuracy_limited(ours: torch.Tensor, theirs: torch.Tensor) -> bool:
-    """E7(a)'s tie-breaker: ours is no farther from the fp64 truth than theirs, x1.2, at the median and the max."""
-    return float(ours.median()) <= ACCURACY_FACTOR * float(theirs.median()) and float(
-        ours.max()
-    ) <= ACCURACY_FACTOR * float(theirs.max())
+def _accuracy_relative(name: str, a: torch.Tensor, b: torch.Tensor, between: torch.Tensor) -> list[str]:
+    """The revised D1 / GPU-CPU criterion; returns the violations (none: it passes).
+
+    a and b are two paths' per-pair raw rel-L2 to the fp64 truth, `between` the per-pair raw rel-L2 of path a against
+    path b. a must be no farther from the truth than 1.2 x b at the median and at the max, and `between` must stay
+    within the sanity ceiling at the max.
+    """
+    failures = []
+    for stat, fn in (("median", torch.median), ("max", torch.max)):
+        da, db = float(fn(a)), float(fn(b))
+        if not da <= ACCURACY_FACTOR * db:
+            failures.append(f"{name}: d(., truth) {stat} {da:.3g} > {ACCURACY_FACTOR} x {db:.3g}")
+    if not float(between.max()) <= SANITY_MAX:
+        failures.append(f"{name}: per-pair rel-L2 between the paths max {float(between.max()):.3g} > {SANITY_MAX:g}")
+    return failures
 
 
 @pytest.mark.parametrize("kind", ["shuffled", "random"])
 @pytest.mark.parametrize("config", list(dls_tiny.CONFIGS))
 def test_d1_compiled_matches_eager_in_fp32_mode(config, kind, pytestconfig):
-    """D1, plus E7(a)'s accuracy tie-breaker against the fp64 truth as a hard check.
+    """D1 as revised after round 2: compiled no farther from the fp64 truth than 1.2 x eager, within 1e-3 of eager.
 
-    D1's bound is checked last. Where it is exceeded the test is marked xfail with the measured numbers: every fp32
-    evaluation of these models is 1e-6 to 1e-4 per pair from the fp64 truth, because the rescale rule's secants
-    (g(z_x) - g(z_r)) / (z_x - z_r) turn ulp-level differences in a GELU input into relative errors of
-    ulp / |z_x - z_r| (see the module docstring and the open issue). The accuracy check still fails on a real error.
+    The absolute numbers, and the original bound of 1e-6 between the paths, are written to the terminal.
     """
     X, R = _case(config, kind)
     L = X.shape[-1]
@@ -212,10 +230,17 @@ def test_d1_compiled_matches_eager_in_fp32_mode(config, kind, pytestconfig):
         float(((compiled.y_x - eager.y_x).abs() / eager.y_x.abs().clamp_min(1)).max()),
         float(((compiled.y_r - eager.y_r).abs() / eager.y_r.abs().clamp_min(1)).max()),
     )
+    ratio = {
+        s: float(f(to_truth["compiled"])) / float(f(to_truth["eager"]))
+        for s, f in (("median", torch.median), ("max", torch.max))
+    }
     line = (
-        f"D1 config {config} {kind}: compiled vs eager, fp32 mode: raw per-pair rel-L2 {_q(rel)} (tol max {D1_MAX:g}; "
-        f"bitwise {'yes' if torch.equal(compiled.m, eager.m) else 'no'}); vs the fp64 truth: compiled {_q(to_truth['compiled'])}, "
-        f"eager {_q(to_truth['eager'])}; run() attr per-sequence {_q(rel_attr)}; outputs max |dy|/max(1,|y|) {d_out:.3g}"
+        f"D1 config {config} {kind}: compiled vs eager, fp32 mode: raw per-pair rel-L2 {_q(rel)} (sanity max "
+        f"{SANITY_MAX:g}; original bound {D1_ORIGINAL_MAX:g} {'met' if float(rel.max()) <= D1_ORIGINAL_MAX else 'not met'}"
+        f", reported only; bitwise {'yes' if torch.equal(compiled.m, eager.m) else 'no'}); vs the fp64 truth: compiled "
+        f"{_q(to_truth['compiled'])}, eager {_q(to_truth['eager'])}, ratio median {ratio['median']:.3f} max "
+        f"{ratio['max']:.3f} (bound {ACCURACY_FACTOR}); run() attr per-sequence {_q(rel_attr)}; outputs max "
+        f"|dy|/max(1,|y|) {d_out:.3g}"
     )
     _report(pytestconfig, line)
     for result in (eager, compiled):
@@ -230,34 +255,39 @@ def test_d1_compiled_matches_eager_in_fp32_mode(config, kind, pytestconfig):
     )
     assert torch.equal(run_c.y_x, compiled.y_x) and torch.equal(run_c.y_r, compiled.y_r)  # one forward, run or raw
     assert torch.equal(run_e.y_x, eager.y_x) and torch.equal(run_e.y_r, eager.y_r)
-    assert _accuracy_limited(to_truth["compiled"], to_truth["eager"]), "compiled is less accurate than eager"
-    if float(rel.max()) > D1_MAX:
-        pytest.xfail(f"D1 not met: {line}")
+    failures = _accuracy_relative("compiled vs eager", to_truth["compiled"], to_truth["eager"], rel)
+    assert not failures, f"{failures}; {line}"
 
 
 @pytest.mark.parametrize("config", list(dls_tiny.CONFIGS))
 def test_gpu_eager_engine_matches_the_cpu_engine_in_fp32_mode(config, pytestconfig):
     """The same two_pass arithmetic on two devices; only GEMM blocking, reduction order and cuDNN differ.
 
-    Like D1: the accuracy tie-breaker against the fp64 truth is a hard check, and an exceeded bound is marked xfail
-    with the measured numbers.
+    As revised after round 2: the GPU no farther from the fp64 truth than 1.2 x the CPU, and within 1e-3 of it per pair.
+    The absolute numbers, the original bound of 1e-5 and the cpu_mirror path are written to the terminal.
     """
     gpu, cpu, mirror, truth = (
         _raw(config, "shuffled", which) for which in ("gpu_eager", "cpu_two_pass", "cpu_mirror", "truth")
     )
     assert mirror.debug["forward_stats"] == "cpu_mirror" and gpu.debug["forward_stats"] == "two_pass"
+    assert cpu.debug["forward_stats"] == "two_pass" and cpu.debug["device"] == "cpu"
     rel = _rows_rel_l2(_pairs(gpu), _pairs(cpu))
     rel_mirror = _rows_rel_l2(_pairs(gpu), _pairs(mirror))
     to_truth = {name: _rows_rel_l2(_pairs(r), _pairs(truth)) for name, r in (("gpu", gpu), ("cpu", cpu))}
+    ratio = {
+        s: float(f(to_truth["gpu"])) / float(f(to_truth["cpu"]))
+        for s, f in (("median", torch.median), ("max", torch.max))
+    }
     line = (
-        f"GPU eager vs CPU, config {config}, fp32 mode: per-pair rel-L2 vs CPU two_pass {_q(rel)} (tol max "
-        f"{GPU_CPU_MAX:g}); vs CPU cpu_mirror (reported only) {_q(rel_mirror)}; vs the fp64 truth: GPU "
-        f"{_q(to_truth['gpu'])}, CPU {_q(to_truth['cpu'])}"
+        f"GPU eager vs CPU, config {config}, fp32 mode: per-pair rel-L2 vs CPU two_pass {_q(rel)} (sanity max "
+        f"{SANITY_MAX:g}; original bound {GPU_CPU_ORIGINAL_MAX:g} "
+        f"{'met' if float(rel.max()) <= GPU_CPU_ORIGINAL_MAX else 'not met'}, reported only); vs CPU cpu_mirror "
+        f"(reported only) {_q(rel_mirror)}; vs the fp64 truth: GPU {_q(to_truth['gpu'])}, CPU {_q(to_truth['cpu'])}, "
+        f"ratio median {ratio['median']:.3f} max {ratio['max']:.3f} (bound {ACCURACY_FACTOR})"
     )
     _report(pytestconfig, line)
-    assert _accuracy_limited(to_truth["gpu"], to_truth["cpu"]), "the GPU engine is less accurate than the CPU engine"
-    if float(rel.max()) > GPU_CPU_MAX:
-        pytest.xfail(f"GPU-CPU bound not met: {line}")
+    failures = _accuracy_relative("GPU vs CPU", to_truth["gpu"], to_truth["cpu"], rel)
+    assert not failures, f"{failures}; {line}"
 
 
 def test_cpu_mirror_is_refused_on_cuda():
@@ -402,7 +432,7 @@ def test_the_two_runs_agree(real_runs):
     for name in ("y_x", "y_r"):
         assert torch.equal(getattr(first, name), getattr(second, name)), name
     rel = _rows_rel_l2(second.attr, first.attr)
-    assert float(rel.max()) <= D1_MAX  # iconv's input gradient is not bitwise repeatable in cuDNN (probe P3)
+    assert float(rel.max()) <= RERUN_MAX  # iconv's input gradient is not bitwise repeatable in cuDNN (probe P3)
     assert bool(torch.isfinite(first.attr).all())
 
 

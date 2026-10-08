@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""attribute_fast.py: `cherimoya attribute` for DeepLIFT/DeepSHAP on the counts head, computed by cheri_dls.
+"""attribute_fast.py: `cherimoya attribute` for DeepLIFT/DeepSHAP on the counts head, computed by cheri_dls, and audited.
 
 `cherimoya attribute -p attribute.json` runs tangermeme's hook-based deep_lift_shap. It forwards every sequence once
 per reference and runs the backward over both halves of each batch, about 130 pairs/s on a shared H100. This script
@@ -9,7 +9,7 @@ analyses/attr_pilot/design/final_design.md, §13-§14; implementation steps 3 an
 
     python workflows/cherimoya/attribute_fast.py -p attribute.json [--precision reference|fp32] [--seqs-per-step N]
         [--mem-budget-gb GB] [--compile auto|default|none] [--ref-workers N] [--forward-stats auto|two_pass|...]
-        [--deterministic] [--allow-version-drift]
+        [--deterministic] [--allow-version-drift] [--audit N]
 
 Run it inside a box, never on the login node. The same JSON still runs under `cherimoya attribute` unchanged: the
 stock command's merge_parameters passes unknown keys through, so the optional "fast" block is ignored there.
@@ -39,6 +39,20 @@ What it does, in the stock command's order (attribute.py below is cherimoya_cli/
    ``<attr minus .npz>.deltas.npy``, the (n_kept, K) float32 convergence deltas, and ``<attr minus .npz>.meta.json``:
    versions, GPU, flags, S, K, precision, timings, peak GPU memory and RSS, a delta summary, the random_state used
    and the self-check result.
+11. The audit (design §14; --audit N, default 8, 0 turns it off). On N evenly spaced kept peaks,
+   round(linspace(0, n_kept - 1, N)), the stock deep_lift_shap runs as `cherimoya attribute` runs it: through the real
+   LogCountWrapper(ControlWrapper(model), group), with attribution_ops(), dtype float32, on the run's device, in the
+   run's precision mode. It gets the references the engine used for those peaks, kept by the run and injected, and
+   those are first checked, bit for bit, against tangermeme's own draw for those peaks. Its batch_size is
+   min(JSON batch_size, 20): stock deep_lift_shap at batch 64 allocates 15.5 GB on the real model, at 20 about 6 GB,
+   under the 8 GB the shared GPUs allow a process. Per peak, our float32 attributions over the window are compared with
+   the stock's: Pearson and rel-L2 = ||ours - stock|| / ||stock|| over 4 x W.
+   - Any peak with Pearson < 0.9999 or rel-L2 > 1e-2 (acceptance criterion E5's caps), or references that differ
+     from tangermeme's, fails the audit. The outputs are already written; the meta records the audit, and the run then
+     raises AuditFailed, which main() turns into exit status 3.
+   - A median rel-L2 above 3e-4 logs a warning. In reference precision the stock's own rerun floor F_rr is 7.2e-5 at
+     the median and 1.3e-4 at the max (validation E2), and the engine sat at 8.6e-5 (E3).
+   The meta is written before the audit and again with its record, so a crash in the audit leaves the run's meta.
 
 The "fast" block (all optional; a flag overrides the block, and the block overrides the default):
 
@@ -52,9 +66,10 @@ The "fast" block (all optional; a flag overrides the block, and the block overri
 | forward_stats | "auto" | "two_pass" on CUDA, "cpu_mirror" on the CPU; "one_pass" is diagnostic |
 | deterministic | false | bitwise reruns (cuDNN deterministic, no benchmark, deterministic cuBLAS and Inductor) |
 | allow_version_drift | false | run with cherimoya/tangermeme versions other than the ones cheri_dls was checked against |
+| audit | 8 | peaks the stock deep_lift_shap re-attributes after the run (step 11); 0 turns the audit off |
 
-Keys the design names for later rounds (audit, resume, part files, the tangermeme engine, conv_class, other sidecar
-names) are refused rather than ignored, and so is any unknown key.
+Keys the design names for later rounds (resume, part files, the tangermeme engine, conv_class, other sidecar names)
+are refused rather than ignored, and so is any unknown key.
 
 Deliberate differences from the stock command:
 - The forward self-check gates in strict fp32. Both sides, our eager forward and the stock module through
@@ -71,11 +86,23 @@ Deliberate differences from the stock command:
   never sits next to a partial set of new files.
 - output "profile" and dtypes other than float32 are refused, and the output directories are checked, before the
   model is loaded.
+- The audit's departures from design §14: batch_size min(JSON, 20) rather than 64 (the 8 GB rule); a warning above a
+  median rel-L2 of 3e-4 in either precision, rather than 1e-3 in reference precision only; and the references are
+  checked against tangermeme's own draw before they are injected. The forward self-check stays a strict-fp32 gate of
+  the architecture and weights; whether the run is faithful in its own precision is what the audit checks, per run
+  (design/revisions.md).
 
 NUMBA_CACHE_DIR: importing this module exports a node-local default, $TMPDIR/numba_cache or else
 /dev/shm/$USER/numba_cache, if it is unset. tangermeme compiles its numba shuffle kernel with cache=True when it is
 imported, which fixes the cache location then; unset, numba would write into the installed environment. So the
 variable must be set before cherimoya or cheri_dls is imported, and this module imports both only inside run().
+
+TRITON_CACHE_AUTOTUNING: importing this module also exports TRITON_CACHE_AUTOTUNING=1 if it is unset. The stock
+module's training path, which the self-check and the audit run, uses cherimoya's autotuned Triton kernels, and
+autotuning them costs about 50 s per process on the real model. With the variable set, Triton keeps the timings in
+TRITON_CACHE_DIR, so a node pays once. Triton reads it when a kernel is decorated, at `import cherimoya`, so it too
+must be set before cherimoya is imported. The meta records its value, whether this module set it, and whether
+cherimoya was already imported (then it changes nothing in this process).
 """
 
 from __future__ import annotations
@@ -103,6 +130,16 @@ SELF_CHECK_PEAKS = 4
 SELF_CHECK_MAX_ABS = 2.5e-4
 """§14: abort if our counts output and the stock module's differ by more than this on the first 4 peaks."""
 
+AUDIT_PEARSON_MIN = 0.9999
+AUDIT_REL_L2_MAX = 1e-2
+"""The audit fails on any peak below this Pearson or above this rel-L2 (acceptance criterion E5's caps, per peak)."""
+AUDIT_WARN_MEDIAN_REL_L2 = 3e-4
+"""The audit warns when the median rel-L2 over its peaks exceeds this."""
+AUDIT_MAX_BATCH = 20
+"""The audit's stock deep_lift_shap runs at min(JSON batch_size, this): about 6 GB on the real model at 20."""
+AUDIT_FAILED_EXIT = 3
+"""main()'s exit status when the audit fails; the outputs and the meta are written by then."""
+
 FAST_DEFAULTS = {
     "precision": "reference",
     "seqs_per_step": "auto",
@@ -112,13 +149,13 @@ FAST_DEFAULTS = {
     "forward_stats": "auto",
     "deterministic": False,
     "allow_version_drift": False,
+    "audit": 8,
 }
-"""The "fast" options and their defaults (the Engine's own defaults)."""
+"""The "fast" options and their defaults (the Engine's own defaults, and the audit's peak count)."""
 
 FAST_LATER = {
     "engine": "dls",
     "self_check": True,
-    "audit": None,
     "resume": None,
     "part_peaks": None,
     "chunk_peaks": None,
@@ -161,7 +198,24 @@ def ensure_numba_cache_dir() -> str:
     return path
 
 
+def ensure_triton_autotune_cache() -> dict:
+    """Export TRITON_CACHE_AUTOTUNING=1 if it is unset; return what was found, for the meta (see the module doc).
+
+    A value that is already set, "0" included, is kept. "cherimoya_imported" True means cherimoya's kernels were
+    decorated before this ran, so the variable cannot change them in this process.
+    """
+    before = os.environ.get("TRITON_CACHE_AUTOTUNING")
+    if before is None:
+        os.environ["TRITON_CACHE_AUTOTUNING"] = "1"
+    return {
+        "TRITON_CACHE_AUTOTUNING": os.environ["TRITON_CACHE_AUTOTUNING"],
+        "set_by_attribute_fast": before is None,
+        "cherimoya_imported": "cherimoya" in sys.modules,
+    }
+
+
 ensure_numba_cache_dir()
+TRITON_AUTOTUNE = ensure_triton_autotune_cache()
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -223,6 +277,9 @@ def _check_fast(options: dict) -> None:
     for key in ("deterministic", "allow_version_drift"):
         if not isinstance(options[key], bool):
             raise bad(key, "true or false")
+    audit = options["audit"]
+    if isinstance(audit, bool) or not isinstance(audit, numbers.Integral) or audit < 0:
+        raise bad("audit", "a number of peaks, 0 or more")
 
 
 def engine_dtype(dtype: object, device: object) -> str:
@@ -370,6 +427,176 @@ def compare_run_outputs(check: dict, y_x, precision: str, bound: float = SELF_CH
             precision,
         )
     return {"precision": precision, "max_abs": value, "run_y": run_y.tolist()}
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# the audit (§14)
+
+
+class AuditFailed(RuntimeError):
+    """The audit found a peak beyond its caps, or references that are not tangermeme's. The outputs are written."""
+
+
+def audit_peaks(n_kept: int, n_audit: int):
+    """The audit's peaks: round(linspace(0, n_kept - 1, n_audit)) as int64, every peak when n_audit >= n_kept.
+
+    Consecutive points of the linspace are at least 1 apart, so the rounded indices are distinct.
+    """
+    import numpy
+
+    if n_audit <= 0 or n_kept <= 0:
+        return numpy.zeros(0, numpy.int64)
+    if n_audit >= n_kept:
+        return numpy.arange(n_kept, dtype=numpy.int64)
+    return numpy.round(numpy.linspace(0, n_kept - 1, n_audit)).astype(numpy.int64)
+
+
+def compare_attributions(
+    ours,
+    stock,
+    *,
+    pearson_min: float = AUDIT_PEARSON_MIN,
+    rel_l2_max: float = AUDIT_REL_L2_MAX,
+    warn_median: float = AUDIT_WARN_MEDIAN_REL_L2,
+) -> dict:
+    """Per-peak Pearson and rel-L2 = ||ours - stock|| / ||stock|| over each peak's values, in float64, and the verdict.
+
+    ours and stock are (n, 4, W) arrays. "pass" is every peak within both caps (NaN fails); "warn" is a median rel-L2
+    above warn_median. Returns plain numbers and lists, for the meta.
+    """
+    import numpy
+
+    a = numpy.asarray(ours, dtype=numpy.float64).reshape(len(ours), -1)
+    b = numpy.asarray(stock, dtype=numpy.float64).reshape(len(stock), -1)
+    if a.shape != b.shape or not len(a):
+        raise ValueError(f"the audit compares equal, non-empty shapes, got {a.shape} and {b.shape}")
+    rel = numpy.linalg.norm(a - b, axis=1) / numpy.maximum(numpy.linalg.norm(b, axis=1), 1e-30)
+    ac, bc = a - a.mean(axis=1, keepdims=True), b - b.mean(axis=1, keepdims=True)
+    r = (ac * bc).sum(axis=1) / numpy.maximum(numpy.linalg.norm(ac, axis=1) * numpy.linalg.norm(bc, axis=1), 1e-300)
+    ok = (r >= pearson_min) & (rel <= rel_l2_max)
+    return {
+        "pearson": r.tolist(),
+        "rel_l2": rel.tolist(),
+        "min_pearson": float(r.min()),
+        "median_rel_l2": float(numpy.median(rel)),
+        "max_rel_l2": float(rel.max()),
+        "failed_positions": numpy.flatnonzero(~ok).tolist(),
+        "bounds": {"pearson_min": pearson_min, "rel_l2_max": rel_l2_max, "warn_median_rel_l2": warn_median},
+        "pass": bool(ok.all()),
+        "warn": not float(numpy.median(rel)) <= warn_median,
+    }
+
+
+def _tangermeme_references(X, peaks, n_shuffles: int, random_state: int):
+    """tangermeme's own draw for the peaks, as deep_lift_shap makes it: pair (e, k) gets
+    ``dinucleotide_shuffle(X[e:e+1].float(), n=1, random_state=random_state + k)[:, 0]`` (TM/deep_lift_shap.py:706-708).
+    Returned as dls_refs tokens, (len(peaks), K, L) uint8."""
+    import dls_refs
+    import torch
+    from tangermeme.ersatz import dinucleotide_shuffle
+
+    out = []
+    for e in peaks:
+        x = X[int(e) : int(e) + 1].float()
+        refs = [dinucleotide_shuffle(x, n=1, random_state=random_state + k)[:, 0] for k in range(n_shuffles)]
+        out.append(dls_refs.onehot_to_tokens(torch.cat(refs)))
+    return out
+
+
+def run_audit(engine, model, X, result, peaks, start: int, end: int, *, batch_size: int, warning_threshold) -> dict:
+    """The audit of step 11 (see the module doc) on `peaks`, which the run kept the references of; returns its record.
+
+    model is the float32 Cherimoya, on the engine's device. result is the engine's Result, with result.references the
+    (len(peaks), K, L) tokens of those peaks' references. The stock deep_lift_shap's per-batch convergence warnings are
+    counted, not shown: the run's own deltas are in its summary warning and the deltas sidecar.
+    """
+    import warnings
+
+    import cheri_dls
+    import dls_refs
+    import numpy
+    import torch
+    from cherimoya.deep_lift_shap import attribution_ops
+    from tangermeme.deep_lift_shap import deep_lift_shap
+
+    began = time.perf_counter()
+    device = engine.weights.device
+    K = result.references.shape[1]
+    bs = max(1, min(int(batch_size), AUDIT_MAX_BATCH))
+    record: dict = {
+        "peaks": len(peaks),
+        "indices": [int(i) for i in peaks],
+        "batch_size": bs,
+        "dtype": "float32",
+        "device": str(device),
+        "precision": engine.precision,
+        "deterministic": engine.deterministic,
+        "n_shuffles": int(K),
+        "random_state": engine.random_state,
+        "references": "the engine's own for these peaks, kept by the run and injected",
+    }
+    drawn = _tangermeme_references(X, peaks, K, engine.random_state)
+    same = [bool(numpy.array_equal(result.references[i], drawn[i])) for i in range(len(peaks))]
+    record["references_match_tangermeme"] = all(same)
+    record["references_mismatched_positions"] = [i for i, ok in enumerate(same) if not ok]
+
+    R = dls_refs.tokens_to_onehot(result.references, torch.float32)
+    wrapper = cheri_dls.make_wrapper(model, "counts", engine.group).to(device).eval()
+    index = torch.as_tensor(numpy.asarray(peaks, numpy.int64))
+    if device.type == "cuda":
+        torch.cuda.empty_cache()  # the engine's cached blocks go back before the stock run allocates its own
+        torch.cuda.reset_peak_memory_stats(device)
+    threshold = float("inf") if warning_threshold is None else float(warning_threshold)
+    t = time.perf_counter()
+    with (
+        cheri_dls.precision_mode(engine.precision, deterministic=engine.deterministic, inductor_cache=False),
+        warnings.catch_warnings(record=True) as caught,
+    ):
+        warnings.simplefilter("always")
+        stock = deep_lift_shap(
+            wrapper,
+            X[index],
+            references=R,
+            n_shuffles=K,
+            hypothetical=True,
+            batch_size=bs,
+            warning_threshold=threshold,
+            additional_nonlinear_ops=attribution_ops(),
+            dtype="float32",
+            device=str(device),
+            random_state=engine.random_state,
+            verbose=False,
+        )[:, :, start:end].float()
+    record["stock_s"] = time.perf_counter() - t
+    deltas_warnings = [w for w in caught if str(w.message).startswith("Convergence deltas too high")]
+    for w in caught:
+        if w not in deltas_warnings:
+            warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
+    record["stock_delta_warnings"] = len(deltas_warnings)
+    if device.type == "cuda":
+        record["gpu_max_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
+    ours = result.attr[index].float()
+    record.update(compare_attributions(ours.numpy(), stock.numpy()))
+    record["pass"] = bool(record["pass"] and record["references_match_tangermeme"])
+    record["seconds"] = time.perf_counter() - began
+    return record
+
+
+def _log_audit(audit: dict) -> None:
+    summary = (
+        f"{audit['peaks']} peaks against the stock deep_lift_shap (batch {audit['batch_size']}, {audit['precision']} "
+        f"precision): min Pearson {audit['min_pearson']:.8f}, rel-L2 median {audit['median_rel_l2']:.3g} and max "
+        f"{audit['max_rel_l2']:.3g} (caps {AUDIT_PEARSON_MIN}, {AUDIT_REL_L2_MAX:g}); references "
+        f"{'equal' if audit['references_match_tangermeme'] else 'NOT equal'} to tangermeme's; {audit['seconds']:.1f} s"
+    )
+    if audit["warn"]:
+        logger.warning(
+            "audit: the median rel-L2 %.3g is above %g (the stock's own rerun floor is about 7e-5 in reference "
+            "precision)",
+            audit["median_rel_l2"],
+            AUDIT_WARN_MEDIAN_REL_L2,
+        )
+    (logger.info if audit["pass"] else logger.error)("audit %s: %s", "passed" if audit["pass"] else "FAILED", summary)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -602,8 +829,9 @@ def run(args: argparse.Namespace) -> dict | None:
     )
     gpu_before_run = torch.cuda.max_memory_allocated(device) if cuda else None
 
+    peaks = audit_peaks(len(X), options["audit"])
     t = time.perf_counter()
-    result = engine.run(X, start, end)
+    result = engine.run(X, start, end, keep_references=peaks if len(peaks) else None)
     timings["run"] = time.perf_counter() - t
     check["run_outputs"] = compare_run_outputs(check, result.y_x, engine.precision)
     X_attr = result.attr.float()
@@ -632,6 +860,7 @@ def run(args: argparse.Namespace) -> dict | None:
         compile=meta["compile_s"],
         warmup=meta["warmup_s"],
         refs=reference_stats.get("wait_s"),  # seconds the steps waited for the reference pool
+        refs_first_wait=reference_stats.get("first_wait_s"),  # the part of it spent on the first step's references
         refs_stalls=reference_stats.get("stalls"),
         steady_pairs_per_s=meta["steady_pairs_per_s"],
         pairs_per_s=meta["pairs_per_s"],
@@ -683,6 +912,8 @@ def run(args: argparse.Namespace) -> dict | None:
         },
         "deltas": deltas,
         "self_check": check,
+        "audit": {"peaks": len(peaks), "pass": None, "status": "pending" if len(peaks) else "off (audit 0)"},
+        "triton_autotune": dict(TRITON_AUTOTUNE, TRITON_CACHE_DIR=os.environ.get("TRITON_CACHE_DIR")),
         "outputs": {
             "ohe": parameters["ohe_filename"],
             "attr": parameters["attr_filename"],
@@ -712,6 +943,36 @@ def run(args: argparse.Namespace) -> dict | None:
         meta["seqs_per_step"],
         timings["total"],
     )
+    if not len(peaks):
+        return record
+
+    t = time.perf_counter()
+    audit = run_audit(
+        engine,
+        model,
+        X,
+        result,
+        peaks,
+        start,
+        end,
+        batch_size=parameters["batch_size"],
+        warning_threshold=parameters["warning_threshold"],
+    )
+    timings["audit"] = time.perf_counter() - t
+    timings["total"] = time.perf_counter() - began
+    record["audit"] = audit
+    record["finished_et"] = _now_et()
+    _write_json(meta_file, record)
+    _log_audit(audit)
+    if not audit["pass"]:
+        failed = audit["failed_positions"]
+        raise AuditFailed(
+            f"audit failed: {len(failed)} of {audit['peaks']} audited peaks (kept indices "
+            f"{[audit['indices'][i] for i in failed]}) are beyond the caps against the stock deep_lift_shap (Pearson >= "
+            f"{AUDIT_PEARSON_MIN}, rel-L2 <= {AUDIT_REL_L2_MAX:g}): min Pearson {audit['min_pearson']:.8f}, max rel-L2 "
+            f"{audit['max_rel_l2']:.3g}; references equal to tangermeme's: {audit['references_match_tangermeme']}. "
+            f"The outputs are written; {meta_file} records the audit."
+        )
     return record
 
 
@@ -751,13 +1012,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         help="run with other cherimoya/tangermeme versions than cheri_dls was checked against",
     )
+    parser.add_argument(
+        "--audit",
+        type=int,
+        metavar="N",
+        help="peaks the stock deep_lift_shap re-attributes after the run, to compare (default 8; 0: no audit)",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
+    """The command line; exit status 0, or AUDIT_FAILED_EXIT when the audit fails (the outputs are written)."""
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    run(args)
+    try:
+        run(args)
+    except AuditFailed as exc:
+        logger.error("%s", exc)
+        return AUDIT_FAILED_EXIT
     return 0
 
 

@@ -13,6 +13,12 @@ attributions computed by cheri_dls.Engine. These tests run both commands on the 
 C11: the ohe (int8) and idx (bool) files are numpy.array_equal to the stock's, every npz holds the one key arr_0, the
 shapes are equal, and the attributions are float32 with a per-locus rel-L2 of at most 1e-5 against the stock's.
 
+The audit (--audit N, design §14): every run above re-attributes 8 evenly spaced peaks with the stock deep_lift_shap,
+the engine's own references injected, at batch_size min(JSON, 20), and passes. A run whose engine output is corrupted
+on one audited peak (scaled by 1.05, or swapped with another peak's) fails it after writing every output, the meta
+records the failure, and main() exits 3; so do references that differ from tangermeme's draw. --audit 0 runs none.
+The per-peak comparison and its 3e-4 median warning are checked on synthetic arrays.
+
 Also covered:
 - The order of the writes: ohe, attr, then idx (the done marker), then the deltas sidecar; the meta sidecar and the
   self-check's record; a stale done marker is removed before the new files are written.
@@ -23,7 +29,8 @@ Also covered:
 - One summary convergence warning, none for warning_threshold null; the stock group error for a multi-group model
   with group null; random_state null records the drawn seed, and a rerun with it reproduces the attributions.
 - A failed forward self-check aborts before anything is written.
-- NUMBA_CACHE_DIR defaults to a node-local directory, exported before cherimoya is imported.
+- NUMBA_CACHE_DIR defaults to a node-local directory, exported before cherimoya is imported, and
+  TRITON_CACHE_AUTOTUNING to 1, so cherimoya's autotuned kernels cache their timings; a value already set is kept.
 
 Measured values are written to the terminal.
 """
@@ -246,6 +253,22 @@ def test_matches_the_stock_command(request, inputs, stock_runs, tmp_path, batch_
     assert check["run_outputs"]["max_abs"] <= 1e-6
     assert meta["outputs"]["attr_shape"] == [int(KEPT.sum()), 4, ATTR_WINDOW]
 
+    audit = meta["audit"]
+    _report(
+        request.config,
+        f"audit, batch_size {batch_size}: {audit['peaks']} peaks {audit['indices']} at stock batch "
+        f"{audit['batch_size']}: min Pearson {audit['min_pearson']:.10f}, rel-L2 median {audit['median_rel_l2']:.3g} "
+        f"max {audit['max_rel_l2']:.3g}; {audit['seconds']:.2f} s",
+    )
+    assert audit == record["audit"] and audit["pass"] is True and audit["warn"] is False
+    assert audit["indices"] == np.round(np.linspace(0, KEPT.sum() - 1, 8)).astype(int).tolist()
+    assert audit["batch_size"] == min(batch_size, attribute_fast.AUDIT_MAX_BATCH) and audit["dtype"] == "float32"
+    assert audit["references_match_tangermeme"] is True and audit["n_shuffles"] == N_SHUFFLES
+    assert audit["precision"] == "reference" and audit["failed_positions"] == []
+    assert audit["max_rel_l2"] <= C11_REL_L2 and audit["min_pearson"] >= 0.99999
+    assert "audit" in meta["timings_s"] and meta["triton_autotune"]["TRITON_CACHE_AUTOTUNING"]
+    assert meta["engine"]["reference_stats"]["first_wait_s"] is not None
+
 
 def test_writes_in_the_stock_order(inputs, tmp_path, monkeypatch):
     """ohe, attr, idx as attribute.py:115-117 writes them, so the idx file marks a finished run; then the sidecars."""
@@ -398,12 +421,16 @@ def test_fast_options_resolve_defaults_block_and_flags():
     assert options["seqs_per_step"] == 4  # the block wins over the default
     assert options["mem_budget_gb"] == attribute_fast.FAST_DEFAULTS["mem_budget_gb"]  # null keeps the default
     assert options["ref_workers"] == 0
+    assert options["audit"] == 8  # the default
+    assert attribute_fast.fast_options({"audit": 3})["audit"] == 3
+    assert attribute_fast.fast_options({"audit": 3}, argparse.Namespace(audit=0))["audit"] == 0  # the flag wins
+    assert attribute_fast.fast_options({"audit": None})["audit"] == 8
     # keys of later rounds are accepted only with this version's behaviour
-    attribute_fast.fast_options({"engine": "dls", "self_check": True, "audit": None})
-    with pytest.raises(ValueError, match="not implemented"):
-        attribute_fast.fast_options({"audit": 8})
+    attribute_fast.fast_options({"engine": "dls", "self_check": True, "resume": None})
     with pytest.raises(ValueError, match="not implemented"):
         attribute_fast.fast_options({"engine": "tangermeme"})
+    with pytest.raises(ValueError, match="not implemented"):
+        attribute_fast.fast_options({"resume": True})
     with pytest.raises(ValueError, match='unknown key "fast.precison"'):
         attribute_fast.fast_options({"precison": "fp32"})
     bad = [
@@ -416,6 +443,10 @@ def test_fast_options_resolve_defaults_block_and_flags():
         {"ref_workers": -1},
         {"forward_stats": "three_pass"},
         {"deterministic": "yes"},
+        {"audit": -1},
+        {"audit": True},
+        {"audit": 1.5},
+        {"audit": "8"},
     ]
     for block in bad:
         with pytest.raises(ValueError):
@@ -500,6 +531,138 @@ def test_a_failed_self_check_aborts_before_anything_is_written(inputs, tmp_path,
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# the audit
+
+
+def _corrupting_run(monkeypatch, corrupt) -> list:
+    """Make Engine.run hand back its result with corrupt(attr) applied: an engine whose output is wrong."""
+    real_run = cheri_dls.Engine.run
+    calls = []
+
+    def run(self, *args, **kwargs):
+        result = real_run(self, *args, **kwargs)
+        calls.append(kwargs.get("keep_references"))
+        return result._replace(attr=corrupt(result.attr.clone()))
+
+    monkeypatch.setattr(cheri_dls.Engine, "run", run)
+    return calls
+
+
+def _scale_one_peak(attr):
+    attr[3] *= 1.05  # rel-L2 0.05 > 1e-2, Pearson still 1
+    return attr
+
+
+def _swap_two_peaks(attr):
+    attr[[3, 7]] = attr[[7, 3]]  # Pearson far below 0.9999
+    return attr
+
+
+@pytest.mark.parametrize("corrupt", [_scale_one_peak, _swap_two_peaks], ids=["scaled", "swapped"])
+def test_a_corrupted_engine_output_fails_the_audit_after_writing(request, inputs, tmp_path, monkeypatch, corrupt):
+    calls = _corrupting_run(monkeypatch, corrupt)
+    path = write_params(inputs, tmp_path, "corrupt", fast={"ref_workers": 0})
+    with pytest.raises(attribute_fast.AuditFailed, match="audit failed") as failed:
+        attribute_fast.run(ns(path))
+    assert all(p.exists() for p in output_paths(path)), "every output is written before the audit fails"
+    meta = json.loads(output_paths(path)[-1].read_text())
+    audit = meta["audit"]
+    _report(request.config, f"audit of a {corrupt.__name__} output: {failed.value}")
+    peaks = np.round(np.linspace(0, KEPT.sum() - 1, 8)).astype(int).tolist()
+    assert len(calls) == 1 and np.array_equal(calls[0], peaks)
+    bad = [peaks.index(i) for i in (3, 7) if i in peaks and (corrupt is _swap_two_peaks or i == 3)]
+    assert audit["pass"] is False and audit["failed_positions"] == bad
+    assert audit["references_match_tangermeme"] is True
+    if corrupt is _scale_one_peak:
+        assert audit["rel_l2"][bad[0]] == pytest.approx(0.05, rel=1e-3) and audit["min_pearson"] > 0.99999
+    else:
+        assert max(audit["pearson"][i] for i in bad) < 0.9999
+    # through the command line: the same outputs, and exit status 3
+    assert attribute_fast.main(["-p", str(path)]) == attribute_fast.AUDIT_FAILED_EXIT
+
+
+def test_references_unlike_tangermemes_fail_the_audit(inputs, tmp_path, monkeypatch):
+    """If the engine's references for the audited peaks were not tangermeme's draw, the audit fails even though the
+    stock run, given the same references, agrees with the engine."""
+    real = attribute_fast._tangermeme_references
+
+    def shifted(X, peaks, n_shuffles, random_state):
+        return real(X, peaks, n_shuffles, random_state + 1)
+
+    monkeypatch.setattr(attribute_fast, "_tangermeme_references", shifted)
+    path = write_params(inputs, tmp_path, "refs", fast={"ref_workers": 0})
+    with pytest.raises(attribute_fast.AuditFailed, match="references equal to tangermeme's: False"):
+        attribute_fast.run(ns(path))
+    audit = json.loads(output_paths(path)[-1].read_text())["audit"]
+    assert audit["references_match_tangermeme"] is False and audit["failed_positions"] == []
+    assert audit["references_mismatched_positions"] == list(range(8))
+
+
+def test_audit_zero_runs_no_audit(inputs, tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("--audit 0 must not audit")
+
+    monkeypatch.setattr(attribute_fast, "run_audit", forbidden)
+    calls = _corrupting_run(monkeypatch, lambda attr: attr)
+    path = write_params(inputs, tmp_path, "noaudit", fast={"ref_workers": 0, "audit": 8})
+    assert attribute_fast.main(["-p", str(path), "--audit", "0"]) == 0
+    meta = json.loads(output_paths(path)[-1].read_text())
+    assert meta["fast"]["audit"] == 0 and meta["audit"] == {"peaks": 0, "pass": None, "status": "off (audit 0)"}
+    assert calls == [None]  # the run keeps no references
+
+
+def test_audit_peaks_are_evenly_spaced_and_distinct():
+    assert attribute_fast.audit_peaks(10, 8).tolist() == [0, 1, 3, 4, 5, 6, 8, 9]
+    assert attribute_fast.audit_peaks(4999, 8).tolist() == [0, 714, 1428, 2142, 2856, 3570, 4284, 4998]
+    assert attribute_fast.audit_peaks(5, 8).tolist() == [0, 1, 2, 3, 4]
+    assert attribute_fast.audit_peaks(5, 0).tolist() == [] and attribute_fast.audit_peaks(0, 8).tolist() == []
+    assert attribute_fast.audit_peaks(1, 1).tolist() == [0]
+    for n in range(1, 60):
+        for k in range(1, n + 1):
+            peaks = attribute_fast.audit_peaks(n, k)
+            assert len(np.unique(peaks)) == k and peaks[0] == 0 and peaks[-1] == (n - 1 if k > 1 else 0)
+
+
+def test_compare_attributions_caps_and_warning(caplog):
+    rng = np.random.default_rng(0)
+    stock = rng.normal(size=(6, 4, 50))
+    same = attribute_fast.compare_attributions(stock, stock)
+    assert same["pass"] and not same["warn"] and same["max_rel_l2"] == 0.0 and same["min_pearson"] == pytest.approx(1)
+
+    # a median rel-L2 of 5e-4: within the caps, so it passes, but above 3e-4, so it warns
+    noise = rng.normal(size=stock.shape)
+    noise *= (
+        5e-4
+        * np.linalg.norm(stock.reshape(6, -1), axis=1)[:, None, None]
+        / np.linalg.norm(noise.reshape(6, -1), axis=1)[:, None, None]
+    )
+    near = attribute_fast.compare_attributions(stock + noise, stock)
+    assert near["pass"] and near["warn"] and near["median_rel_l2"] == pytest.approx(5e-4, rel=1e-6)
+
+    # a peak with a large constant offset: its centred values decorrelate (Pearson < 0.9999) while its rel-L2,
+    # relative to the offset's norm, stays under 1e-2: the Pearson cap alone fails it
+    offset = stock.copy()
+    offset[2] = 100.0 + 0.1 * rng.normal(size=offset[2].shape)
+    ours = offset.copy()
+    ours[2] += 0.02 * rng.normal(size=ours[2].shape)
+    pearson_only = attribute_fast.compare_attributions(ours, offset)
+    assert pearson_only["rel_l2"][2] <= 1e-2 and pearson_only["pearson"][2] < 0.9999
+    assert not pearson_only["pass"] and pearson_only["failed_positions"] == [2]
+
+    nan = stock.copy()
+    nan[1, 0, 0] = np.nan
+    assert attribute_fast.compare_attributions(nan, stock)["failed_positions"] == [1]
+    with pytest.raises(ValueError, match="equal, non-empty"):
+        attribute_fast.compare_attributions(stock[:2], stock)
+
+    audit = dict(near, peaks=6, batch_size=20, precision="reference", references_match_tangermeme=True, seconds=1.0)
+    with caplog.at_level("INFO", logger="attribute_fast"):
+        attribute_fast._log_audit(audit)
+    assert [r.levelname for r in caplog.records] == ["WARNING", "INFO"]
+    assert "above 0.0003" in caplog.records[0].getMessage()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # NUMBA_CACHE_DIR
 
 
@@ -538,3 +701,32 @@ def test_the_numba_cache_is_exported_before_cherimoya_is_imported(tmp_path):
     exported, kernel_cache = done.stdout.split()[-2:]
     assert exported == str(tmp_path / "numba_cache")
     assert Path(kernel_cache).resolve().is_relative_to((tmp_path / "numba_cache").resolve())
+
+
+@pytest.mark.parametrize("preset", [None, "0"], ids=["unset", "set-to-0"])
+def test_triton_autotune_caching_is_exported_before_cherimoya_is_imported(tmp_path, preset):
+    """In a fresh process: importing attribute_fast exports TRITON_CACHE_AUTOTUNING=1 when it is unset (and keeps a
+    value already set), before cherimoya is imported, so cherimoya's autotuned kernels cache their timings."""
+    code = textwrap.dedent(
+        f"""
+        import os, sys
+        sys.path.insert(0, {str(WORKFLOWS)!r})
+        import attribute_fast
+        print(os.environ.get("TRITON_CACHE_AUTOTUNING"))
+        print(attribute_fast.TRITON_AUTOTUNE["set_by_attribute_fast"], attribute_fast.TRITON_AUTOTUNE["cherimoya_imported"])
+        import cherimoya.cheri as cheri
+        print(cheri.HAS_TRITON and cheri._fwd_stats_kernel.cache_results)
+        """
+    )
+    env = {k: v for k, v in os.environ.items() if k != "TRITON_CACHE_AUTOTUNING"}
+    env["TMPDIR"] = str(tmp_path)
+    env.setdefault("NUMBA_CACHE_DIR", str(tmp_path / "numba_cache"))
+    if preset is not None:
+        env["TRITON_CACHE_AUTOTUNING"] = preset
+    done = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=600)
+    assert done.returncode == 0, done.stderr[-3000:]
+    value, flags, cached = done.stdout.strip().splitlines()[-3:]
+    if preset is None:
+        assert (value, flags, cached) == ("1", "True False", "True")
+    else:
+        assert (value, flags, cached) == ("0", "False False", "False")

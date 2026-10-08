@@ -10,15 +10,23 @@ reference differ: cuDNN's input-grad is not repeatable, cudnn.benchmark and Trit
 in each process, and the rescale rule's secants amplify ulp-level differences. A fixed tolerance would either pass a
 real error or fail an exact engine.
 
-Subcommands, in order. Every one runs inside a box. All of them import torch except the drivers of `oracle` and
-`ours`, which only start and watch one child process per run, one at a time.
+Subcommands, in order. Every one runs inside a box. All of them import torch except `checkpoint-json`, `summarize`
+and the drivers of `oracle` and `ours`, which only start and watch one child process per run, one at a time.
 
+- checkpoint-json: the attribute.json of another trained checkpoint. It copies a base JSON (the pilot's) and changes
+  only "model", ``<fold>/cherimoya.<fold>.torch``, and "loci", the fold's fit.json "loci". The three output paths point
+  under --out-dir and stay unused. The chromosome list is the base's and must name all 24 chromosomes: cherimoya's
+  default list is the pilot fold's training and validation chromosomes, 21 of them.
 - prepare: reads the attribute.json the way `cherimoya attribute` does (attribute.py:21-86: merge_parameters,
   extract_loci, the N filter, the centred window). P256 is 256 peaks evenly spaced over the kept peaks,
   round(linspace(0, n - 1, 256)). The 8 truth peaks are evenly spaced over P256, round(linspace(0, 255, 8)).
   P256's references are drawn with dls_refs.RefProducer, the engine's own path. Every pair is checked against
   tangermeme's ``dinucleotide_shuffle(X[e:e+1].float(), n=1, random_state=rs + k)[:, 0]`` (G0). Writes <out>/inputs/:
-  the kept peaks as uint8 tokens, the indices, P256's reference tokens and meta.json.
+  the kept peaks as uint8 tokens, the indices, P256's reference tokens and meta.json, and p256.tsv (p256-table).
+- p256-table: writes <out>/inputs/p256.tsv from what prepare saved. Each P256 peak gets its kept index, its row among
+  the loci extract_loci read, its coordinates and whether it is a truth peak. The loci are tangermeme's own
+  _interleave_loci over the JSON's loci and chroms; with one loci file and every chromosome listed, the row is the
+  file's line.
 - oracle: the stock runs, each in a fresh subprocess, so each picks its own cuDNN algorithms and Triton
   configurations, as separate `cherimoya attribute` runs do.
   - R1, R1p (R1'): the flags as `import cherimoya` leaves them (TF32 GEMMs, cudnn.allow_tf32, cudnn.benchmark).
@@ -63,7 +71,18 @@ Subcommands, in order. Every one runs inside a box. All of them import torch exc
     report's "Revised criteria" section, but do not gate.
   - Context, not gated: T1' vs T1, R1_8 vs R1, every run's distance to T64, every run's forward error against T64,
     every run's deltas, and with --probe-json the cuDNN classes probe P3 (dls_probe.py) found at the row counts these
-    runs used.
+    runs used. Also E3's precision-policy margins: T1 vs R1's median, and the stock rerun's (F_rr), as fractions of
+    0.3 F_tf(0.5). And E7(a)'s ratios d(ours, T64) / d(R, T64), computed whether or not E3 and E4 pass.
+  - E10 also checks that each run it compares ran at its specified S, in raw() and in run(). An out-of-memory halving
+    would otherwise compare a run with itself.
+  - --plan names the runs and gates of a validation (PLANS). "full" (the default) is everything above, on the pilot
+    model. "checkpoint" validates another checkpoint: the oracle R1, R1', R2 and R2', ours T1, T2 and T1_S8, the truth.
+    It gates G0, E1, E2, E3, E4, E5 and E10 in reference mode, with E7(a) as context. The other gates are out of scope:
+    they are listed as such and do not count toward the verdict. A gate that reads a planned run that is missing is
+    "not run".
+- summarize: one summary.md over several validation directories (one per checkpoint), from their report.json and
+  inputs/meta.json. It has the verdicts, the floors, E3's policy margins, E7(a)'s ratios and every gate check's
+  measured value against its bound. --reference-dir adds a column for another validation, such as the pilot's.
 
 Deviations from the design, forced by the rules for the shared GPUs and recorded in the report:
 - The oracle's batch_size. Stock deep_lift_shap at the pilot's batch_size 64 allocates 15.5 GB on this model, and
@@ -82,6 +101,16 @@ Run it in a box, on one GPU and four pinned cores, one GPU job at a time:
     ... dls_validate.py ours --out-dir <dir> --runs T1,T1p,T2,T3,T1_S8,T2_S8,P5000_ref,P5000_fp32
     CUDA_VISIBLE_DEVICES= ... dls_validate.py truth --out-dir <dir>
     CUDA_VISIBLE_DEVICES= ... dls_validate.py gates --out-dir <dir>
+
+Another checkpoint, one directory per checkpoint, one checkpoint at a time:
+
+    dls_validate.py checkpoint-json --base attr_pilot/attribute.json --fold-dir <dataset>/<fold> --out-dir <dir>
+    ... dls_validate.py prepare -p <dir>/attribute.json --out-dir <dir>
+    ... dls_validate.py oracle --plan checkpoint --out-dir <dir> --batch-size 20
+    ... dls_validate.py ours --plan checkpoint --out-dir <dir> --mem-budget-gb 7.5
+    CUDA_VISIBLE_DEVICES= ... dls_validate.py truth --out-dir <dir>
+    CUDA_VISIBLE_DEVICES= ... dls_validate.py gates --plan checkpoint --out-dir <dir>
+    dls_validate.py summarize --out <summary.md> <dir> [<dir> ...] [--reference-dir attr_pilot/validation]
 """
 
 from __future__ import annotations
@@ -129,6 +158,44 @@ OURS_RUNS = {
 }
 TRUTH_RUN = "T64"
 REFERENCE_OF = {"reference": "R1", "fp32": "R2"}  # the stock run a mode is judged against
+
+GATES = ("G0", "E1", "E2", "E3", "E4", "E5", "E6", "E8", "E10")
+# The runs each gate reads. When a run the plan has is missing, the gates that read it are "not run" (None).
+GATE_RUNS = {
+    "G0": (),
+    "E1": ("R1", "R1p", "R2", "T1", "T2", "T3", TRUTH_RUN),
+    "E2": ("R1", "R1p", "R2", "R2p"),
+    "E3": ("T1", "R1", "R1p", "R2"),
+    "E4": ("T2", "R2", "R2p"),
+    "E5": ("R1", "R2", "T1", "T1p", "T3", "T1_S8", "T2", "T2_S8"),
+    "E6": ("T3", "T1", "R1", "R1p", "R2"),
+    "E8": ("P5000_ref",),
+    "E10": ("T1_S8", "T1", "R1", "R1p", "T2_S8", "T2", "R2", "R2p"),
+}
+# A validation's runs and the gates its verdict covers. "full" is design §15.3 on the pilot model, as rounds 2 and 3
+# ran it. "checkpoint" repeats the floors, T1, T2, T1_S8 and the truth on another trained checkpoint. Without T3, P5000
+# and T2_S8, E6, E8 and E10's fp32 mode are out of its scope.
+PLANS = {
+    "full": {
+        "about": "design §15.3: every stock and engine run, the fp64 truth, every gate",
+        "oracle": tuple(ORACLE_RUNS),
+        "ours": tuple(OURS_RUNS),
+        "gates": GATES,
+    },
+    "checkpoint": {
+        "about": "another checkpoint: R1, R1', R2, R2'; T1, T2, T1_S8; the fp64 truth. G0, E1, E2, E3, E4, E5 and E10 "
+        "in reference mode; E7(a) as context",
+        "oracle": ("R1", "R1p", "R2", "R2p"),
+        "ours": ("T1", "T2", "T1_S8"),
+        "gates": ("G0", "E1", "E2", "E3", "E4", "E5", "E10"),
+    },
+}
+
+
+def plan_runs(plan: str) -> list[str]:
+    """Every run a plan has, the truth included, in the order the report lists runs."""
+    return [*PLANS[plan]["oracle"], *PLANS[plan]["ours"], TRUTH_RUN]
+
 
 # Acceptance constants (final_rest.json acceptance_criteria E1-E10; design §15.4), as revised after round 2 for E1 in
 # reference mode and E10 in fp32 mode (design/revisions.md). Nothing else is relaxed here.
@@ -229,6 +296,113 @@ def accuracy_limited(ours: dict, ref: dict, factor: float = ACCURACY_FACTOR) -> 
     return {stat: bool(ours[stat] <= factor * ref[stat]) for stat in ("q50", "max")}
 
 
+def e3_policy(floors: dict, e3_rows: list[dict]) -> dict:
+    """E3's precision-policy check, median <= 0.3 F_tf(0.5), per metric, with its margins.
+
+    T1 vs R1's median and the stock rerun's, F_rr(0.5) (R1' vs R1), are each given as a fraction of the bound. A run
+    under the reference's precision policy differs from R1 by about what a rerun does; one under another policy lands
+    near F_tf. Read from the floors and E3's rows, which every report.json has.
+    """
+    out = {}
+    f_rr = floors.get("F_rr")
+    for row in e3_rows:
+        if row["statistic"] != "q50 policy" or not row["bound"]:
+            continue
+        metric, bound = row["metric"], row["bound"]
+        rerun = f_rr[metric]["q50"] if f_rr else None
+        out[metric] = {
+            "bound": bound,
+            "rule": row["rule"],
+            "ours_q50": row["measured"],
+            "ours_ratio": row["measured"] / bound,
+            "stock_rerun_q50": rerun,
+            "stock_rerun_ratio": None if rerun is None else rerun / bound,
+            "pass": row["pass"],
+        }
+    return out
+
+
+def e7_context(e7_computed: dict) -> dict:
+    """E7(a)'s tie-breaker as context: per gate and metric, d(ours, T64) / d(R, T64) at the median and the max, and
+    whether both are within 1.2. Read from report.json's "E7_computed", which gates fills whenever T64 exists."""
+    out = {}
+    for gate, tb in e7_computed.items():
+        metrics = {}
+        for metric, v in tb["metrics"].items():
+            metrics[metric] = {
+                "d_ours": {s: v["d_ours"][s] for s in ("q50", "max")},
+                "d_ref": {s: v["d_ref"][s] for s in ("q50", "max")},
+                "ratio": {s: v["d_ours"][s] / max(v["d_ref"][s], TINY) for s in ("q50", "max")},
+                "within": bool(all(v["pass"].values())),
+            }
+        out[gate] = {"ours": tb["ours"], "reference": tb["reference"], "metrics": metrics}
+    return out
+
+
+ALL_CHROMS = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
+UNUSED_OUTPUTS = (
+    ("ohe_filename", "attr.ohe.npz"),
+    ("attr_filename", "attr.attr.npz"),
+    ("idx_filename", "attr.idx.npy"),
+)
+
+
+def checkpoint_parameters(base: dict, fold_dir: Path, out_dir: Path) -> dict:
+    """The attribute.json of the checkpoint trained in fold_dir: `base` with "model" ``<fold_dir>/cherimoya.<fold>.torch``
+    and "loci" the fold's fit.json "loci", and its output paths under out_dir/stock_unused. Nothing else changes.
+
+    The base must list all 24 chromosomes: cherimoya's default list is the pilot fold's training and validation
+    chromosomes, 21 of them, and "all 24 chromosomes" is the design's peak set (§15.3).
+    """
+    fold_dir = Path(fold_dir)
+    fold = fold_dir.name
+    fit = json.loads((fold_dir / "fit.json").read_text())
+    if fit.get("name", f"cherimoya.{fold}") != f"cherimoya.{fold}":
+        raise ValueError(f"{fold_dir / 'fit.json'} names the model {fit['name']!r}, not cherimoya.{fold}")
+    model = fold_dir / f"cherimoya.{fold}.torch"
+    loci = [str(p) for p in (fit["loci"] if isinstance(fit["loci"], list) else [fit["loci"]])]
+    missing = [str(p) for p in (model, *loci) if not Path(p).exists()]
+    if missing:
+        raise FileNotFoundError(f"missing: {missing}")
+    chroms = base.get("chroms") or []
+    if sorted(chroms) != sorted(ALL_CHROMS):
+        raise ValueError(f"the base JSON must list the 24 chromosomes {ALL_CHROMS}, not {chroms}")
+    parameters = dict(base)
+    parameters["model"], parameters["loci"] = str(model), loci
+    for key, name in UNUSED_OUTPUTS:
+        parameters[key] = str(Path(out_dir) / "stock_unused" / name)
+    return parameters
+
+
+def write_p256_table(out_dir: Path) -> Path:
+    """<out>/inputs/p256.tsv: each P256 peak's position in P256, its kept index, its row among the loci extract_loci
+    read, its coordinates as the loci file gives them, and whether it is a truth peak.
+
+    The loci are tangermeme's own _interleave_loci over the JSON's loci and chroms, as extract_loci reads them, and the
+    row is the kept-mask position (np.flatnonzero(idx)[kept index]). With one loci file and every chromosome listed,
+    that row is the file's line, counting from 0.
+    """
+    import numpy as np
+    from tangermeme.io import _interleave_loci
+
+    d = Path(out_dir) / "inputs"
+    parameters = json.loads((d / "meta.json").read_text())["parameters"]
+    idx = np.load(d / "idx.npy")
+    p256 = np.load(d / "p256.npy")
+    truth = set(np.load(d / "truth.npy").tolist())
+    loci = _interleave_loci(parameters["loci"], parameters["chroms"])
+    if len(loci) != len(idx):
+        raise RuntimeError(f"extract_loci's mask has {len(idx)} entries but the loci have {len(loci)} rows")
+    rows = np.flatnonzero(idx)[p256]
+    lines = ["p256\tkept_index\tloci_row\tchrom\tstart\tend\ttruth"]
+    for i, (kept, row) in enumerate(zip(p256.tolist(), rows.tolist())):
+        locus = loci.iloc[row]
+        lines.append(f"{i}\t{kept}\t{row}\t{locus['chrom']}\t{locus['start']}\t{locus['end']}\t{int(i in truth)}")
+    path = d / "p256.tsv"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # helpers shared by the children
 
@@ -261,6 +435,23 @@ def _base_record(kind: str, name: str, spec: dict, args: argparse.Namespace) -> 
         "started_et": _now_et(),
         "env": {k: os.environ.get(k) for k in ENV_KEYS},
     }
+
+
+def _harness_version() -> dict:
+    """This file's path, its git commit and whether workflows/cherimoya differs from it (None outside a git checkout)."""
+    out: dict = {"file": str(Path(__file__).resolve()), "commit": None, "dirty": None}
+    try:
+        git = ["git", "-C", str(HERE)]
+        out["commit"] = subprocess.run(
+            [*git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True, timeout=30
+        ).stdout.strip()
+        status = subprocess.run(
+            [*git, "status", "--porcelain", "--", "."], capture_output=True, text=True, check=True, timeout=30
+        )
+        out["dirty"] = bool(status.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return out
 
 
 def _versions(torch) -> dict:
@@ -500,6 +691,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         raise SystemExit("the evenly spaced peak indices are not distinct")
     meta.update(
         parameters=parameters,
+        n_loci_read=len(idxs),
         n_regions_in_chroms=n_loci,
         n_kept=n,
         length=L,
@@ -555,6 +747,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     meta["timings_s"]["total"] = time.perf_counter() - began
     meta["finished_et"] = _now_et()
     _write_json(out / "meta.json", meta)
+    write_p256_table(args.out_dir)
     logger.info(
         "prepare: %d kept peaks of length %d, window [%d, %d); P256 %d..%d; G0 %d/%d pairs bitwise equal; wrote %s",
         n,
@@ -570,13 +763,39 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     return 0 if meta["G0"]["pass"] else 1
 
 
+def cmd_checkpoint_json(args: argparse.Namespace) -> int:
+    """Write <out>/attribute.json for the checkpoint in --fold-dir (checkpoint_parameters). An existing file is kept
+    when it says the same and refused when it differs: runs may already have read it."""
+    base = json.loads(Path(args.base).read_text())
+    parameters = checkpoint_parameters(base, args.fold_dir, args.out_dir)
+    text = json.dumps(parameters, indent=4) + "\n"
+    path = Path(args.out_dir) / "attribute.json"
+    if path.exists():
+        if path.read_text() != text:
+            logger.error("%s exists and differs from the JSON for %s; not overwritten", path, args.fold_dir)
+            return 1
+        logger.info("%s already says the same", path)
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    logger.info("wrote %s: model %s, loci %s", path, parameters["model"], parameters["loci"])
+    return 0
+
+
+def cmd_p256_table(args: argparse.Namespace) -> int:
+    """Write <out>/inputs/p256.tsv for a directory prepare has filled."""
+    logger.info("wrote %s", write_p256_table(args.out_dir))
+    return 0
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # drivers: one fresh child process per run, one at a time
 
 
 def _drive(kind: str, args: argparse.Namespace) -> int:
     table = ORACLE_RUNS if kind == "oracle" else OURS_RUNS
-    names = [r.strip() for r in args.runs.split(",") if r.strip()]
+    runs = args.runs if args.runs is not None else ",".join(PLANS[args.plan][kind])
+    names = [r.strip() for r in runs.split(",") if r.strip()]
     unknown = [r for r in names if r not in table]
     if unknown:
         logger.error("unknown %s runs %s; known: %s", kind, unknown, list(table))
@@ -1018,6 +1237,31 @@ def _cap_rows(runs: Runs, a: str, b: str) -> list[dict]:
     ]
 
 
+def _steps_row(runs: Runs, name: str) -> dict:
+    """E10's check that `name` ran at its specified S in raw() (the multipliers) and run() (the attributions).
+
+    An out-of-memory halving lowers the S a call records (cheri_dls.Engine._after_oom), so the smaller of the two must
+    equal the spec's. Otherwise E10 would compare a run with one at its own step size.
+    """
+    rec = runs.record(name)
+    spec = OURS_RUNS[name]["S"]
+    calls = [d for d in (rec.get("raw"), rec.get("meta")) if d]
+    used = [d.get("seqs_per_step") for d in calls]
+    measured = min(used) if used and None not in used else None
+    halvings = sum(len(d.get("oom") or []) for d in calls)
+    return _row(
+        "E10",
+        f"{name} steps as run",
+        "seqs_per_step",
+        "S in raw() and run()",
+        measured,
+        spec,
+        f"S = {spec} as specified, no out-of-memory halving",
+        "==",
+        note=f"{halvings} halvings over {len(calls)} calls",
+    )
+
+
 def _outputs(runs: Runs, name: str, peaks: str = "own"):
     """A run's attributed outputs, the sequences' then the references', as one float64 vector."""
     import numpy as np
@@ -1046,12 +1290,24 @@ def cmd_gates(args: argparse.Namespace) -> int:
     runs = Runs(out_dir, truth)
     threshold = float(inputs_meta["parameters"]["warning_threshold"])
     report: dict = {"generated_et": _now_et(), "out_dir": str(out_dir), "head": "counts"}
+    report["harness"] = _harness_version()
     report["inputs"] = {
         k: inputs_meta[k]
         for k in ("n_kept", "length", "window", "p256_rule", "truth_rule", "truth_kept_indices", "G0", "versions")
     }
     report["inputs"]["parameters_file"] = inputs_meta.get("parameters_file")
-    missing = [n for n in [*ORACLE_RUNS, *OURS_RUNS, TRUTH_RUN] if not runs.has(n)]
+    report["inputs"]["model"] = inputs_meta["parameters"].get("model")
+    report["inputs"]["loci"] = inputs_meta["parameters"].get("loci")
+    plan = PLANS[args.plan]
+    planned = plan_runs(args.plan)
+    report["plan"] = {
+        "name": args.plan,
+        "about": plan["about"],
+        "runs": planned,
+        "gates": list(plan["gates"]),
+        "out_of_scope": [g for g in GATES if g not in plan["gates"]],
+    }
+    missing = [n for n in planned if not runs.has(n)]
     report["missing_runs"] = missing
     present = [n for n in [*ORACLE_RUNS, *OURS_RUNS, TRUTH_RUN] if runs.has(n)]
     report["runs"] = {n: _run_summary(runs, n) for n in present}
@@ -1260,7 +1516,9 @@ def cmd_gates(args: argparse.Namespace) -> int:
             verdicts[gate]["via_E7a"] = ok
     gates["E7"] = e7_rows
     report["E7_computed"] = e7
+    report["E7_context"] = e7_context(e7)
     report["E3_E4_verdicts"] = verdicts
+    report["E3_policy"] = e3_policy(floors, gates.get("E3", []))
 
     # E4's side report: T2 vs R1 must meet only E5
     if need("T2", "R1"):
@@ -1281,16 +1539,21 @@ def cmd_gates(args: argparse.Namespace) -> int:
         )
     gates["E5"] = e5
 
-    # E8: our P5000 deltas against the pilot's stock run
+    # E8: our P5000 deltas against the pilot's stock run (the pilot model's numbers: only a plan with E8 reads them)
     e8 = []
+    e8_in_scope = "E8" in plan["gates"]
     pilot_bounds = e8_bounds(PILOT["above"], PILOT["pairs"], PILOT["max"])
-    report["E8_reference"] = {
-        "pilot": PILOT,
-        "pilot_fraction": PILOT["above"] / PILOT["pairs"],
-        "bounds": pilot_bounds,
-        "stock_p5000_run": args.stock_deltas or None,
-    }
-    if runs.has("P5000_ref"):
+    report["E8_reference"] = (
+        {
+            "pilot": PILOT,
+            "pilot_fraction": PILOT["above"] / PILOT["pairs"],
+            "bounds": pilot_bounds,
+            "stock_p5000_run": args.stock_deltas or None,
+        }
+        if e8_in_scope
+        else None
+    )
+    if e8_in_scope and runs.has("P5000_ref"):
         s = runs.record("P5000_ref")["deltas"]
         e8.append(
             _row(
@@ -1350,6 +1613,7 @@ def cmd_gates(args: argparse.Namespace) -> int:
     # E10: step-size invariance, S = 4 against S = 8
     e10 = []
     if need("T1_S8", "T1") and "F_rr" in floors:
+        e10 += [_steps_row(runs, "T1"), _steps_row(runs, "T1_S8")]
         cmp = runs.compare("T1_S8", "T1")
         for metric in ("raw", "hyp"):
             e10.append(
@@ -1366,6 +1630,7 @@ def cmd_gates(args: argparse.Namespace) -> int:
     if need("T2_S8", "T2"):
         # fp32 mode as revised (design/revisions.md): E4's form against F_hh, the stock's own strict-fp32 rerun, on
         # the per-pair raw rel-L2. The original p99 <= 1e-5 is reported only; hyp is reported in the same form.
+        e10 += [_steps_row(runs, "T2"), _steps_row(runs, "T2_S8")]
         cmp = runs.compare("T2_S8", "T2")
         label = "T2_S8 vs T2 (fp32)"
         original = _row(
@@ -1447,11 +1712,16 @@ def cmd_gates(args: argparse.Namespace) -> int:
                     _row("context d(.,T64)", f"{name} vs T64", metric, stat, cmp[metric][stat], None, "reported")
                 )
 
-    # verdicts
+    # verdicts: the plan's gates only. A gate that reads a planned run that is missing is not run (None).
     summary = {}
-    for gate in ("G0", "E1", "E2", "E3", "E4", "E5", "E6", "E8", "E10"):
+    not_run = {}
+    for gate in plan["gates"]:
         gate_rows = gates.get(gate, [])
-        if gate == "E2":
+        absent = [n for n in GATE_RUNS[gate] if n in missing]
+        if absent:
+            verdict = None
+            not_run[gate] = absent
+        elif gate == "E2":
             verdict = len(floors) == 3
         elif gate in ("E3", "E4"):
             v = verdicts.get(gate, {})
@@ -1464,11 +1734,12 @@ def cmd_gates(args: argparse.Namespace) -> int:
     rows += original_rows
     rows += context_rows
     report["summary"] = summary
+    report["not_run"] = not_run
     report["gates"] = gates
     report["revisions"] = revisions
     report["original_bounds"] = original_rows
     report["all_gates_pass"] = all(v not in (None, False) for v in summary.values())
-    report["deviations"] = _deviations(runs)
+    report["deviations"] = _deviations(runs, report)
     report["open_issues"] = _open_issues(runs, summary, report)
 
     _write_json(out_dir / "report.json", report)
@@ -1510,6 +1781,7 @@ def _run_summary(runs: Runs, name: str) -> dict:
         "finished_et": rec.get("finished_et"),
         "total_s": rec.get("timings_s", {}).get("total"),
         "gpu_mem_cap_gb": rec.get("gpu_mem_cap_gb"),
+        "cuda_visible_devices": (rec.get("env") or {}).get("CUDA_VISIBLE_DEVICES"),
         "deltas": rec.get("deltas"),
     }
     if rec["kind"] == "oracle":
@@ -1550,8 +1822,17 @@ def _flag_brief(flags: dict) -> dict:
     return {k.replace("torch.backends.", "").replace("torch.", ""): flags.get(k) for k in keys}
 
 
-def _deviations(runs: Runs) -> list[str]:
+def _deviations(runs: Runs, report: dict) -> list[str]:
     out = []
+    plan = report["plan"]
+    if plan["name"] != "full":
+        out.append(
+            f"Plan {plan['name']!r}: {plan['about']}. Out of its scope, and not in the verdict: "
+            + ", ".join(plan["out_of_scope"])
+            + ". The plan has no eager run T3 (E6), no P5000 runs (E8) and no T2_S8 (E10's fp32 mode). "
+            "inputs/x_tokens.npy still holds every kept peak as tokens (2,114 bytes each), as prepare writes it for "
+            "any plan."
+        )
     if runs.has("R1"):
         bs = int(runs.record("R1")["args"]["batch_size"])
         if bs != 64:
@@ -1567,7 +1848,8 @@ def _deviations(runs: Runs) -> list[str]:
     )
     out.append(
         "Counts head only: the profile head is not implemented in cheri_dls (attribute_fast.py hands output 'profile' to "
-        "the stock command). E9, end to end against `cherimoya attribute`, ran separately (attr_pilot/e9)."
+        "the stock command). E9, end to end against `cherimoya attribute`, ran separately on the pilot model "
+        "(attr_pilot/e9)."
     )
     out.append(
         f"E1 in reference mode and E10 in fp32 mode are gated as revised after round 2 ({REVISIONS_DOC}): their "
@@ -1599,21 +1881,34 @@ def _open_issues(runs: Runs, summary: dict, report: dict) -> list[str]:
     e1 = report.get("E1_context", {})
     for gate, verdict in summary.items():
         if verdict is None:
-            out.append(f"{gate} was not evaluated (missing runs: {report['missing_runs']})")
+            absent = report.get("not_run", {}).get(gate) or report["missing_runs"]
+            out.append(f"{gate} was not evaluated (missing runs: {absent})")
             continue
+        failed = [r for r in report["gates"].get(gate, []) if r["pass"] is False]
+        what = "; ".join(
+            f"{r['comparison']} {r['metric']} {r['statistic']} {_fmt(r['measured'])}, bound {r['op']} {_fmt(r['bound'])}"
+            for r in failed
+        )
+        policy = report.get("E3_policy") or {}
+        policy_note = (
+            " E3's policy margins (median / 0.3 F_tf(0.5)): "
+            + "; ".join(
+                f"{m} ours {_ratio(v['ours_ratio'])}, stock rerun {_ratio(v['stock_rerun_ratio'])}"
+                for m, v in policy.items()
+            )
+            + "."
+            if gate == "E3" and policy
+            else ""
+        )
         if verdict == "via E7(a)":
             out.append(
-                f"{gate} failed its floor-relative limits and passed only through the E7(a) accuracy tie-breaker"
+                f"{gate} failed its floor-relative limits ({what}) and passed only through the E7(a) accuracy "
+                f"tie-breaker (design §15.3).{policy_note}"
             )
             continue
         if verdict is not False:
             continue
-        failed = [r for r in report["gates"].get(gate, []) if r["pass"] is False]
-        what = "; ".join(
-            f"{r['comparison']} {r['metric']} {r['statistic']} {_fmt(r['measured'])} > {_fmt(r['bound'])}"
-            for r in failed
-        )
-        line = f"{gate} failed: {what}."
+        line = f"{gate} failed: {what}.{policy_note}"
         if gate == "E1":
             noise = e1.get("max_abs_between_runs", {})
             spread = [v for v in e1.get("module_y_x_copy_spread", {}).values() if v is not None]
@@ -1634,12 +1929,17 @@ def _open_issues(runs: Runs, summary: dict, report: dict) -> list[str]:
                 f"{_fmt(report['distance_to_T64'].get('T2_S8', {}).get('raw', {}).get('q50'))}."
             )
         out.append(line)
-    if not report["E8_reference"]["stock_p5000_run"]:
+    if report["E8_reference"] is not None and not report["E8_reference"]["stock_p5000_run"]:
         out.append(
             "No stock P5000 run exists (attr_pilot/stock_run/ is empty), so E8 is read against the pilot's logged numbers "
             "only."
         )
     return out
+
+
+def _ratio(value) -> str:
+    """A margin such as measured / bound, to 3 decimals."""
+    return "" if value is None else f"{value:.3f}"
 
 
 def _fmt(value) -> str:
@@ -1716,6 +2016,61 @@ def _revisions_markdown(report: dict) -> list[str]:
     return lines
 
 
+def _verdict(verdict) -> str:
+    """A gate's verdict as the reports print it."""
+    if verdict is True:
+        return "PASS"
+    if verdict is False:
+        return "FAIL"
+    if verdict is None:
+        return "not run"
+    return f"PASS {verdict}"  # "via E7(a)"
+
+
+def _margins_markdown(report: dict) -> list[str]:
+    """E3's precision-policy margins and E7(a)'s accuracy ratios, both context: computed whatever E3 and E4 give."""
+    lines = []
+    policy = report.get("E3_policy") or {}
+    if policy:
+        lines += [
+            "",
+            "## E3 precision policy: margins",
+            "",
+            "E3's policy check is median <= 0.3 F_tf(0.5). Ours is T1 vs R1; the stock rerun is R1' vs R1 (F_rr), "
+            "against the same bound.",
+            "",
+            "| metric | bound 0.3 F_tf(0.5) | T1 vs R1 median | ours / bound | R1' vs R1 median | stock rerun / bound | "
+            "pass |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for metric, v in policy.items():
+            lines.append(
+                f"| {metric} | {_fmt(v['bound'])} | {_fmt(v['ours_q50'])} | {_ratio(v['ours_ratio'])} | "
+                f"{_fmt(v['stock_rerun_q50'])} | {_ratio(v['stock_rerun_ratio'])} | {v['pass']} |"
+            )
+    e7 = report.get("E7_context") or {}
+    if e7:
+        lines += [
+            "",
+            "## E7(a) context: distance to the fp64 truth",
+            "",
+            "d(a, T64) is a's rel-L2 to T64 on the 8 truth peaks (raw per pair, hyp per peak). E7(a) passes when "
+            "d(ours, T64) <= 1.2 d(R, T64) at the median and the max; it decides E3 or E4 only when they fail.",
+            "",
+            "| gate | ours vs reference | metric | d(ours) q50 | d(R) q50 | ratio q50 | d(ours) max | d(R) max | "
+            "ratio max | within 1.2 |",
+            "|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for gate, g in e7.items():
+            for metric, v in g["metrics"].items():
+                lines.append(
+                    f"| {gate} | {g['ours']} vs {g['reference']} | {metric} | {_fmt(v['d_ours']['q50'])} | "
+                    f"{_fmt(v['d_ref']['q50'])} | {_ratio(v['ratio']['q50'])} | {_fmt(v['d_ours']['max'])} | "
+                    f"{_fmt(v['d_ref']['max'])} | {_ratio(v['ratio']['max'])} | {v['within']} |"
+                )
+    return lines
+
+
 def _markdown(report: dict, rows: list[dict]) -> str:
     inp = report["inputs"]
     lines = [
@@ -1724,9 +2079,16 @@ def _markdown(report: dict, rows: list[dict]) -> str:
         f"Generated {report['generated_et']} (ET) by `workflows/cherimoya/dls_validate.py gates`. Every number is in "
         "`report.json`; every check, with its bound and rule, in `report.tsv`; each run's record and arrays under `runs/`.",
         "",
+        f"Model: `{inp.get('model')}`. Peaks: `{', '.join(inp.get('loci') or [])}`.",
+        "",
+        f"Gates computed by `{report['harness']['file']}` at commit {report['harness']['commit']} (uncommitted changes "
+        f"in workflows/cherimoya: {report['harness']['dirty']}).",
+        "",
         f"Inputs: {inp['n_kept']} kept peaks of length {inp['length']}, window {inp['window']}; P256 = "
         f"{inp['p256_rule']}; truth peaks = {inp['truth_rule']} (kept indices {inp['truth_kept_indices']}). "
         f"G0: {inp['G0']['bitwise_equal']}/{inp['G0']['pairs']} reference pairs bitwise equal to tangermeme's.",
+        "",
+        f"Plan {report['plan']['name']!r}: {report['plan']['about']}.",
         "",
         "## Verdict",
         "",
@@ -1734,10 +2096,15 @@ def _markdown(report: dict, rows: list[dict]) -> str:
         "|---|---|",
     ]
     for gate, verdict in report["summary"].items():
-        lines.append(
-            f"| {gate} | {'PASS' if verdict is True else verdict if verdict else 'FAIL' if verdict is False else 'not run'} |"
-        )
-    lines += ["", f"All gates pass: **{report['all_gates_pass']}**.", "", "## Floors (E2), counts head", ""]
+        lines.append(f"| {gate} | {_verdict(verdict)} |")
+    lines += ["", f"All gates pass: **{report['all_gates_pass']}**."]
+    if report["plan"]["out_of_scope"]:
+        lines += [
+            "",
+            f"Out of the scope of plan {report['plan']['name']!r}, not in the verdict: "
+            f"{', '.join(report['plan']['out_of_scope'])}.",
+        ]
+    lines += ["", "## Floors (E2), counts head", ""]
     lines += [
         "| floor | comparison | raw q50 | raw q99 | raw max | hyp q50 | hyp q99 | hyp max |",
         "|---|---|---|---|---|---|---|---|",
@@ -1766,6 +2133,7 @@ def _markdown(report: dict, rows: list[dict]) -> str:
             f"{r['op']} {_fmt(r['bound'])} | {r['rule']} | {r['pass']} |"
         )
     lines += _revisions_markdown(report)
+    lines += _margins_markdown(report)
     lines += [
         "",
         "## Runs",
@@ -1850,6 +2218,239 @@ def _markdown(report: dict, rows: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# summarize: several validations side by side
+
+
+def _summary_entry(out_dir: Path) -> dict:
+    """What summarize reads from one validation directory: report.json, inputs/meta.json and the runs' records.
+
+    Everything is derived from fields every report.json has, so a report written before plans existed (the pilot's,
+    plan "full") reads the same way.
+    """
+    import numpy as np
+
+    out_dir = Path(out_dir)
+    report = json.loads((out_dir / "report.json").read_text())
+    meta = json.loads((out_dir / "inputs" / "meta.json").read_text())
+    model = Path(meta["parameters"]["model"])
+    plan = report.get("plan") or {"name": "full", "out_of_scope": []}
+    devices: dict = {}
+    for name in report.get("runs", {}):
+        rec = json.loads((out_dir / "runs" / name / "record.json").read_text())
+        device = (rec.get("env") or {}).get("CUDA_VISIBLE_DEVICES")
+        if device:
+            gpu = f"{device} ({(rec.get('versions') or {}).get('gpu', '?')})"
+            devices.setdefault(gpu, []).append(name)
+    gates = report["gates"]
+    return {
+        "dir": str(out_dir),
+        "label": f"{model.parent.parent.name} {model.parent.name}",
+        "model": str(model),
+        "loci": meta["parameters"]["loci"],
+        "n_loci_read": int(np.load(out_dir / "inputs" / "idx.npy", mmap_mode="r").shape[0]),
+        "n_kept": meta["n_kept"],
+        "p256_first_last": meta["p256_first_last"],
+        "truth_kept_indices": meta["truth_kept_indices"],
+        "G0": meta["G0"],
+        "plan": plan["name"],
+        "out_of_scope": plan.get("out_of_scope", []),
+        "gpu_runs": devices,
+        "summary": report["summary"],
+        "all_gates_pass": report["all_gates_pass"],
+        "floors": report["floors"],
+        "E3_policy": e3_policy(report["floors"], gates.get("E3", [])),
+        "E7_context": e7_context(report.get("E7_computed") or {}),
+        "rows": [r for g in report["summary"] if g != "E2" for r in gates.get(g, [])] + gates.get("E7", []),
+        "open_issues": report.get("open_issues", []),
+        "harness": report.get("harness"),
+    }
+
+
+def _check_cell(row: dict | None) -> str:
+    """One gate check in the summary's matrix: measured against the bound, the margin for an upper bound, the verdict."""
+    if row is None:
+        return ""
+    verdict = {True: "pass", False: "FAIL", None: "not run"}[row["pass"]]
+    measured, bound, op = row["measured"], row["bound"], row["op"]
+    if bound is None:
+        return f"{_fmt(measured)}, {verdict}"
+    if op == "<=" and isinstance(bound, float) and bound > 0 and isinstance(measured, int | float):
+        return f"{_fmt(measured)} / {_fmt(bound)} = {measured / bound:.3f}, {verdict}"
+    return f"{_fmt(measured)} {op} {_fmt(bound)}, {verdict}"
+
+
+def _summary_markdown(entries: list[dict], reference: dict | None, notes: list[str]) -> str:
+    cols = entries + ([reference] if reference else [])
+    names = [e["label"] + (" (reference)" if e is reference else "") for e in cols]
+    lines = [
+        "# cheri_dls validation on more checkpoints, counts head",
+        "",
+        f"Generated {_now_et()} (ET) by `workflows/cherimoya/dls_validate.py summarize`, from each directory's "
+        "report.json and inputs/meta.json. Each checkpoint's report.md has the full report.",
+        "",
+    ]
+    for name in sorted({e["plan"] for e in entries}):
+        lines.append(f"Plan {name!r}: {PLANS[name]['about'] if name in PLANS else '?'}.")
+    harness = sorted({f"{h['commit']} (dirty: {h['dirty']})" for e in entries if (h := e["harness"])})
+    if harness:
+        lines += ["", "The checkpoints' gates were computed at commit " + ", ".join(harness) + "."]
+    if reference:
+        lines += [
+            "",
+            f"The last column is the {reference['plan']!r} validation of {reference['label']} ({reference['dir']}), "
+            "shown for comparison. It is not part of this summary's verdict.",
+        ]
+    verdict = all(e["all_gates_pass"] for e in entries)
+    lines += ["", f"Every gate in scope passes on every checkpoint: **{verdict}**."]
+    for metric in ("raw", "hyp"):
+        ours = [e["E3_policy"][metric]["ours_ratio"] for e in entries if metric in e["E3_policy"]]
+        rerun = [e["E3_policy"][metric]["stock_rerun_ratio"] for e in entries if metric in e["E3_policy"]]
+        if ours and None not in rerun:
+            line = (
+                f"E3 policy margin, {metric}: ours / bound {min(ours):.3f} to {max(ours):.3f}; stock rerun / bound "
+                f"{min(rerun):.3f} to {max(rerun):.3f}"
+            )
+            ref = (reference or {}).get("E3_policy", {}).get(metric)
+            if ref:
+                line += f" (reference: {_ratio(ref['ours_ratio'])} and {_ratio(ref['stock_rerun_ratio'])})"
+            lines.append("")
+            lines.append(line + ".")
+
+    lines += [
+        "",
+        "## Checkpoints",
+        "",
+        "| checkpoint | model | peaks file | loci read | kept peaks | P256 (kept indices) | truth peaks (kept indices) | "
+        "G0 | GPU (runs) | plan |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for name, e in zip(names, cols):
+        gpus = "; ".join(f"{g}: {len(r)}" for g, r in e["gpu_runs"].items())
+        first, last = e["p256_first_last"]
+        lines.append(
+            f"| {name} | `{Path(e['model']).name}` | `{', '.join(Path(p).name for p in e['loci'])}` | "
+            f"{e['n_loci_read']} | {e['n_kept']} | 256, {first}..{last} | {e['truth_kept_indices']} | "
+            f"{e['G0']['bitwise_equal']}/{e['G0']['pairs']} | {gpus} | {e['plan']} |"
+        )
+
+    gates = [g for g in GATES if any(g in e["summary"] for e in cols)]
+    lines += [
+        "",
+        "## Verdicts",
+        "",
+        "| checkpoint | " + " | ".join(gates) + " | all gates in scope |",
+        "|---|" + "---|" * (len(gates) + 1),
+    ]
+    for name, e in zip(names, cols):
+        cells = [
+            _verdict(e["summary"][g]) if g in e["summary"] else "out of scope" if g in e["out_of_scope"] else "-"
+            for g in gates
+        ]
+        lines.append(f"| {name} | " + " | ".join(cells) + f" | {e['all_gates_pass']} |")
+
+    lines += [
+        "",
+        "## Floors (E2)",
+        "",
+        "raw = per-pair rel-L2 of the multipliers over 4 x 2114; hyp = per-peak rel-L2 of the windowed hypothetical "
+        "attributions over 4 x 400. F_rr = R1' vs R1, F_hh = R2' vs R2, F_tf = R2 vs R1.",
+        "",
+        "| checkpoint | floor | raw q50 | raw q99 | raw max | hyp q50 | hyp q99 | hyp max |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for name, e in zip(names, cols):
+        for floor, f in e["floors"].items():
+            lines.append(
+                f"| {name} | {floor} | "
+                + " | ".join(_fmt(f[m][s]) for m in ("raw", "hyp") for s in ("q50", "q99", "max"))
+                + " |"
+            )
+
+    lines += [
+        "",
+        "## E3 precision policy: margins",
+        "",
+        "The policy check is median <= 0.3 F_tf(0.5). Ours is T1 vs R1's median; the stock rerun's is F_rr(0.5), "
+        "R1' vs R1, against the same bound. A ratio above 1 fails the check.",
+        "",
+        "| checkpoint | metric | bound 0.3 F_tf(0.5) | T1 vs R1 median | ours / bound | R1' vs R1 median | "
+        "stock rerun / bound | pass |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for name, e in zip(names, cols):
+        for metric, v in e["E3_policy"].items():
+            lines.append(
+                f"| {name} | {metric} | {_fmt(v['bound'])} | {_fmt(v['ours_q50'])} | {_ratio(v['ours_ratio'])} | "
+                f"{_fmt(v['stock_rerun_q50'])} | {_ratio(v['stock_rerun_ratio'])} | {v['pass']} |"
+            )
+
+    lines += [
+        "",
+        "## E7(a) context: distance to the fp64 truth",
+        "",
+        "d(a, T64): rel-L2 to the fp64 truth on the 8 truth peaks (raw per pair, hyp per peak). E7(a) holds when "
+        "d(ours, T64) <= 1.2 d(R, T64) at the median and the max; it decides E3 or E4 only when they fail.",
+        "",
+        "| checkpoint | for | ours vs R | metric | d(ours) q50 | d(R) q50 | ratio q50 | ratio max | within 1.2 |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for name, e in zip(names, cols):
+        for gate, g in e["E7_context"].items():
+            for metric, v in g["metrics"].items():
+                lines.append(
+                    f"| {name} | {gate} | {g['ours']} vs {g['reference']} | {metric} | {_fmt(v['d_ours']['q50'])} | "
+                    f"{_fmt(v['d_ref']['q50'])} | {_ratio(v['ratio']['q50'])} | {_ratio(v['ratio']['max'])} | "
+                    f"{v['within']} |"
+                )
+
+    keys: list = []
+    for e in entries:
+        for r in e["rows"]:
+            key = (r["gate"], r["comparison"], r["metric"], r["statistic"])
+            if key not in keys:
+                keys.append(key)
+    lookup = [{(r["gate"], r["comparison"], r["metric"], r["statistic"]): r for r in e["rows"]} for e in cols]
+    lines += [
+        "",
+        "## Gate checks: measured against the bound",
+        "",
+        "Each cell is measured / bound = margin for an upper bound, or measured, the operator and the bound otherwise. "
+        "The rule of each check is in its row.",
+        "",
+        "| gate | comparison | metric | statistic | rule | " + " | ".join(names) + " |",
+        "|---|---|---|---|---|" + "---|" * len(names),
+    ]
+    for key in keys:
+        rule = next(lk[key]["rule"] for lk in lookup if key in lk)
+        cells = [_check_cell(lk.get(key)) for lk in lookup]
+        lines.append(f"| {' | '.join(key)} | {rule} | " + " | ".join(cells) + " |")
+
+    issues = [(name, issue) for name, e in zip(names, cols) for issue in e["open_issues"]]
+    lines += ["", "## Open issues, from each report", ""]
+    lines += [f"- {name}: {issue}" for name, issue in issues] or ["- none"]
+    if notes:
+        lines += ["", "## Notes", ""] + [f"- {n}" for n in notes]
+    return "\n".join(lines) + "\n"
+
+
+def cmd_summarize(args: argparse.Namespace) -> int:
+    """summary.md (and summary.json) over several validation directories; exit 1 unless every one passes."""
+    entries = [_summary_entry(Path(d)) for d in args.dirs]
+    reference = _summary_entry(Path(args.reference_dir)) if args.reference_dir else None
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(_summary_markdown(entries, reference, args.note or []))
+    _write_json(
+        out.with_suffix(".json"),
+        {"generated_et": _now_et(), "checkpoints": entries, "reference": reference, "notes": args.note or []},
+    )
+    for e in entries:
+        logger.info("%s: %s (all gates in scope pass: %s)", e["label"], e["summary"], e["all_gates_pass"])
+    logger.info("wrote %s and %s", out, out.with_suffix(".json"))
+    return 0 if all(e["all_gates_pass"] for e in entries) else 1
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # command line
 
 
@@ -1860,6 +2461,11 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     def common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--out-dir", type=Path, required=True, help="the validation directory (inputs/, runs/, reports)")
 
+    p = sub.add_parser("checkpoint-json", help="the attribute.json of another trained checkpoint, from a base JSON")
+    common(p)
+    p.add_argument("--base", required=True, help="the base attribute.json (the pilot's), listing all 24 chromosomes")
+    p.add_argument("--fold-dir", type=Path, required=True, help="<dataset>/<fold>, with fit.json and the model")
+
     p = sub.add_parser("prepare", help="extract the peaks, P256, the truth peaks and P256's references; check G0")
     common(p)
     p.add_argument("-p", "--parameters", required=True, help="the attribute.json of `cherimoya attribute`")
@@ -1869,6 +2475,9 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--chunk-peaks", type=int, default=16, help="peaks per RefProducer chunk (default 16)")
     p.add_argument("--threads", type=int, default=4)
 
+    p = sub.add_parser("p256-table", help="write inputs/p256.tsv (P256's indices and coordinates) for a prepared dir")
+    common(p)
+
     for kind, table in (("oracle", ORACLE_RUNS), ("ours", OURS_RUNS)):
         for name in (kind, f"_{kind}"):
             p = sub.add_parser(
@@ -1876,7 +2485,10 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
             )
             common(p)
             if name == kind:
-                p.add_argument("--runs", default=",".join(table), help=f"comma-separated, of {', '.join(table)}")
+                p.add_argument(
+                    "--runs", default=None, help=f"comma-separated, of {', '.join(table)}; default: the plan's"
+                )
+                p.add_argument("--plan", choices=list(PLANS), default="full", help="whose runs --runs defaults to")
                 p.add_argument("--timeout", type=int, default=2400, help="seconds before a child is killed")
             else:
                 p.add_argument("--run", required=True, choices=list(table))
@@ -1904,8 +2516,15 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
 
     p = sub.add_parser("gates", help="floors, gates and context; writes report.json, report.tsv and report.md")
     common(p)
+    p.add_argument("--plan", choices=list(PLANS), default="full", help="the runs and gates of this validation")
     p.add_argument("--stock-deltas", help="deltas (.npy, (N, K)) of a stock P5000 run, to read E8 against as well")
     p.add_argument("--probe-json", help="dls_probes.json of a P3 probe run at the rows these runs used, to report")
+
+    p = sub.add_parser("summarize", help="summary.md (and .json) over several validation directories")
+    p.add_argument("dirs", nargs="+", type=Path, help="validation directories, each with report.json")
+    p.add_argument("--out", type=Path, required=True, help="the summary's markdown path; .json is written next to it")
+    p.add_argument("--reference-dir", type=Path, help="another validation to show last, for comparison (not gated)")
+    p.add_argument("--note", action="append", help="a line for the summary's Notes section (repeatable)")
     return parser.parse_args(argv)
 
 
@@ -1913,13 +2532,16 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     commands = {
+        "checkpoint-json": cmd_checkpoint_json,
         "prepare": cmd_prepare,
+        "p256-table": cmd_p256_table,
         "oracle": lambda a: _drive("oracle", a),
         "ours": lambda a: _drive("ours", a),
         "_oracle": child_oracle,
         "_ours": child_ours,
         "truth": cmd_truth,
         "gates": cmd_gates,
+        "summarize": cmd_summarize,
     }
     return commands[args.command](args)
 

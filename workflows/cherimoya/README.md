@@ -184,3 +184,38 @@ mask entry per peak, the parameters and seeds of `attribute.json`, and the
 engine's sha256 equal to the pin `<out-root>/attribution_engine.json`. States:
 done, running, waiting, stale, failed, missing. A fold attributed by the stock
 command instead is accepted through `attr.attr.stock.json` (see its doc).
+
+`to_chrombpnet_scores.py` converts a DONE fold for 06.0-11.0. Run it in the
+cherimoya environment, inside a box, under the fold's lock
+(`flock -n <fold>/.task.lock ...`, or pass `--lock`):
+
+```bash
+python workflows/cherimoya/to_chrombpnet_scores.py \
+    --attribute-json <out-root>/<dataset>/fold_<k>/attribute.json
+```
+
+It writes into the directory 06.0 reads,
+`<out-root>/<dataset>/downstream/full_models/<dataset>_<peak_type>_fold_<k>/interpretation/`
+(output_dir and peak_type from the dataset's config; `--out-dir` names it
+instead):
+
+- `interpretation.counts_scores.h5` in ChromBPNet's 05.0 layout: `/raw/seq`
+  int8, `/shap/seq` (the attributions) and `/projected_shap/seq` (ohe x
+  attributions in float32, then cast) float16, each (N, 4, W), chunks of 16
+  rows, Blosc blosclz level 9 with shuffle as 05.0 writes them;
+- `interpretation.interpreted_regions.bed`: the peaks-file lines the idx mask
+  keeps, byte for byte, so h5 row j is peaks-file row `flatnonzero(idx)[j]`.
+  Cherimoya drops windows with a base other than A, C, G or T and ChromBPNet
+  keeps them, so join the two models by peak name; ChromBPNet's column
+  c + 1057 - W/2 is this file's column c;
+- `interpretation.provenance.json`: the sources (paths, sizes, mtimes), the idx
+  sha256, the meta's audit and code blocks, the dropped peaks, and what the
+  float16 cast did (non-zero values that became 0, flagged above 1e-3;
+  subnormals; max |value|).
+
+It refuses a fold that is not DONE, an ohe that is not one-hot, attributions
+that are not finite or exceed float16's 65504, and rows that differ from those
+of a sibling fold already converted. Each file goes through `.partial` and a
+rename, the provenance last; a rerun whose sources and outputs still match the
+provenance does nothing, and `--force` converts again. It streams the npz files
+in blocks: about 2 GB of RAM and 20 s per 40,000 rows at W = 1000.

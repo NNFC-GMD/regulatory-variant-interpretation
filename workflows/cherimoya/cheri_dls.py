@@ -7,8 +7,9 @@ then its K references. The backward runs over the sequence half only. The design
 analyses/attr_pilot/design/final_design.md; the section numbers below refer to it. CH/ is the installed cherimoya
 package and TM/ the installed tangermeme.
 
-This module holds the weights, the forward pass, the backward rules and the epilogue (§5-§9). Every function runs
-eagerly; compilation comes later.
+This module holds the weights, the forward pass, the backward rules, the epilogue and the Engine that runs them over
+a whole set of peaks (§4-§11). Every function runs eagerly, and only the CPU path is validated so far; compilation and
+the other GPU features come later.
 
 - check_versions() and load_model(). The model is loaded with the reference's own loader,
   ``Cherimoya.load(path, device="cpu", compile=False)`` (cherimoya_cli/commands/attribute.py:35-38). Its strict
@@ -43,8 +44,15 @@ eagerly; compilation comes later.
     input gradient, giving the multipliers at the one-hot input.
 - epilogue() (§9): per-pair convergence deltas, and hypothetical scores over the attribution window.
   mean_over_references() averages the windows over each sequence's references on the CPU, bitwise as tangermeme does.
+- Engine (§4, §11): runs all of the above over a set of peaks, in steps of S whole peaks with their K references.
+  Each step forwards its joint rows once and runs the backward over its S*K pairs. A short last step is padded by
+  repeating its last peak, and the padding is dropped. References are injected, or drawn by dls_refs.RefProducer
+  exactly as deep_lift_shap draws them.
+  - Engine.raw() returns each pair's multipliers, outputs and convergence delta (tests and validation).
+  - Engine.run() returns the hypothetical attributions over a window, averaged over references, as
+    `cherimoya attribute` computes them, plus the deltas and a summary of them. It warns once if deltas are high.
 
-Two deliberate differences from the reference:
+Deliberate differences from the reference:
 - The counts head casts the pooled stream to the count Linear's dtype, where CH/cherimoya.py:458 calls ``.float()``.
   Every supported model has fp32 parameters, so the two are the same operation. A float64 model on CPU (tests and the
   fp64 "truth" run only) gets a float64 head. With ``.float()`` the stock module cannot run a float64 forward at all:
@@ -53,16 +61,28 @@ Two deliberate differences from the reference:
   the (K, 4, W) window block alone. The CPU mean sums a column in an order that depends on where the column sits in
   its block, and the window alone moves some columns. Measured: for K=20, L=2114, W=100 in float32, the window-only
   mean differs from tangermeme's in 9 of 400 elements; the full-length block matches it bitwise.
+- The Engine returns its results in the model's dtype, where `cherimoya attribute` casts the attributions with
+  ``.float()`` after deep_lift_shap returns (attribute.py:101); the caller casts. It warns once per run with a summary
+  of the deltas, where tangermeme warns once per batch with the batch's deltas, and a warning_threshold of None means
+  no warning.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import numbers
+import operator
+import time
+import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass
 from os import PathLike
 from typing import NamedTuple
 
 import cherimoya
+import dls_refs
+import numpy as np
 import tangermeme
 import torch
 import torch.nn.functional as F
@@ -85,6 +105,12 @@ RESCALE_EPS = 1e-6
 
 DEFAULT_HEAD_ROWS = 128
 """Rows of the head that counts_cotangent() differentiates: 2 x batch_size 64, the reference's full batch (§7.1)."""
+
+AUTO_SEQS_PER_STEP = 8
+"""Peaks per step for seqs_per_step="auto". Sizing steps from free GPU memory (§11) comes with the GPU engine."""
+
+SEED_RANGE = 9_999_999
+"""random_state None draws a base seed from [0, SEED_RANGE), once per Engine (§10)."""
 
 
 def check_versions(allow_drift: bool = False) -> dict[str, str]:
@@ -592,6 +618,19 @@ def input_multipliers(Gz: torch.Tensor, X_refs: torch.Tensor, W0: torch.Tensor) 
     )[0]
 
 
+def convergence_deltas(
+    m: torch.Tensor, X1h: torch.Tensor, y_x: torch.Tensor, y_r: torch.Tensor, S: int, K: int
+) -> torch.Tensor:
+    """tangermeme's convergence delta per pair, |(y_x - y_r) - sum((x - r) * m)| over the full length (§9).
+
+    m (S*K, 4, L) holds the raw multipliers, X1h (S + S*K, 4, L) the joint one-hot rows, y_x (S,) and y_r (S, K) the
+    attributed outputs. Returns (S, K). The expression is TM/deep_lift_shap.py:739-742's.
+    """
+    x, r = split_rows(X1h, S, K)
+    m = m.view(S, K, *m.shape[1:])
+    return ((y_x[:, None] - y_r) - ((x - r) * m).sum(dim=(-2, -1))).abs()
+
+
 def epilogue(
     m: torch.Tensor,
     X1h: torch.Tensor,
@@ -609,15 +648,14 @@ def epilogue(
     - hyp (S, K, 4, end - start), contiguous. For one-hot references (an N column of zeros included) it is bitwise
       tangermeme's hypothetical_attributions (TM/deep_lift_shap.py:93-103) sliced to the window: both round once, to
       fl(m_i - m_b) for reference base b.
-    - delta (S, K): |(y_x - y_r) - sum((x - r) * m)| on the raw multipliers, tangermeme's convergence delta
-      (TM/deep_lift_shap.py:739-742).
+    - delta (S, K): convergence_deltas() on the raw multipliers.
     """
     L = X1h.shape[-1]
     if not 0 <= start < end <= L:
         raise ValueError(f"the window [{start}, {end}) must be non-empty and inside [0, {L})")
-    x, r = split_rows(X1h, S, K)
+    delta = convergence_deltas(m, X1h, y_x, y_r, S, K)
+    _, r = split_rows(X1h, S, K)
     m = m.view(S, K, *m.shape[1:])
-    delta = ((y_x[:, None] - y_r) - ((x - r) * m).sum(dim=(-2, -1))).abs()
     mw, rw = m[..., start:end], r[..., start:end]
     return (mw - (rw * mw).sum(dim=-2, keepdim=True)).contiguous(), delta
 
@@ -644,3 +682,318 @@ def mean_over_references(hyp: torch.Tensor, start: int, length: int) -> torch.Te
         block[:, :, start : start + W] = hyp[s]
         out[s] = block.mean(dim=0)[:, start : start + W]
     return out
+
+
+class RawResult(NamedTuple):
+    """Engine.raw()'s output: CPU tensors in the engine's dtype."""
+
+    m: torch.Tensor  # (N, K, 4, L) multipliers at the one-hot input; pair (e, k) at [e, k]
+    y_x: torch.Tensor  # (N,) the attributed output of each sequence
+    y_r: torch.Tensor  # (N, K) the attributed output of each reference
+    deltas: torch.Tensor  # (N, K) convergence deltas
+    debug: dict  # what ran: step size, steps, padding, statistics mode, reference source, delta summary
+
+
+class Result(NamedTuple):
+    """Engine.run()'s output: CPU tensors in the engine's dtype. `cherimoya attribute` saves attr.float() (:101)."""
+
+    attr: torch.Tensor  # (N, 4, W) hypothetical attributions over the window, averaged over each sequence's references
+    deltas: torch.Tensor  # (N, K) convergence deltas
+    y_x: torch.Tensor  # (N,)
+    y_r: torch.Tensor  # (N, K)
+    meta: dict  # debug's keys, plus the window, the wall time and pairs/s
+
+
+class Engine:
+    """DeepLIFT/DeepSHAP attributions of a Cherimoya model, as `cherimoya attribute` computes them with tangermeme.
+
+    The engine works in steps of S whole peaks, each with its K references (§3, §11):
+    - The step's joint rows [x_0..x_{S-1}, r_00..r_{S-1,K-1}] are forwarded once: each sequence once, not once per
+      reference as in tangermeme's batches. Nothing in the forward mixes rows.
+    - The backward runs over the sequence half only, as S*K pairs. The counts cotangent enters broadcast over the
+      pairs; each block's rules, the stem rule and iconv's input gradient follow (bwd_block, stem_rule,
+      input_multipliers).
+    - A last step with fewer than S peaks is padded by repeating its last peak, sequence and references, and the
+      padded pairs are dropped. So every step has the same shapes.
+    - run() takes the hypothetical scores over the window [start, end) and averages them over each sequence's K
+      references on the CPU, bitwise as tangermeme does (mean_over_references).
+
+    Arguments:
+    - model: a loaded Cherimoya (load_model). Its weights are read once (CheriWeights) and never changed.
+    - output, group: what is attributed, as in attribute.json. The real LogCountWrapper(ControlWrapper(model), group)
+      is built, so a bad group fails exactly as `cherimoya attribute` fails. output="profile" is not implemented yet.
+    - device: where the weights and steps live; by default the model's device. Only the CPU path is validated so far.
+      The GPU features of the design (compiled passes, precision modes, pinned transfers, OOM backoff, step sizing from
+      free memory) are not implemented yet.
+    - n_shuffles, random_state: K references per sequence when none are passed in: pair (e, k) gets
+      ``dinucleotide_shuffle(X[e:e+1].float(), n=1, random_state=random_state + k)[:, 0]``, drawn by
+      dls_refs.RefProducer exactly as deep_lift_shap draws it (R4). random_state None draws a base seed once, records
+      it, and makes the run reproducible from it.
+    - head_rows: rows of the head that counts_cotangent() differentiates, by default 2 x 64. `cherimoya attribute`
+      differentiates 2 x batch_size rows, so pass 2 x the JSON batch_size. Nothing else depends on batch_size.
+    - seqs_per_step: S, or "auto" for AUTO_SEQS_PER_STEP. A run with fewer peaks uses steps of all of them.
+    - forward_stats: the normalization's statistics (forward_save). "auto" is "cpu_mirror" on CPU, "two_pass" on CUDA.
+    - warning_threshold: run() warns once, with a summary, if any convergence delta exceeds it. None: no warning.
+    - ref_workers: worker processes for RefProducer; None for its default, 0 to draw in this process.
+    - allow_version_drift: run with other cherimoya or tangermeme versions than the ones the engine was checked against.
+    """
+
+    def __init__(
+        self,
+        model: Cherimoya,
+        *,
+        output: str = "counts",
+        group: int | None = 0,
+        device: str | torch.device | None = None,
+        n_shuffles: int = 20,
+        random_state: int | None = 0,
+        head_rows: int = DEFAULT_HEAD_ROWS,
+        seqs_per_step: int | str = "auto",
+        forward_stats: str = "auto",
+        warning_threshold: float | None = 1e-3,
+        ref_workers: int | None = None,
+        allow_version_drift: bool = False,
+    ) -> None:
+        if output not in OUTPUTS:
+            raise ValueError("output must be either `counts` or `profile`.")
+        if output == "profile":
+            raise NotImplementedError("the profile head is not implemented in cheri_dls yet; attribute counts")
+        self.weights = CheriWeights.from_model(model, device, allow_version_drift=allow_version_drift)
+        self.wrapper = make_wrapper(model, output, group)  # the reference's group checks; kept for self-checks
+        self.output, self.group = output, group
+        self.forward_stats = resolve_forward_stats(forward_stats, self.weights.device)
+        self.n_shuffles = _positive_int(n_shuffles, "n_shuffles")
+        self.head_rows = _positive_int(head_rows, "head_rows")
+        if seqs_per_step != "auto":
+            seqs_per_step = _positive_int(seqs_per_step, "seqs_per_step", "'auto' or ")
+        self.seqs_per_step = seqs_per_step
+        if random_state is None:
+            random_state = int(np.random.randint(0, SEED_RANGE))
+            logger.info("random_state is None: drew the base seed %d", random_state)
+        if isinstance(random_state, bool) or not isinstance(random_state, numbers.Integral):
+            raise ValueError(f"random_state must be an integer or None, got {random_state!r}")
+        self.random_state = int(random_state)
+        if warning_threshold is not None and (
+            isinstance(warning_threshold, bool) or not isinstance(warning_threshold, numbers.Real)
+        ):
+            raise ValueError(f"warning_threshold must be a number or None, got {warning_threshold!r}")
+        self.warning_threshold = None if warning_threshold is None else float(warning_threshold)
+        if ref_workers is not None and (
+            isinstance(ref_workers, bool) or not isinstance(ref_workers, numbers.Integral) or ref_workers < 0
+        ):
+            raise ValueError(f"ref_workers must be None or a non-negative integer, got {ref_workers!r}")
+        self.ref_workers = None if ref_workers is None else int(ref_workers)
+        self._cotangents: dict[int, torch.Tensor] = {}
+
+    def raw(self, X: torch.Tensor | np.ndarray, references: torch.Tensor | np.ndarray | None = None) -> RawResult:
+        """Each pair's multipliers, outputs and convergence delta: what deep_lift_shap(raw_outputs=True) computes.
+
+        For tests and validation: the multipliers take N*K*4*L values. X is an (N, 4, L) one-hot such as
+        extract_loci's int8 one, with no N. references is an (N, K, 4, L) one-hot whose columns may be all zero (N), or
+        None to draw n_shuffles per sequence (see the class doc). Injected references set K, as in deep_lift_shap.
+        """
+        x_tokens, ref_tokens, K = self._tokens(X, references)
+        N, L = x_tokens.shape
+        S = self._step_size(N)
+        G0 = self._counts_cotangent(L)
+        dtype = self.weights.dtype
+        m = torch.empty(N, K, 4, L, dtype=dtype)
+        y_x, y_r, deltas = torch.empty(N, dtype=dtype), torch.empty(N, K, dtype=dtype), torch.empty(N, K, dtype=dtype)
+        debug = self._describe(N, L, K, S)
+        with self._reference_chunks(x_tokens, ref_tokens, K, S, debug) as chunks, torch.no_grad():
+            for a, b, refs in chunks:
+                n = b - a
+                X1h = self._joint_rows(x_tokens[a:b], refs, S)
+                fwd, mult = self._step(X1h, G0, S, K)
+                ys_x, ys_r = fwd.y[:S], fwd.y[S:].view(S, K)
+                delta = convergence_deltas(mult, X1h, ys_x, ys_r, S, K)
+                m[a:b] = mult.view(S, K, 4, L)[:n].cpu()
+                y_x[a:b], y_r[a:b], deltas[a:b] = ys_x[:n].cpu(), ys_r[:n].cpu(), delta[:n].cpu()
+                debug["steps"] += 1
+                debug["padded_peaks"] += S - n
+        debug["deltas"] = delta_summary(deltas, self.warning_threshold)
+        return RawResult(m, y_x, y_r, deltas, debug)
+
+    def run(
+        self,
+        X: torch.Tensor | np.ndarray,
+        start: int,
+        end: int,
+        *,
+        references: torch.Tensor | np.ndarray | None = None,
+    ) -> Result:
+        """Hypothetical attributions over the window [start, end), averaged over each sequence's references.
+
+        This is ``deep_lift_shap(wrapper, X, hypothetical=True, ...)[:, :, start:end]`` as `cherimoya attribute` calls
+        it (attribute.py:88-101), before its ``.float()``. X and references are as in raw(). Also returns the
+        convergence deltas and outputs per pair, and warns once if any delta exceeds warning_threshold.
+        """
+        x_tokens, ref_tokens, K = self._tokens(X, references)
+        N, L = x_tokens.shape
+        if not 0 <= operator.index(start) < operator.index(end) <= L:
+            raise ValueError(f"the window [{start}, {end}) must be non-empty and inside [0, {L})")
+        S = self._step_size(N)
+        G0 = self._counts_cotangent(L)
+        dtype = self.weights.dtype
+        attr = torch.empty(N, 4, end - start, dtype=dtype)
+        y_x, y_r, deltas = torch.empty(N, dtype=dtype), torch.empty(N, K, dtype=dtype), torch.empty(N, K, dtype=dtype)
+        meta = self._describe(N, L, K, S) | {"window": [int(start), int(end)]}
+        began = time.perf_counter()
+        with self._reference_chunks(x_tokens, ref_tokens, K, S, meta) as chunks, torch.no_grad():
+            for a, b, refs in chunks:
+                n = b - a
+                X1h = self._joint_rows(x_tokens[a:b], refs, S)
+                fwd, mult = self._step(X1h, G0, S, K)
+                ys_x, ys_r = fwd.y[:S], fwd.y[S:].view(S, K)
+                hyp, delta = epilogue(mult, X1h, ys_x, ys_r, start, end, S, K)
+                attr[a:b] = mean_over_references(hyp[:n].cpu(), start, L)
+                y_x[a:b], y_r[a:b], deltas[a:b] = ys_x[:n].cpu(), ys_r[:n].cpu(), delta[:n].cpu()
+                meta["steps"] += 1
+                meta["padded_peaks"] += S - n
+        meta["seconds"] = time.perf_counter() - began
+        meta["pairs_per_s"] = N * K / meta["seconds"]
+        meta["deltas"] = delta_summary(deltas, self.warning_threshold)
+        logger.info(
+            "cheri_dls: %d sequences x %d references in %d steps of %d peaks, %.1f s (%.0f pairs/s)",
+            N,
+            K,
+            meta["steps"],
+            S,
+            meta["seconds"],
+            meta["pairs_per_s"],
+        )
+        if meta["deltas"]["above"]:
+            warnings.warn(delta_warning(meta["deltas"]), RuntimeWarning, stacklevel=2)
+        return Result(attr, deltas, y_x, y_r, meta)
+
+    def _step(self, X1h: torch.Tensor, G0: torch.Tensor, S: int, K: int) -> tuple[Forward, torch.Tensor]:
+        """One step: the forward over the joint rows, then the backward over the S*K pairs. Returns (fwd, m).
+
+        m (S*K, 4, L) holds the multipliers at the one-hot input.
+        """
+        w = self.weights
+        L = X1h.shape[-1]
+        fwd = model_forward(X1h, w, forward_stats=self.forward_stats, output=self.output, group=self.group)
+        G = G0.expand(S, K, L, w.C)
+        for saved, block in zip(reversed(fwd.saved), reversed(w.blocks)):
+            G = bwd_block(G, saved, block, w.rs, S, K)
+        return fwd, input_multipliers(stem_rule(G, fwd.z0, S, K), X1h[S:], w.W0)
+
+    def _joint_rows(self, x_tokens: np.ndarray, ref_tokens: np.ndarray, S: int) -> torch.Tensor:
+        """The step's one-hot rows [x_0..x_{S-1}, r_00..r_{S-1,K-1}], (S + S*K, 4, L), in the engine's dtype.
+
+        x_tokens (n, L) and ref_tokens (n, K, L) are uint8 tokens (dls_refs). With n < S, the last peak's sequence and
+        references are repeated to fill the step.
+        """
+        n = len(x_tokens)
+        if n < S:
+            keep = np.concatenate([np.arange(n), np.full(S - n, n - 1)])
+            x_tokens, ref_tokens = x_tokens[keep], ref_tokens[keep]
+        tokens = np.concatenate([x_tokens, ref_tokens.reshape(-1, x_tokens.shape[-1])])
+        return dls_refs.tokens_to_onehot(torch.from_numpy(tokens).to(self.weights.device), self.weights.dtype)
+
+    @contextlib.contextmanager
+    def _reference_chunks(
+        self, x_tokens: np.ndarray, ref_tokens: np.ndarray | None, K: int, S: int, record: dict
+    ) -> Iterator[Iterator[tuple[int, int, np.ndarray]]]:
+        """An iterator of (a, b, references of peaks [a, b) as (b - a, K, L) tokens), over chunks of S peaks in order.
+
+        Injected references are sliced. Otherwise a RefProducer draws them, ahead of use, and closes its pool on exit.
+        """
+        N = len(x_tokens)
+        if ref_tokens is not None:
+            record["references"] = "injected"
+            yield ((a, min(a + S, N), ref_tokens[a : a + S]) for a in range(0, N, S))
+            return
+        record["references"] = "produced"
+        with dls_refs.RefProducer(self.ref_workers) as producer:
+            yield producer.chunks(x_tokens, K, self.random_state, S)
+            record["reference_stats"] = dict(producer.stats)
+
+    def _tokens(
+        self, X: torch.Tensor | np.ndarray, references: torch.Tensor | np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray | None, int]:
+        """Check X and references as deep_lift_shap does, and encode them as uint8 tokens.
+
+        Returns X's tokens (N, L), the references' tokens (N, K, L) or None, and K.
+
+        X must be a one-hot with exactly one base per position. references may have all-zero (N) columns
+        (TM/deep_lift_shap.py:681-684). The tokens are lossless, so the one-hot rows of a step equal the inputs.
+        """
+        x = torch.as_tensor(X)
+        if x.dim() != 3 or x.shape[1] != 4:
+            raise ValueError(f"X must have shape (N, 4, L), got {tuple(x.shape)}")
+        if x.shape[0] == 0:
+            raise ValueError("deep_lift_shap requires at least one example; got X with shape[0] == 0.")
+        x_tokens = dls_refs.onehot_to_tokens(x)
+        if bool((x_tokens == dls_refs.N_TOKEN).any()):
+            raise ValueError("X must be one-hot encoded and cannot have unknown characters (all-zero columns)")
+        if references is None:
+            return x_tokens, None, self.n_shuffles
+        r = torch.as_tensor(references)
+        N, _, L = x.shape
+        if r.dim() != 4 or r.shape[0] != N or r.shape[1] < 1 or tuple(r.shape[2:]) != (4, L):
+            raise ValueError(f"references must have shape ({N}, K >= 1, 4, {L}), got {tuple(r.shape)}")
+        return x_tokens, dls_refs.onehot_to_tokens(r), r.shape[1]
+
+    def _step_size(self, n_peaks: int) -> int:
+        return min(AUTO_SEQS_PER_STEP if self.seqs_per_step == "auto" else self.seqs_per_step, n_peaks)
+
+    def _counts_cotangent(self, length: int) -> torch.Tensor:
+        """counts_cotangent() at the input length, computed once per length (§7.1)."""
+        if length not in self._cotangents:
+            self._cotangents[length] = counts_cotangent(
+                self.weights, group=self.group, length=length, rows=self.head_rows
+            )
+        return self._cotangents[length]
+
+    def _describe(self, N: int, L: int, K: int, S: int) -> dict:
+        return {
+            "output": self.output,
+            "group": self.group,
+            "device": str(self.weights.device),
+            "dtype": str(self.weights.dtype).removeprefix("torch."),
+            "forward_stats": self.forward_stats,
+            "head_rows": self.head_rows,
+            "n_sequences": N,
+            "length": L,
+            "n_shuffles": K,
+            "pairs": N * K,
+            "random_state": self.random_state,
+            "seqs_per_step": S,
+            "steps": 0,
+            "padded_peaks": 0,
+        }
+
+
+def delta_summary(deltas: torch.Tensor, threshold: float | None) -> dict:
+    """Convergence deltas in brief (§9): pairs, threshold, how many exceed it, max, p50, p99 and p99.9.
+
+    A delta exceeds the threshold as tangermeme decides it, ``deltas > threshold`` in the deltas' dtype
+    (TM/deep_lift_shap.py:744). `above` is None when the threshold is.
+    """
+    values = deltas.detach().cpu()
+    p50, p99, p999 = np.quantile(values.double().flatten().numpy(), [0.5, 0.99, 0.999])
+    return {
+        "pairs": values.numel(),
+        "threshold": threshold,
+        "above": None if threshold is None else int((values > threshold).sum()),
+        "max": float(values.max()),
+        "p50": float(p50),
+        "p99": float(p99),
+        "p99.9": float(p999),
+    }
+
+
+def delta_warning(summary: dict) -> str:
+    """The one warning a run gives for high deltas, where tangermeme warns per batch with the whole batch's deltas."""
+    return (
+        f"Convergence deltas too high: {summary['above']} of {summary['pairs']} pairs > {summary['threshold']:g} "
+        f"(max {summary['max']:.4g}, p50/p99/p99.9 {summary['p50']:.3g}/{summary['p99']:.3g}/{summary['p99.9']:.3g})"
+    )
+
+
+def _positive_int(value: object, name: str, alternatives: str = "") -> int:
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value < 1:
+        raise ValueError(f"{name} must be {alternatives}a positive integer, got {value!r}")
+    return int(value)

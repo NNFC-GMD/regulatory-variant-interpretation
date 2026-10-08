@@ -1,5 +1,7 @@
-"""cheri_dls's weights and forward pass against the Cherimoya module's own CPU forward (acceptance criterion C1).
+"""cheri_dls's forward pass and whole engine against Cherimoya's own forward and tangermeme's deep_lift_shap, on CPU.
 
+Part 1, the weights and the forward pass (acceptance criterion C1)
+------------------------------------------------------------------
 C1. The "cpu_mirror" forward runs the reference CPU path op for op (cherimoya/cheri.py:54-87, 124-132). On the same
 rows it must therefore give the module's own output:
 - float64: |dy| <= 1e-12 * max(1, |y|).
@@ -29,12 +31,51 @@ Also covered:
   architecture changes raise;
 - the dls_tiny oracle and its delta sink.
 
+Part 2, the whole engine: Engine.raw and Engine.run (acceptance criteria C3-C10)
+---------------------------------------------------------------------------------
+Both sides get the same 13 sequences and the same injected references, K = 5 per sequence, of four kinds (dls_tiny):
+dinucleotide shuffles, random one-hots, r = x, and x with 3 mutated positions.
+- The oracle is deep_lift_shap as `cherimoya attribute` calls it, on CPU, at batch_size 7 and 1 thread. 7 is odd, so
+  a sequence's pairs split across batches. Its convergence deltas come from its print sink.
+- The engine runs at the default thread count, in steps of 8 peaks unless a test sets the step size. 13 peaks then
+  fill one step and pad the second with 3 copies of the last peak. Its counts cotangent is taken at the oracle's
+  full-batch row count, 2 x 7.
+
+forward_stats is "cpu_mirror" everywhere except C6 ("two_pass") and C9 (both). cpu_mirror normalizes in float32, as
+the module does (cherimoya/cheri.py:127), even in a float64 model. So its forward is the oracle's, while two_pass sits
+about 1e-8 away from the oracle in float64. Conversely, two_pass is conservative to float64 accuracy, and cpu_mirror
+only to float32 accuracy.
+
+- C3: per-pair rel-L2 of the raw multipliers over (4, L) against deep_lift_shap(raw_outputs=True).
+  - float64: max <= 1e-9.
+  - float32, shuffled and random references only: median <= 1e-6 and max <= 1e-5.
+- C4: per-sequence rel-L2 of the hypothetical attributions against deep_lift_shap(hypothetical=True), over the full
+  length and over attribute.py's centred window. float64: <= 1e-9; float32: <= 1e-5.
+- C5: in float64, |delta_ours - delta_ref| <= 1e-9 * max(1, |y_x - y_r|) for every pair. float32 deltas are reported,
+  not bounded: they are the size of an ulp of y.
+- C6: in float64 with two_pass, |delta| <= 1e-10 * max(1, |y_x - y_r|) for every pair.
+- C7: with r = x the multipliers are the plain gradient, autograd through the float64 wrapper: per-pair rel-L2 <= 1e-6.
+  The autograd path's float32 normalization sets the bound.
+- C8: with 3 mutated positions, some GELU inputs differ by less than 1e-6 between a sequence and its reference, so the
+  rule falls back to the gradient there. At least one such element must exist, and C3's float64 bound must hold.
+- C9: in float64, steps of S = 3 and 8 peaks against S = 1, for 13 peaks: per-pair and per-sequence rel-L2 <= 1e-12,
+  and the same relative bound on the deltas and outputs.
+- C10: on every model, the DeepLIFT multipliers for shuffled references differ from the plain gradient by at least 10%
+  per-pair rel-L2. So the rules are exercised.
+
+Also covered:
+- references produced by dls_refs.RefProducer, in process and in a 2-process pool, equal the injected shuffles bit
+  for bit;
+- the engine's argument checks;
+- a single summary warning for high deltas.
+
 Measured values are written to the terminal.
 """
 
 from __future__ import annotations
 
 import copy
+import functools
 import re
 import sys
 import warnings
@@ -509,3 +550,419 @@ def test_oracle_runs_a_float64_model(pytestconfig):
     assert result.attributions.dtype == result.deltas.dtype == torch.float64
     assert result.deltas.shape == (13, 2) and bool(torch.isfinite(result.attributions).all())
     _report(pytestconfig, f"oracle float64, config B: max convergence delta {float(result.deltas.max()):.3g}")
+
+
+# Part 2: the whole engine against tangermeme's deep_lift_shap (C3-C10) -----------------------------------------------
+
+F64 = torch.float64
+ORACLE_BATCH = 7  # odd, so a sequence's pairs split across batches (design §15.1)
+HEAD_ROWS = 2 * ORACLE_BATCH  # the oracle's full batch: 2 x batch_size rows (§4 head_rows)
+N_SEQUENCES = dls_tiny.N_RANDOM + dls_tiny.N_AT_RICH  # 13: no step size tested here divides it
+
+C3_FP64_MAX, C3_FP32_MEDIAN, C3_FP32_MAX = 1e-9, 1e-6, 1e-5
+C4_TOL = {torch.float32: 1e-5, F64: 1e-9}
+C5_FP64 = 1e-9
+C6_FP64 = 1e-10
+C7_TOL = 1e-6
+C9_TOL = 1e-12
+C10_MIN = 0.1
+
+PARITY_CASES = [
+    pytest.param(torch.float32, "shuffled", id="float32-shuffled"),
+    pytest.param(torch.float32, "random", id="float32-random"),
+    pytest.param(F64, "shuffled", id="float64-shuffled"),
+    pytest.param(F64, "random", id="float64-random"),
+    pytest.param(F64, "identical", id="float64-identical"),  # r = x, C7's references
+    pytest.param(F64, "mutated", id="float64-mutated"),  # 3 mutated positions, C8's references
+]
+
+
+@functools.cache
+def _case(config: str, kind: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """A config's 13 sequences, int8 (13, 4, L), and their K references of one kind, float32 (13, K, 4, L)."""
+    X = dls_tiny.sequences(config)
+    if kind == "shuffled":
+        return X, dls_tiny.shuffled_references(X, K)
+    if kind == "random":
+        return X, dls_tiny.random_references(X, K, seed=3)
+    if kind == "identical":
+        return X, dls_tiny.identical_references(X, K)
+    if kind == "mutated":
+        return X, dls_tiny.mutated_references(X, K, seed=5)
+    raise ValueError(kind)
+
+
+def _window(config: str) -> tuple[int, int]:
+    """attribute.py:84-86's window, for an attr_window of a quarter of the input."""
+    L = dls_tiny.CONFIGS[config].length
+    start = L // 2 - (L // 4) // 2
+    return start, start + L // 4
+
+
+def _engine(config: str, dtype: torch.dtype, **kwargs) -> cheri_dls.Engine:
+    """An Engine on a fresh tiny model, attributing the config's group, with the oracle's head rows."""
+    model = dls_tiny.tiny_model(config, dtype=dtype)
+    return cheri_dls.Engine(model, group=dls_tiny.CONFIGS[config].group, head_rows=HEAD_ROWS, **kwargs)
+
+
+@functools.cache
+def _ours_raw(config: str, dtype: torch.dtype, kind: str, stats: str = "cpu_mirror", step: int | str = "auto"):
+    X, R = _case(config, kind)
+    return _engine(config, dtype, forward_stats=stats, seqs_per_step=step).raw(X, R)
+
+
+@functools.cache
+def _ours_run(
+    config: str,
+    dtype: torch.dtype,
+    kind: str,
+    start: int,
+    end: int,
+    stats: str = "cpu_mirror",
+    step: int | str = "auto",
+):
+    X, R = _case(config, kind)
+    return _engine(config, dtype, forward_stats=stats, seqs_per_step=step).run(X, start, end, references=R)
+
+
+@functools.cache
+def _theirs(config: str, dtype: torch.dtype, kind: str, raw_outputs: bool) -> dls_tiny.OracleResult:
+    """tangermeme's deep_lift_shap on the same injected references, batch_size 7, 1 thread."""
+    X, R = _case(config, kind)
+    wrapped = dls_tiny.wrapper(dls_tiny.tiny_model(config, dtype=dtype), "counts", dls_tiny.CONFIGS[config].group)
+    return dls_tiny.oracle(wrapped, X, R, raw_outputs=raw_outputs, dtype=dtype, batch_size=ORACLE_BATCH)
+
+
+@functools.cache
+def _gradient(config: str) -> torch.Tensor:
+    """The plain gradient of the attributed count at each sequence, (13, 4, L): autograd through the float64 wrapper.
+
+    No DeepLIFT hooks are involved. The module normalizes in float32 (cherimoya/cheri.py:127), in the backward too.
+    """
+    wrapped = dls_tiny.wrapper(dls_tiny.tiny_model(config, dtype=F64), "counts", dls_tiny.CONFIGS[config].group)
+    X = dls_tiny.sequences(config).to(F64).requires_grad_()
+    with torch.enable_grad():
+        (grad,) = torch.autograd.grad(wrapped(X)[:, 0].sum(), X)
+    return grad
+
+
+def _rows_rel_l2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """||a - b||_2 / max(||b||_2, 1e-30) for each row (first axis), in float64."""
+    a, b = a.double().flatten(1), b.double().flatten(1)
+    return (a - b).norm(dim=1) / b.norm(dim=1).clamp_min(1e-30)
+
+
+def _dy(result) -> torch.Tensor:
+    """|y_x - y_r| per pair, (N, K), in float64."""
+    return (result.y_x[:, None] - result.y_r).double().abs()
+
+
+def _name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+@pytest.mark.parametrize("dtype, kind", PARITY_CASES)
+@pytest.mark.parametrize("config", CONFIG_NAMES)
+def test_c3_c5_raw_multipliers_and_deltas_match_tangermeme(config, dtype, kind, pytestconfig):
+    """Engine.raw against deep_lift_shap(raw_outputs=True) and its print-sink deltas, on the same references."""
+    L = dls_tiny.CONFIGS[config].length
+    ours, theirs = _ours_raw(config, dtype, kind), _theirs(config, dtype, kind, True)
+    assert ours.m.shape == theirs.attributions.shape == (N_SEQUENCES, K, 4, L)
+    assert ours.deltas.shape == ours.y_r.shape == (N_SEQUENCES, K) and ours.y_x.shape == (N_SEQUENCES,)
+    assert ours.m.dtype == ours.deltas.dtype == ours.y_x.dtype == ours.y_r.dtype == dtype
+    assert ours.debug["seqs_per_step"] == 8 and ours.debug["steps"] == 2 and ours.debug["padded_peaks"] == 3
+
+    rel = _rows_rel_l2(ours.m.flatten(0, 1), theirs.attributions.flatten(0, 1))
+    d_delta = (ours.deltas.double() - theirs.deltas.double()).abs() / _dy(ours).clamp_min(1)
+    _report(
+        pytestconfig,
+        f"C3/C5 config {config} {_name(dtype)} {kind}: raw per-pair rel-L2 median {float(rel.median()):.3g} max "
+        f"{float(rel.max()):.3g} (tol "
+        + (f"max {C3_FP64_MAX:g}" if dtype == F64 else f"median {C3_FP32_MEDIAN:g}, max {C3_FP32_MAX:g}")
+        + f"; bitwise {'yes' if torch.equal(ours.m, theirs.attributions) else 'no'}); "
+        f"|d delta|/max(1,|dy|) max {float(d_delta.max()):.3g}"
+        + (f" (tol {C5_FP64:g})" if dtype == F64 else " (reported only)")
+        + f"; deltas max ours {float(ours.deltas.max()):.3g}, tangermeme {float(theirs.deltas.max()):.3g}",
+    )
+    if dtype == F64:
+        assert float(rel.max()) <= C3_FP64_MAX
+        assert float(d_delta.max()) <= C5_FP64
+    else:
+        assert float(rel.median()) <= C3_FP32_MEDIAN
+        assert float(rel.max()) <= C3_FP32_MAX
+
+
+@pytest.mark.parametrize("dtype, kind", PARITY_CASES)
+@pytest.mark.parametrize("config", CONFIG_NAMES)
+def test_c4_hypothetical_attributions_match_tangermeme(config, dtype, kind, pytestconfig):
+    """Engine.run against deep_lift_shap(hypothetical=True), per sequence, over the full length and the window.
+
+    The window run must also be the full-length run sliced, bit for bit, and both must carry Engine.raw's deltas and
+    outputs: the three share every step.
+    """
+    L = dls_tiny.CONFIGS[config].length
+    start, end = _window(config)
+    full, window = _ours_run(config, dtype, kind, 0, L), _ours_run(config, dtype, kind, start, end)
+    theirs = _theirs(config, dtype, kind, False).attributions
+    assert full.attr.shape == theirs.shape == (N_SEQUENCES, 4, L)
+    assert window.attr.shape == (N_SEQUENCES, 4, end - start)
+    assert full.attr.dtype == window.attr.dtype == dtype
+    assert torch.equal(window.attr, full.attr[..., start:end])
+    raw = _ours_raw(config, dtype, kind)
+    for result in (full, window):
+        for name in ("deltas", "y_x", "y_r"):
+            assert torch.equal(getattr(result, name), getattr(raw, name)), name
+
+    rel_full = _rows_rel_l2(full.attr, theirs)
+    rel_window = _rows_rel_l2(window.attr, theirs[..., start:end])
+    worst = max(float(rel_full.max()), float(rel_window.max()))
+    _report(
+        pytestconfig,
+        f"C4 config {config} {_name(dtype)} {kind}: hyp per-sequence rel-L2 max, full length "
+        f"{float(rel_full.max()):.3g}, window [{start}, {end}) {float(rel_window.max()):.3g} (tol {C4_TOL[dtype]:g}); "
+        f"bitwise {'yes' if torch.equal(full.attr, theirs) else 'no'}",
+    )
+    assert worst <= C4_TOL[dtype]
+
+
+@pytest.mark.parametrize("kind", ["shuffled", "random", "mutated"])
+@pytest.mark.parametrize("config", CONFIG_NAMES)
+def test_c6_conservation_with_two_pass_statistics(config, kind, pytestconfig):
+    """With two_pass the forward normalizes with the rule's own statistics, so the rules sum exactly to y_x - y_r."""
+    ours = _ours_raw(config, F64, kind, "two_pass")
+    ratio = ours.deltas / _dy(ours).clamp_min(1)
+    mirror = _ours_raw(config, F64, kind, "cpu_mirror")
+    mirror_ratio = mirror.deltas / _dy(mirror).clamp_min(1)
+    _report(
+        pytestconfig,
+        f"C6 config {config} {kind}: two_pass max |delta|/max(1,|dy|) {float(ratio.max()):.3g} (tol {C6_FP64:g}); "
+        f"cpu_mirror, for contrast: {float(mirror_ratio.max()):.3g} (not bounded)",
+    )
+    assert float(ratio.max()) <= C6_FP64
+
+
+@pytest.mark.parametrize("config", CONFIG_NAMES)
+def test_c7_identical_references_give_the_gradient(config, pytestconfig):
+    """r = x: every rule falls back to the ordinary gradient, so the multipliers are autograd's gradient at x."""
+    grad = _gradient(config).repeat_interleave(K, dim=0)
+    lines = []
+    for stats in ("cpu_mirror", "two_pass"):
+        ours = _ours_raw(config, F64, "identical", stats)
+        rel = _rows_rel_l2(ours.m.flatten(0, 1), grad)
+        lines.append(f"{stats} max {float(rel.max()):.3g}, max delta {float(ours.deltas.max()):.3g}")
+        assert float(rel.max()) <= C7_TOL, stats
+    _report(pytestconfig, f"C7 config {config}: per-pair rel-L2 vs the gradient (tol {C7_TOL:g}): " + "; ".join(lines))
+
+
+@pytest.mark.parametrize("config", CONFIG_NAMES)
+def test_c8_near_identical_references_exercise_the_gradient_fallback(config, pytestconfig):
+    """3 mutated positions: the GELU inputs of a sequence and its reference often differ by less than 1e-6.
+
+    The count is taken from a forward over the same joint rows: where |z_x - z_r| < 1e-6, strictly, tangermeme's
+    rescale rule and ours take the gradient instead of the secant. C8 asks for one such element. Every GELU must have
+    one here, the blocks' as well as the stem's: away from the mutations the stem's inputs are equal, while a block's
+    differ through the per-row normalization, by amounts that only sometimes fall below 1e-6. C3's float64 bound must
+    still hold.
+    """
+    cfg = dls_tiny.CONFIGS[config]
+    X, R = _case(config, "mutated")
+    w = cheri_dls.CheriWeights.from_model(dls_tiny.tiny_model(config, dtype=F64))
+    X1h = torch.cat([X, R.flatten(0, 1)]).to(F64)
+    with torch.no_grad():
+        fwd = cheri_dls.model_forward(X1h, w, forward_stats="cpu_mirror", group=cfg.group)
+    sites = [("stem", fwd.z0)] + [(f"block {i}", saved.u) for i, saved in enumerate(fwd.saved)]
+    counts = {}
+    for name, z in sites:
+        zx, zr = cheri_dls.split_rows(z, N_SEQUENCES, K)
+        counts[name] = int(((zx - zr).abs() < cheri_dls.RESCALE_EPS).sum())
+
+    theirs = _theirs(config, F64, "mutated", True).attributions
+    rel = _rows_rel_l2(_ours_raw(config, F64, "mutated").m.flatten(0, 1), theirs.flatten(0, 1))
+    _report(
+        pytestconfig,
+        f"C8 config {config}: GELU elements with |dz| < 1e-6 over {N_SEQUENCES * K} pairs: "
+        + ", ".join(f"{name} {n}" for name, n in counts.items())
+        + f"; raw per-pair rel-L2 max {float(rel.max()):.3g} (tol {C3_FP64_MAX:g})",
+    )
+    assert min(counts.values()) >= 1
+    assert float(rel.max()) <= C3_FP64_MAX
+
+
+@pytest.mark.parametrize("kind", ["shuffled", "mutated"])
+@pytest.mark.parametrize("stats", ["cpu_mirror", "two_pass"])
+@pytest.mark.parametrize("config", CONFIG_NAMES)
+def test_c9_results_do_not_depend_on_the_step_size(config, stats, kind, pytestconfig):
+    """Steps of 3 and 8 peaks against steps of 1, for 13 peaks: the last step is padded with copies of the last peak.
+
+    Rows are independent in every op, so only reassociation can differ. Multipliers are compared per pair and the
+    attributions per sequence (rel-L2); deltas relative to max(1, |dy|), and outputs relative to max(1, |y|).
+    """
+    start, end = _window(config)
+    base_raw = _ours_raw(config, F64, kind, stats, 1)
+    base_run = _ours_run(config, F64, kind, start, end, stats, 1)
+    assert (base_raw.debug["steps"], base_raw.debug["padded_peaks"]) == (N_SEQUENCES, 0)
+    lines = []
+    for step in (3, 8):
+        raw = _ours_raw(config, F64, kind, stats, step)
+        run = _ours_run(config, F64, kind, start, end, stats, step)
+        n_steps = -(-N_SEQUENCES // step)
+        assert (raw.debug["seqs_per_step"], raw.debug["steps"], raw.debug["padded_peaks"]) == (
+            step,
+            n_steps,
+            n_steps * step - N_SEQUENCES,
+        )
+        assert (run.meta["seqs_per_step"], run.meta["steps"]) == (step, n_steps)
+        y_ref = torch.cat([base_raw.y_x[:, None], base_raw.y_r], dim=1).double()
+        y = torch.cat([raw.y_x[:, None], raw.y_r], dim=1).double()
+        errs = {
+            "m": float(_rows_rel_l2(raw.m.flatten(0, 1), base_raw.m.flatten(0, 1)).max()),
+            "attr": float(_rows_rel_l2(run.attr, base_run.attr).max()),
+            "deltas": float(((raw.deltas - base_raw.deltas).abs() / _dy(base_raw).clamp_min(1)).max()),
+            "y": float(((y - y_ref).abs() / y_ref.abs().clamp_min(1)).max()),
+        }
+        bitwise = torch.equal(raw.m, base_raw.m) and torch.equal(run.attr, base_run.attr)
+        lines.append(
+            f"S={step}: "
+            + ", ".join(f"{k} {v:.3g}" for k, v in errs.items())
+            + f" (bitwise {'yes' if bitwise else 'no'})"
+        )
+        assert max(errs.values()) <= C9_TOL, step
+    _report(pytestconfig, f"C9 config {config} {stats} {kind} vs S=1 (tol {C9_TOL:g}): " + "; ".join(lines))
+
+
+@pytest.mark.parametrize("config", CONFIG_NAMES)
+def test_c10_deeplift_multipliers_are_not_the_gradient(config, pytestconfig):
+    """Shuffled references: every pair's multipliers differ from the gradient at its sequence by >= 10% rel-L2."""
+    rel = _rows_rel_l2(_ours_raw(config, F64, "shuffled").m.flatten(0, 1), _gradient(config).repeat_interleave(K, 0))
+    _report(
+        pytestconfig,
+        f"C10 config {config}: per-pair rel-L2 DeepLIFT vs gradient, min {float(rel.min()):.3g} "
+        f"(bound >= {C10_MIN:g}), median {float(rel.median()):.3g}, max {float(rel.max()):.3g}",
+    )
+    assert float(rel.min()) >= C10_MIN
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_produced_references_are_the_injected_shuffles(workers, pytestconfig):
+    """references=None: dls_refs.RefProducer draws them, in this process (0 workers) or in a spawn pool.
+
+    dls_tiny.shuffled_references is deep_lift_shap's own draw (test_shuffled_references_are_deep_lift_shaps_own), so
+    bitwise equality with it covers the seeds, the token round trip and the order of the chunks. Config B, with steps
+    of 4 peaks: 13 peaks make 4 steps, the last padded.
+    """
+    rs, k = 1234, 3
+    X = dls_tiny.sequences("B")
+    R = dls_tiny.shuffled_references(X, k, random_state=rs)
+    engine = _engine("B", torch.float32, n_shuffles=k, random_state=rs, ref_workers=workers, seqs_per_step=4)
+    produced, injected = engine.raw(X), engine.raw(X, R)
+    for name in ("m", "y_x", "y_r", "deltas"):
+        assert torch.equal(getattr(produced, name), getattr(injected, name)), name
+    start, end = _window("B")
+    produced_run, injected_run = engine.run(X, start, end), engine.run(X, start, end, references=R)
+    assert torch.equal(produced_run.attr, injected_run.attr) and torch.equal(produced_run.deltas, injected_run.deltas)
+    assert (produced_run.meta["references"], injected_run.meta["references"]) == ("produced", "injected")
+    assert produced_run.meta["random_state"] == rs and produced_run.meta["n_shuffles"] == k
+    _report(
+        pytestconfig,
+        f"RefProducer, {workers} worker(s): {N_SEQUENCES * k} pairs bitwise equal to the injected shuffles "
+        f"(raw and run); reference stats {produced_run.meta['reference_stats']}",
+    )
+
+
+def test_engine_arguments():
+    model = dls_tiny.tiny_model("B")
+    X = dls_tiny.sequences("B")[:3]
+    L = X.shape[-1]
+    R = dls_tiny.shuffled_references(X, 2)
+
+    with pytest.raises(NotImplementedError, match="profile"):
+        cheri_dls.Engine(model, output="profile", group=1)
+    with pytest.raises(ValueError, match="output"):
+        cheri_dls.Engine(model, output="logits", group=1)
+    with pytest.raises(ValueError, match="attributes one output"):
+        cheri_dls.Engine(model, group=None)  # attribute.py:43-47
+    with pytest.raises(ValueError, match="contract"):
+        cheri_dls.Engine(ControlWrapper(model), group=1)
+    for bad in (2, True):
+        with pytest.raises(ValueError, match="group must be"):
+            cheri_dls.Engine(model, group=bad)  # wrappers.py:67-85
+    for bad in (0, -1, "big", 2.5, True):
+        with pytest.raises(ValueError, match="seqs_per_step"):
+            cheri_dls.Engine(model, group=1, seqs_per_step=bad)
+    for name in ("n_shuffles", "head_rows"):
+        for bad in (0, 1.5, True):
+            with pytest.raises(ValueError, match=name):
+                cheri_dls.Engine(model, group=1, **{name: bad})
+    with pytest.raises(ValueError, match="forward_stats"):
+        cheri_dls.Engine(model, group=1, forward_stats="three_pass")
+    with pytest.raises(ValueError, match="random_state"):
+        cheri_dls.Engine(model, group=1, random_state=1.5)
+    with pytest.raises(ValueError, match="warning_threshold"):
+        cheri_dls.Engine(model, group=1, warning_threshold="high")
+    for bad in (-1, 1.5, True):
+        with pytest.raises(ValueError, match="ref_workers"):
+            cheri_dls.Engine(model, group=1, ref_workers=bad)
+
+    engine = cheri_dls.Engine(model, group=1, n_shuffles=2, ref_workers=0)
+    assert (engine.forward_stats, engine.random_state, engine.head_rows) == ("cpu_mirror", 0, 128)
+    with_n = X.clone()
+    with_n[1, :, 7] = 0
+    bad_inputs = {
+        "not one-hot": (X * 2, None, "one-hot"),
+        "an N in X": (with_n, None, "unknown"),
+        "X of 3 channels": (X[:, :3], None, "shape"),
+        "no sequences": (X[:0], None, "at least one"),
+        "references for other sequences": (X, R[:2], "references"),
+        "references of another length": (X, R[..., :-1], "references"),
+        "no references": (X, R[:, :0], "references"),
+        "references not one-hot": (X, R * 2, "one-hot"),
+        "an input too short for the trimming": (X[..., : 2 * model.trimming], None, "trimming"),
+    }
+    for x, r, match in bad_inputs.values():
+        with pytest.raises(ValueError, match=match):
+            engine.raw(x, r)
+        with pytest.raises(ValueError, match=match):
+            engine.run(x, 0, x.shape[-1] if x.dim() == 3 else 1, references=r)
+    for start, end in ((10, 10), (-1, 20), (0, L + 1), (50, 40)):
+        with pytest.raises(ValueError, match="window"):
+            engine.run(X, start, end, references=R)
+
+    # tangermeme takes K from injected references, whatever n_shuffles says (deep_lift_shap.py:681-684), and allows
+    # their N (all-zero) columns.
+    R_n = R.clone()
+    R_n[0, 1, :, 5] = 0
+    raw = cheri_dls.Engine(model, group=1, n_shuffles=20).raw(X, R_n)
+    assert raw.m.shape == (3, 2, 4, L) and bool(torch.isfinite(raw.m).all())
+
+    # random_state None draws a base seed once, records it, and draws the references from it.
+    drawn = cheri_dls.Engine(model, group=1, n_shuffles=2, random_state=None, ref_workers=0)
+    rs = drawn.random_state
+    assert isinstance(rs, int) and 0 <= rs < 9_999_999
+    result = drawn.run(X, 0, L)
+    assert result.meta["random_state"] == rs
+    expected = drawn.run(X, 0, L, references=dls_tiny.shuffled_references(X, 2, random_state=rs))
+    assert torch.equal(result.attr, expected.attr)
+
+
+def test_run_warns_once_for_high_deltas():
+    """One summary RuntimeWarning per run when any delta exceeds the threshold, none for a threshold of None (§9)."""
+    model = dls_tiny.tiny_model("A")
+    X = dls_tiny.sequences("A")[:4]
+    R = dls_tiny.shuffled_references(X, 3)
+    for threshold, warns in ((0.0, True), (None, False), (1.0, False)):
+        engine = cheri_dls.Engine(model, warning_threshold=threshold, seqs_per_step=3)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = engine.run(X, 0, X.shape[-1], references=R)
+        messages = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
+        summary = result.meta["deltas"]
+        assert summary["pairs"] == 12 and summary["threshold"] == threshold
+        assert summary["max"] == float(result.deltas.max())
+        if warns:
+            assert len(messages) == 1, messages
+            assert re.fullmatch(
+                r"Convergence deltas too high: \d+ of 12 pairs > 0 \(max \S+, p50/p99/p99\.9 \S+/\S+/\S+\)", messages[0]
+            )
+            assert summary["above"] == int((result.deltas > 0).sum())
+        else:
+            assert messages == []

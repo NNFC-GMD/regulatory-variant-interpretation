@@ -53,9 +53,17 @@ Subcommands, in order. Every one runs inside a box. All of them import torch exc
     q = 0.5, 0.99 and max. "a vs b" always means ||a - b|| / ||b||, so the floors are relative to R1 (R2 for F_hh)
     and every gate relative to the reference run it names.
   - The gates: E1 forward parity, E3, E4, E5, E6, E7 (applied only when E3 or E4 fails), E8, E10, and G0.
-  - Context, not gated: T1' vs T1, R1_8 vs R1, every run's distance to T64, every run's forward error against T64
-    (in E7(a)'s form for E1 and E10, which have no tie-breaker), every run's deltas, and with --probe-json the cuDNN
-    classes probe P3 (dls_probe.py) found at the row counts these runs used.
+  - E1 in reference mode and E10 in fp32 mode are gated as revised after round 2 (analyses/attr_pilot/design/
+    revisions.md). Their original fixed bounds sat below the stock reference's own rerun noise:
+    - E1, reference mode: max |y_ours - y_R1| <= 2 x max |y_R1' - y_R1|, the stock forward's own rerun noise on the
+      same rows, and max |y_ours - y_T64| <= 1.2 x max |y_R1 - y_T64| on the truth peaks. fp32 mode keeps 5e-5.
+    - E10, fp32 mode: E4's form against F_hh, per-pair raw q99 <= max(3 F_hh(0.99), 1e-4) and q50 <=
+      max(2 F_hh(0.5), 1e-5).
+    The original bounds (2e-4; p99 <= 1e-5) are still computed and reported, in report.json's "revisions" and the
+    report's "Revised criteria" section, but do not gate.
+  - Context, not gated: T1' vs T1, R1_8 vs R1, every run's distance to T64, every run's forward error against T64,
+    every run's deltas, and with --probe-json the cuDNN classes probe P3 (dls_probe.py) found at the row counts these
+    runs used.
 
 Deviations from the design, forced by the rules for the shared GPUs and recorded in the report:
 - The oracle's batch_size. Stock deep_lift_shap at the pilot's batch_size 64 allocates 15.5 GB on this model, and
@@ -122,16 +130,19 @@ OURS_RUNS = {
 TRUTH_RUN = "T64"
 REFERENCE_OF = {"reference": "R1", "fp32": "R2"}  # the stock run a mode is judged against
 
-# Acceptance constants (final_rest.json acceptance_criteria E1-E10; design §15.4). Never relaxed here.
+# Acceptance constants (final_rest.json acceptance_criteria E1-E10; design §15.4), as revised after round 2 for E1 in
+# reference mode and E10 in fp32 mode (design/revisions.md). Nothing else is relaxed here.
 MED_FACTOR, P99_FACTOR = 2.0, 3.0  # E3/E4/E6: median <= max(2 F(0.5), 1e-5), p99 <= max(3 F(0.99), 1e-4)
 MED_MIN, P99_MIN = 1e-5, 1e-4
 POLICY_FACTOR = 0.3  # E3: median <= 0.3 F_tf(0.5)
 PEARSON_MIN, HYP_REL_MAX = 0.9999, 1e-2  # E5 caps, per peak
-E1_MAX = {"reference": 2e-4, "fp32": 5e-5}  # max-abs on the counts output
-ACCURACY_FACTOR = 1.2  # E7(a)
+E1_MAX = {"reference": 2e-4, "fp32": 5e-5}  # max-abs on the counts output; reference mode's is the original, reported
+E1_FLOOR_FACTOR = 2.0  # revised E1, reference mode: max|y_ours - y_R1| <= 2 x max|y_R1' - y_R1|
+ACCURACY_FACTOR = 1.2  # E7(a); also revised E1's accuracy clause: max|y_ours - y_T64| <= 1.2 x max|y_R1 - y_T64|
 E8_FRACTION_FLOOR, E8_MAX_FLOOR = 0.003, 4e-3  # E8: fraction <= max(2 R1's, 0.3%), max <= max(2 R1's max, 4e-3)
 E8_FP32_PREDICTION = 1e-4  # E8, fp32 mode: a prediction, not a gate
-E10_FP32_P99_MAX = 1e-5
+E10_FP32_P99_MAX = 1e-5  # the original E10 fp32 bound, reported only; revised: E4's form against F_hh
+REVISIONS_DOC = "analyses/attr_pilot/design/revisions.md"
 # The pilot's stock run of all 4,999 kept peaks (attr_pilot/attribute.log, recounted in final_rest.json's corrections).
 PILOT = {"above": 153, "pairs": 99_980, "max": 1.9636e-3}
 
@@ -1020,8 +1031,9 @@ def _outputs(runs: Runs, name: str, peaks: str = "own"):
 
 
 def _gate_pass(rows: list[dict]) -> bool | None:
-    verdicts = [r["pass"] for r in rows if r["pass"] is not None]
-    return None if not verdicts else all(verdicts)
+    """A gate's verdict: None when it has no rows or a row could not be evaluated (a run it needs is missing)."""
+    verdicts = [r["pass"] for r in rows]
+    return None if not verdicts or None in verdicts else all(verdicts)
 
 
 def cmd_gates(args: argparse.Namespace) -> int:
@@ -1077,32 +1089,16 @@ def cmd_gates(args: argparse.Namespace) -> int:
         for stat in ("q50", "q99", "max")
     ]
 
-    # E1 forward parity: our outputs against the module's own forward under enable_grad, per mode
-    e1 = []
-    for ours, mode in (("T1", "reference"), ("T3", "reference"), ("T2", "fp32")):
-        ref = REFERENCE_OF[mode]
-        if need(ours, ref):
-            diff = float(np.abs(_outputs(runs, ours) - _outputs(runs, ref)).max())
-            e1.append(
-                _row(
-                    "E1",
-                    f"{ours} y vs {ref} module y",
-                    "counts y",
-                    "max abs",
-                    diff,
-                    E1_MAX[mode],
-                    f"{mode}: <= {E1_MAX[mode]:g}",
-                )
-            )
-    gates["E1"] = e1
+    # Forward outputs: every run's against the others' and against the fp64 truth on the 8 truth peaks (168 rows)
     context_rows = []
+    original_rows = []  # the original bounds of revised criteria: computed and reported, never gating
+    revisions: dict = {"document": REVISIONS_DOC}
     forward_noise = {}
     for a, b in (("R1p", "R1"), ("R2p", "R2"), ("R2", "R1"), ("T1p", "T1"), ("T2", "R1"), ("T1", "R1p"), ("T2", "R2p")):
         if need(a, b):
             diff = float(np.abs(_outputs(runs, a) - _outputs(runs, b)).max())
             forward_noise[f"{a} vs {b}"] = diff
             context_rows.append(_row("context E1", f"{a} y vs {b} y", "counts y", "max abs", diff, None, "reported"))
-    # E1 against the fp64 truth: each run's forward error on the 8 truth peaks (168 rows)
     forward_to_truth = {}
     if runs.has(TRUTH_RUN):
         y_truth = _outputs(runs, TRUTH_RUN)
@@ -1115,7 +1111,6 @@ def cmd_gates(args: argparse.Namespace) -> int:
                         "context E1", f"{name} y vs T64 y (truth peaks)", "counts y", "max abs", diff, None, "reported"
                     )
                 )
-    # Accuracy context for E1, in the form of E7(a); E7 is a tie-breaker of E3 and E4 only, so E1's verdict stands.
     forward_accuracy = {}
     for ours, ref in (("T1", "R1"), ("T3", "R1"), ("T2", "R2")):
         if ours in forward_to_truth and ref in forward_to_truth:
@@ -1125,17 +1120,71 @@ def cmd_gates(args: argparse.Namespace) -> int:
                 "reference_to_T64": d_ref,
                 "within_1.2x": bool(d_ours <= ACCURACY_FACTOR * d_ref),
             }
-            context_rows.append(
-                _row(
-                    "context E1 accuracy",
-                    f"max|y_{ours} - y_T64| vs 1.2 max|y_{ref} - y_T64| (truth peaks)",
-                    "counts y",
-                    "max abs",
-                    d_ours,
-                    ACCURACY_FACTOR * d_ref,
-                    "E7(a)'s form; not a tie-breaker for E1",
-                )
-            )
+
+    # E1 forward parity: our outputs against the module's own forward under enable_grad, per mode. Reference mode as
+    # revised (design/revisions.md): within 2x the stock forward's own rerun noise on the same rows, and no farther
+    # from the fp64 truth than 1.2x the stock run. The original 2e-4 is reported only. fp32 mode keeps 5e-5.
+    e1 = []
+    floor_y = forward_noise.get("R1p vs R1")
+    e1_revision: dict = {
+        "original": {"rule": f"max |y_ours - y_R1| <= {E1_MAX['reference']:g}", "bound": E1_MAX["reference"]},
+        "revised": {
+            "rule": "max |y_ours - y_R1| <= 2 x max |y_R1' - y_R1| (the stock forward's rerun noise on the same "
+            "rows), and max |y_ours - y_T64| <= 1.2 x max |y_R1 - y_T64| on the 8 truth peaks",
+            "floor_R1p_vs_R1": floor_y,
+            "floor_bound": None if floor_y is None else E1_FLOOR_FACTOR * floor_y,
+            "R1_to_T64": forward_to_truth.get("R1"),
+            "accuracy_bound": None if "R1" not in forward_to_truth else ACCURACY_FACTOR * forward_to_truth["R1"],
+        },
+        "runs": {},
+    }
+    for ours, mode in (("T1", "reference"), ("T3", "reference"), ("T2", "fp32")):
+        ref = REFERENCE_OF[mode]
+        if not need(ours, ref):
+            continue
+        diff = float(np.abs(_outputs(runs, ours) - _outputs(runs, ref)).max())
+        label = f"{ours} y vs {ref} module y"
+        if mode == "fp32":
+            e1.append(_row("E1", label, "counts y", "max abs", diff, E1_MAX[mode], f"{mode}: <= {E1_MAX[mode]:g}"))
+            continue
+        original = _row(
+            "E1 original (reported only)",
+            label,
+            "counts y",
+            "max abs",
+            diff,
+            E1_MAX[mode],
+            f"{mode}: <= {E1_MAX[mode]:g}; superseded by the revised E1",
+        )
+        original_rows.append(original)
+        floor_row = _row(
+            "E1",
+            label,
+            "counts y",
+            "max abs",
+            diff,
+            e1_revision["revised"]["floor_bound"],
+            "reference: <= 2 x max|y_R1' - y_R1|",
+        )
+        accuracy_row = _row(
+            "E1",
+            f"{ours} y vs T64 y (truth peaks), against 1.2 x R1's",
+            "counts y",
+            "max abs to T64",
+            forward_to_truth.get(ours),
+            e1_revision["revised"]["accuracy_bound"],
+            "reference: <= 1.2 x max|y_R1 - y_T64|",
+        )
+        e1 += [floor_row, accuracy_row]
+        e1_revision["runs"][ours] = {
+            "max_abs_vs_R1": diff,
+            "max_abs_to_T64": accuracy_row["measured"],
+            "original_pass": original["pass"],
+            "floor_pass": floor_row["pass"],
+            "accuracy_pass": accuracy_row["pass"],
+        }
+    gates["E1"] = e1
+    revisions["E1_reference"] = e1_revision
     report["E1_context"] = {
         "max_abs_between_runs": forward_noise,
         "max_abs_to_T64_truth_peaks": forward_to_truth,
@@ -1315,23 +1364,45 @@ def cmd_gates(args: argparse.Namespace) -> int:
                 )
             )
     if need("T2_S8", "T2"):
+        # fp32 mode as revised (design/revisions.md): E4's form against F_hh, the stock's own strict-fp32 rerun, on
+        # the per-pair raw rel-L2. The original p99 <= 1e-5 is reported only; hyp is reported in the same form.
         cmp = runs.compare("T2_S8", "T2")
-        e10.append(
-            _row("E10", "T2_S8 vs T2 (fp32)", "raw", "q99", cmp["raw"]["q99"], E10_FP32_P99_MAX, "per-pair p99 <= 1e-5")
+        label = "T2_S8 vs T2 (fp32)"
+        original = _row(
+            "E10 original (reported only)",
+            label,
+            "raw",
+            "q99",
+            cmp["raw"]["q99"],
+            E10_FP32_P99_MAX,
+            "per-pair p99 <= 1e-5; superseded by the revised E10",
         )
-        context_rows.append(_row("context", "T2_S8 vs T2 (fp32)", "hyp", "q50", cmp["hyp"]["q50"], None, "reported"))
-        if "F_hh" in floors:
-            context_rows.append(
-                _row(
-                    "context E10",
-                    "T2_S8 vs T2 (fp32) against F_hh, the reference's own fp32 rerun",
-                    "raw",
-                    "q99",
-                    cmp["raw"]["q99"],
-                    floors["F_hh"]["raw"]["q99"],
-                    "F_hh(0.99)",
-                )
-            )
+        original_rows.append(original)
+        hh = floors.get("F_hh")
+        revised = {}
+        for metric in ("raw", "hyp"):
+            bounds = floor_bounds(hh[metric]) if hh else {"q50": None, "q99": None}
+            for stat, rule in (("q50", "max(2*F_hh(0.5), 1e-5)"), ("q99", "max(3*F_hh(0.99), 1e-4)")):
+                row = _row("E10", label, metric, stat, cmp[metric][stat], bounds[stat], rule)
+                if metric == "raw":
+                    e10.append(row)
+                    revised[stat] = {"measured": row["measured"], "bound": row["bound"], "pass": row["pass"]}
+                else:
+                    context_rows.append(dict(row, gate="context E10", rule=f"{rule}; reported, not gated"))
+        revisions["E10_fp32"] = {
+            "original": {
+                "rule": "per-pair raw rel-L2 p99 <= 1e-5",
+                "bound": E10_FP32_P99_MAX,
+                "measured": original["measured"],
+                "pass": original["pass"],
+            },
+            "revised": {
+                "rule": "per-pair raw rel-L2 p99 <= max(3 F_hh(0.99), 1e-4) and median <= max(2 F_hh(0.5), 1e-5)",
+                "F_hh_raw": None if hh is None else {k: hh["raw"][k] for k in ("q50", "q99", "max")},
+                "checks": revised,
+            },
+            "measured_raw": {k: cmp["raw"][k] for k in ("q50", "q99", "max")},
+        }
         if truth_ready:
             for metric in ("raw", "hyp"):
                 d_s8 = runs.compare("T2_S8", TRUTH_RUN, "truth")[metric]
@@ -1390,9 +1461,12 @@ def cmd_gates(args: argparse.Namespace) -> int:
         summary[gate] = verdict
         rows += gate_rows
     rows += gates.get("E7", [])
+    rows += original_rows
     rows += context_rows
     report["summary"] = summary
     report["gates"] = gates
+    report["revisions"] = revisions
+    report["original_bounds"] = original_rows
     report["all_gates_pass"] = all(v not in (None, False) for v in summary.values())
     report["deviations"] = _deviations(runs)
     report["open_issues"] = _open_issues(runs, summary, report)
@@ -1491,7 +1565,15 @@ def _deviations(runs: Runs) -> list[str]:
         "The 8 truth peaks are a subset of P256, so d(R, T64) is read from R1/R2's own rows for those peaks (rows never "
         "mix); R1_8 is the literal extra R1 run on the 8 peaks alone, reported as context."
     )
-    out.append("Counts head only: the profile head is not implemented in cheri_dls, and E9 (end to end) needs the CLI.")
+    out.append(
+        "Counts head only: the profile head is not implemented in cheri_dls (attribute_fast.py hands output 'profile' to "
+        "the stock command). E9, end to end against `cherimoya attribute`, ran separately (attr_pilot/e9)."
+    )
+    out.append(
+        f"E1 in reference mode and E10 in fp32 mode are gated as revised after round 2 ({REVISIONS_DOC}): their "
+        "original fixed bounds sat below the stock reference's own rerun noise. The original bounds are still computed "
+        "and listed under 'Revised criteria'; they do not gate."
+    )
     if (runs.root.parent / "superseded").exists():
         out.append(
             "superseded/ keeps a first set of oracle runs whose E1 forward used plain batches of 40 rows. The rows of "
@@ -1537,19 +1619,19 @@ def _open_issues(runs: Runs, summary: dict, report: dict) -> list[str]:
             spread = [v for v in e1.get("module_y_x_copy_spread", {}).values() if v is not None]
             acc = e1.get("accuracy", {})
             line += (
-                f" The stock forward's own noise is as large: R1' vs R1 {_fmt(noise.get('R1p vs R1'))}, and identical "
-                f"copies of one sequence inside one stock batch differ by up to {_fmt(max(spread) if spread else None)}."
-                " Against the fp64 truth on the 8 truth peaks: "
+                f" Context: R1' vs R1 {_fmt(noise.get('R1p vs R1'))}; identical copies of one sequence inside one "
+                f"stock batch differ by up to {_fmt(max(spread) if spread else None)}. Against the fp64 truth on the 8 "
+                "truth peaks: "
                 + ", ".join(f"{k} {_fmt(v['ours_to_T64'])} vs {_fmt(v['reference_to_T64'])}" for k, v in acc.items())
-                + " (ours vs the reference, max |y - y_T64|). E1 has no tie-breaker; its bound is not relaxed here."
+                + " (ours vs the reference, max |y - y_T64|)."
             )
         if gate == "E10":
             hh = floors.get("F_hh", {}).get("raw", {})
             line += (
-                f" The reference's own fp32 rerun has F_hh per-pair q99 {_fmt(hh.get('q99'))} and max "
-                f"{_fmt(hh.get('max'))}. S = 4 and S = 8 are equally far from the fp64 truth: d(T2,T64) and "
-                f"d(T2_S8,T64) raw q50 {_fmt(report['distance_to_T64'].get('T2', {}).get('raw', {}).get('q50'))} and "
-                f"{_fmt(report['distance_to_T64'].get('T2_S8', {}).get('raw', {}).get('q50'))}. E10 has no tie-breaker."
+                f" Context: F_hh per-pair raw q50 {_fmt(hh.get('q50'))}, q99 {_fmt(hh.get('q99'))}, max "
+                f"{_fmt(hh.get('max'))}; d(T2,T64) and d(T2_S8,T64) raw q50 "
+                f"{_fmt(report['distance_to_T64'].get('T2', {}).get('raw', {}).get('q50'))} and "
+                f"{_fmt(report['distance_to_T64'].get('T2_S8', {}).get('raw', {}).get('q50'))}."
             )
         out.append(line)
     if not report["E8_reference"]["stock_p5000_run"]:
@@ -1584,6 +1666,54 @@ def _write_tsv(path: Path, rows: list[dict]) -> None:
             "\t".join(_fmt(r[c]) if c in ("measured", "bound") else str(r[c] if r[c] is not None else "") for c in cols)
         )
     path.write_text("\n".join(lines) + "\n")
+
+
+def _revisions_markdown(report: dict) -> list[str]:
+    """The report's "Revised criteria" section: each revised criterion's original bound, reported only, and the
+    revised bounds that gate, with the measured values."""
+    rev = report.get("revisions") or {}
+    e1, e10 = rev.get("E1_reference"), rev.get("E10_fp32")
+    if not (e1 and e1.get("runs")) and not e10:
+        return []
+    lines = [
+        "",
+        "## Revised criteria",
+        "",
+        f"E1 in reference mode and E10 in fp32 mode gate with the revised bounds of `{rev.get('document')}`, in the "
+        "table above. Their original fixed bounds sat below the stock reference's own rerun noise. They are still "
+        "computed, here, and do not gate.",
+        "",
+        "| criterion | comparison | statistic | measured | original bound | passes original | revised bound | "
+        "passes revised |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    if e1 and e1.get("runs"):
+        r = e1["revised"]
+        floor_note = f"2 x R1' vs R1 {_fmt(r['floor_R1p_vs_R1'])} = {_fmt(r['floor_bound'])}"
+        accuracy_note = f"1.2 x R1 to T64 {_fmt(r['R1_to_T64'])} = {_fmt(r['accuracy_bound'])}"
+        for name, v in e1["runs"].items():
+            lines.append(
+                f"| E1 reference | {name} y vs R1 module y | max abs | {_fmt(v['max_abs_vs_R1'])} | "
+                f"{_fmt(e1['original']['bound'])} | {v['original_pass']} | {floor_note} | {v['floor_pass']} |"
+            )
+            lines.append(
+                f"| E1 reference | {name} y vs T64 y (truth peaks) | max abs | {_fmt(v['max_abs_to_T64'])} | (none) | "
+                f"- | {accuracy_note} | {v['accuracy_pass']} |"
+            )
+    if e10:
+        checks = e10["revised"]["checks"]
+        hh = e10["revised"]["F_hh_raw"] or {}
+        for stat, factor, name in (("q50", "2", "0.5"), ("q99", "3", "0.99")):
+            check = checks.get(stat, {})
+            original = (
+                (_fmt(e10["original"]["bound"]), str(e10["original"]["pass"])) if stat == "q99" else ("(none)", "-")
+            )
+            lines.append(
+                f"| E10 fp32 | T2_S8 vs T2, raw | {stat} | {_fmt(check.get('measured'))} | {original[0]} | "
+                f"{original[1]} | max({factor} x F_hh({name}) {_fmt(hh.get(stat))}, "
+                f"{'1e-5' if stat == 'q50' else '1e-4'}) = {_fmt(check.get('bound'))} | {check.get('pass')} |"
+            )
+    return lines
 
 
 def _markdown(report: dict, rows: list[dict]) -> str:
@@ -1629,12 +1759,13 @@ def _markdown(report: dict, rows: list[dict]) -> str:
         "|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
-        if r["gate"].startswith("context") or r["gate"].startswith("E8 fp32") or r["gate"] == "E2":
+        if r["gate"].startswith(("context", "E8 fp32")) or r["gate"] == "E2" or "original" in r["gate"]:
             continue
         lines.append(
             f"| {r['gate']} | {r['comparison']} | {r['metric']} | {r['statistic']} | {_fmt(r['measured'])} | "
             f"{r['op']} {_fmt(r['bound'])} | {r['rule']} | {r['pass']} |"
         )
+    lines += _revisions_markdown(report)
     lines += [
         "",
         "## Runs",

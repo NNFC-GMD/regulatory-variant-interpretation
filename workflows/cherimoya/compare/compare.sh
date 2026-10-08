@@ -10,13 +10,15 @@
 #                     joined by peak name, per fold, on the fold averages, against each model's leave-one-out
 #                     ceiling and on held-out folds; then the float16 sensitivity on one dataset and the summary
 #                     -> <COMPARISON_ROOT>/attributions/
-#   3  TF-MoDISco     compare_modisco.py, per dataset: the fold-average patterns and seqlets (matched through the
-#                     joint compendium's clusters and tomtom-lite), and the per-fold QC-scale runs with each model's
-#                     fold-to-fold ceiling; then the bias control and the summary -> <COMPARISON_ROOT>/modisco/
+#   3  TF-MoDISco     compare_modisco.py, per dataset two units: <ds> the fold-average patterns and seqlets
+#                     (matched through the joint compendium's clusters and tomtom-lite), <ds>.qc the per-fold
+#                     QC-scale runs with each model's fold-to-fold ceiling; then the bias control and the summary
+#                     -> <COMPARISON_ROOT>/modisco/
 #   4  compendia      compare_compendia.py: the like-for-like compendia (ChromBPNet's 10 against Cherimoya's 10) and
 #                     the joint compendium's clusters by model -> <COMPARISON_ROOT>/compendium/
 #   5  Fi-NeMo        compare_finemo.py, per dataset: both models' hits on the joint compendium, on the peaks both
-#                     beds hold; then the summary -> <COMPARISON_ROOT>/finemo/
+#                     beds hold (and, with COMPARE_PRODUCTION=1, <ds>.production: the production hits, cbp10 against
+#                     cheri39, through level 4's cluster matches); then the summary -> <COMPARISON_ROOT>/finemo/
 #   The levels run in ascending order. Within a level the dataset units run COMPARE_WORKERS at a time, then the
 #   level's summary.
 #
@@ -42,8 +44,13 @@
 #         COMPARE_FLOAT16_DATASET level 2: the dataset of the float16 sensitivity check (default the list's first;
 #                                 "none" skips it)
 #         COMPARE_JOINT           levels 3-5: the joint compendium's tag (default joint20)
-#         COMPARE_BIAS_MODISCO    level 3: a bias reference's TF-MoDISco h5 (e.g. the bias model's QC run, or the
-#                                 bias control run on another head), besides <COMPARISON_ROOT>/bias_control/*/
+#         COMPARE_MOTIF_DB        levels 3-4: the MEME database patterns are annotated with (default: the one a
+#                                 compendium's compendium.json records, MotifCompendium's)
+#         COMPARE_BIAS_DB         levels 3-4: the MEME database whose TN5_/DNASE_ entries flag bias (default: the one
+#                                 ChromBPNet's per-fold QC used, chrombpnet's motifs.meme)
+#         COMPARE_BIAS_MODISCO    level 3: bias references' TF-MoDISco h5 files, comma-separated (e.g. a bias model's
+#                                 QC run), besides <COMPARISON_ROOT>/bias_control/*/
+#         COMPARE_PRODUCTION      level 5: 1 adds the production-hits units (default 0: they wait for cheri39)
 # Output: the level directories above; logs in <COMPARISON_ROOT>/logs/level<l>/<unit>.log (appended to);
 #   ${BOX_DIR}/compare_steps.tsv, one row per unit run: level, unit, exit, seconds, max RSS (kB, /usr/bin/time %M),
 #   started, note (the unit's RESULT line).
@@ -117,6 +124,9 @@ mkdir -p "${scratch}" "${COMPARISON_ROOT}/logs" || { echo "ERROR: cannot create 
 [[ -s "${record_file}" ]] || printf 'level\tunit\texit\tseconds\tmax_rss_kb\tstarted\tnote\n' >> "${record_file}"
 export OMP_NUM_THREADS="${threads}" MKL_NUM_THREADS="${threads}" OPENBLAS_NUM_THREADS="${threads}" \
        NUMBA_NUM_THREADS="${threads}" CUDA_VISIBLE_DEVICES=
+dbs=()
+[[ -n "${COMPARE_MOTIF_DB:-}" ]] && dbs+=( --motif-db "${COMPARE_MOTIF_DB}" )
+[[ -n "${COMPARE_BIAS_DB:-}" ]] && dbs+=( --bias-db "${COMPARE_BIAS_DB}" )
 
 log() { printf '[%s] %s\n' "$(date)" "$*"; }
 
@@ -222,19 +232,26 @@ level_2() {
 }
 
 level_3() {
-    local ds joint="${COMPARE_JOINT:-joint20}" bias=()
-    [[ -n "${COMPARE_BIAS_MODISCO:-}" ]] && bias=( --bias-modisco "${COMPARE_BIAS_MODISCO}" )
+    local ds joint="${COMPARE_JOINT:-joint20}" bias=() h5 refs=()
+    if [[ -n "${COMPARE_BIAS_MODISCO:-}" ]]; then
+        IFS=, read -r -a refs <<< "${COMPARE_BIAS_MODISCO}"
+        for h5 in "${refs[@]}"; do bias+=( --bias-modisco "${h5}" ); done
+    fi
     for ds in "${datasets[@]}"; do
         selected "${ds}" || continue
-        pool 3 "${ds}" compare_modisco.py --dataset "${ds}" --joint "${joint}" "${force[@]}"
+        pool 3 "${ds}" compare_modisco.py --dataset "${ds}" --part average --joint "${joint}" "${dbs[@]}" \
+            "${force[@]}"
+        pool 3 "${ds}.qc" compare_modisco.py --dataset "${ds}" --part qc --joint "${joint}" "${dbs[@]}" "${force[@]}"
     done
     wait
-    one 3 bias compare_modisco.py --bias --datasets "${list}" --joint "${joint}" "${bias[@]}" "${force[@]}"
+    one 3 bias compare_modisco.py --bias --datasets "${list}" --joint "${joint}" "${dbs[@]}" "${bias[@]}" \
+        "${force[@]}"
     one 3 summary compare_modisco.py --summarize --datasets "${list}" --joint "${joint}" "${force[@]}"
 }
 
 level_4() {
-    one 4 compendia compare_compendia.py --datasets "${list}" --joint "${COMPARE_JOINT:-joint20}" "${force[@]}"
+    one 4 compendia compare_compendia.py --datasets "${list}" --joint "${COMPARE_JOINT:-joint20}" "${dbs[@]}" \
+        "${force[@]}"
 }
 
 level_5() {
@@ -242,6 +259,9 @@ level_5() {
     for ds in "${datasets[@]}"; do
         selected "${ds}" || continue
         pool 5 "${ds}" compare_finemo.py --dataset "${ds}" --joint "${joint}" "${force[@]}"
+        if [[ "${COMPARE_PRODUCTION:-0}" == 1 ]]; then
+            pool 5 "${ds}.production" compare_finemo.py --dataset "${ds}" --production "${force[@]}"
+        fi
     done
     wait
     one 5 summary compare_finemo.py --summarize --datasets "${list}" --joint "${joint}" "${force[@]}"

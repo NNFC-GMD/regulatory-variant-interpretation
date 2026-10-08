@@ -177,3 +177,31 @@ def test_each_level_script_starts_on_its_own(script):
                        cwd="/", timeout=120)  # fmt: skip
     assert p.returncode == 0, p.stderr
     assert "usage:" in p.stdout
+
+
+def test_levels_2_to_5_dispatch_their_units_and_wait_without_inputs(perf, tmp_path):
+    data, env = perf
+    p = compare_sh(env, "2,3,4,5", "--datasets", str(data["list"]))
+    assert p.returncode == 3, p.stdout + p.stderr
+    units = [(r[0], r[1], r[2]) for r in records(env)]
+    ds = data["datasets"]
+    want = [("2", d, "3") for d in ds] + [("2", f"{ds[0]}.float16", "3"), ("2", "summary", "3")]
+    want += [("3", u, "3") for d in ds for u in (d, f"{d}.qc")] + [("3", "bias", "0"), ("3", "summary", "3")]
+    want += [("4", "compendia", "3")] + [("5", d, "3") for d in ds] + [("5", "summary", "3")]
+    assert sorted(units) == sorted(want)
+    notes = {(r[0], r[1]): r[6] for r in records(env)}
+    assert notes[("2", "ds_a")].startswith("waiting: ")
+    assert notes[("3", "bias")].startswith("no bias reference with TF-MoDISco: no bias control run")
+    assert notes[("4", "compendia")].startswith("waiting: not built yet: cbp10")
+    assert "1 unit(s) done, 17 waiting for inputs, 0 failed" in p.stdout
+
+
+def test_only_restricts_the_dataset_units(perf, tmp_path):
+    data, env = perf
+    p = compare_sh(env, "5", "--datasets", str(data["list"]), "--only", "ds_b")
+    assert p.returncode == 3, p.stdout + p.stderr
+    assert [(r[0], r[1]) for r in records(env)] == [("5", "ds_b"), ("5", "summary")]
+    env["COMPARE_PRODUCTION"] = "1"
+    p = compare_sh(env, "5", "--datasets", str(data["list"]), "--only", "ds_c")
+    assert sorted((r[0], r[1]) for r in records(env)[2:]) == [("5", "ds_c"), ("5", "ds_c.production"),
+                                                              ("5", "summary")]  # fmt: skip

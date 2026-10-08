@@ -15,7 +15,10 @@ This writes, in --out-dir:
                           normalised JSD, lower MSE/JSD); then per dataset,
                           the fold means
 
-    python workflows/cherimoya/summarize.py --root <make_jobs out-root> --out-dir <dir>
+    python workflows/cherimoya/summarize.py --root <make_jobs out-root> --out-dir <dir> [--datasets <list.txt>]
+
+--datasets keeps only the datasets of a list (one name per line; blank lines and # comments skipped), e.g. the
+datasets both models were interpreted on.
 """
 
 from __future__ import annotations
@@ -36,9 +39,17 @@ HIGHER_IS_BETTER = {"counts_pearson": True, "counts_spearman": True, "counts_mse
 MODELS = ("chrombpnet", "cherimoya")
 
 
-def read_rows(root: Path) -> list[dict]:
+def read_datasets(path: Path) -> list[str]:
+    """A dataset list: one name per line, blank lines and # comments skipped."""
+    names = [line.split("#", 1)[0].strip() for line in Path(path).read_text().splitlines()]
+    return [n for n in names if n]
+
+
+def read_rows(root: Path, datasets: list[str] | None = None) -> list[dict]:
     rows = []
     for path in sorted(root.glob("*/fold_*/compare.tsv")):
+        if datasets is not None and path.parent.parent.name not in datasets:
+            continue
         fit_time = path.with_name("fit.time")
         seconds, rss_kb = ("NA", "NA")
         if fit_time.exists():
@@ -115,12 +126,16 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", type=Path, required=True, help="make_jobs.py's --out-root")
     ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--datasets", type=Path, help="only the datasets of this list (one per line)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s", datefmt="%F %T")
 
-    rows = read_rows(args.root)
+    datasets = read_datasets(args.datasets) if args.datasets else None
+    rows = read_rows(args.root, datasets)
     if not rows:
-        logger.error("no compare.tsv under %s", args.root)
+        logger.error(
+            "no compare.tsv under %s%s", args.root, f" for the datasets of {args.datasets}" if datasets else ""
+        )
         return 1
     args.out_dir.mkdir(parents=True, exist_ok=True)
     write_tsv(args.out_dir / "comparison.tsv", rows)

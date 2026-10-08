@@ -7,7 +7,8 @@ then its K references. The backward runs over the sequence half only. The design
 analyses/attr_pilot/design/final_design.md; the section numbers below refer to it. CH/ is the installed cherimoya
 package and TM/ the installed tangermeme.
 
-This module holds the weights and the forward pass (§5, §6).
+This module holds the weights, the forward pass, the backward rules and the epilogue (§5-§9). Every function runs
+eagerly; compilation comes later.
 
 - check_versions() and load_model(). The model is loaded with the reference's own loader,
   ``Cherimoya.load(path, device="cpu", compile=False)`` (cherimoya_cli/commands/attribute.py:35-38). Its strict
@@ -28,11 +29,30 @@ This module holds the weights and the forward pass (§5, §6).
 - head_forward(). The counts head with the reference's ops on the reference's layout (§6.3). Control tracks are fed
   as zeros, as ControlWrapper does, and the group is sliced as LogCountWrapper does. The profile head is not
   implemented yet.
+- counts_cotangent() (§7.1). The cotangent of the attributed count at the final residual stream: autograd through
+  head_forward, the reference's own eager head ops, once per model.
+- The backward (§8), over the sequence half of each pair only. tangermeme's rule for a sequence row reads the
+  reference row's activations but never its cotangent (TM/_deep_lift_utils.py:128, 554-557), so the reference half
+  is never needed. Rows are laid out [x_0..x_{S-1}, r_00..r_{S-1,K-1}]; split_rows() views them as sequences
+  (S, 1, ...) and references (S, K, ...), and a sequence row broadcasts over its K pairs without being copied.
+  - gelu_rescale(): the rescale rule of tangermeme's _nonlinear for GELU(tanh) (TM/_deep_lift_utils.py:116-128).
+  - ln_rule(): the normalization rule that cherimoya's conv_norm_op takes from tangermeme
+    (CH/deep_lift_shap.py:137-150; TM/_deep_lift_utils.py:500-557).
+  - dw3_t(): the depthwise conv's transpose, which takes that rule's output back to the block input.
+  - bwd_block(): one CheriBlock, composed from the three; stem_rule(): the stem GELU; input_multipliers(): iconv's
+    input gradient, giving the multipliers at the one-hot input.
+- epilogue() (§9): per-pair convergence deltas, and hypothetical scores over the attribution window.
+  mean_over_references() averages the windows over each sequence's references on the CPU, bitwise as tangermeme does.
 
-One deliberate difference from the reference: the counts head casts the pooled stream to the count Linear's dtype,
-where CH/cherimoya.py:458 calls ``.float()``. Every supported model has fp32 parameters, so the two are the same
-operation. A float64 model on CPU (tests and the fp64 "truth" run only) gets a float64 head. With ``.float()`` the
-stock module cannot run a float64 forward at all: the float32 pooled stream meets the float64 Linear and raises.
+Two deliberate differences from the reference:
+- The counts head casts the pooled stream to the count Linear's dtype, where CH/cherimoya.py:458 calls ``.float()``.
+  Every supported model has fp32 parameters, so the two are the same operation. A float64 model on CPU (tests and the
+  fp64 "truth" run only) gets a float64 head. With ``.float()`` the stock module cannot run a float64 forward at all:
+  the float32 pooled stream meets the float64 Linear and raises. counts_cotangent() inherits the cast.
+- mean_over_references() writes each window into a zeroed full-length block before averaging, where design §9 averages
+  the (K, 4, W) window block alone. The CPU mean sums a column in an order that depends on where the column sits in
+  its block, and the window alone moves some columns. Measured: for K=20, L=2114, W=100 in float32, the window-only
+  mean differs from tangermeme's in 9 of 400 elements; the full-length block matches it bitwise.
 """
 
 from __future__ import annotations
@@ -59,6 +79,12 @@ OUTPUTS = ("counts", "profile")
 
 ICONV_KERNEL, ICONV_PADDING = 21, 10  # CH/cherimoya.py:245
 FCONV_KERNEL, FCONV_PADDING = 75, 37  # CH/cherimoya.py:254-255
+
+RESCALE_EPS = 1e-6
+"""The rescale rule uses the plain gradient where |z_x - z_r| < RESCALE_EPS, strictly (TM/_deep_lift_utils.py:122)."""
+
+DEFAULT_HEAD_ROWS = 128
+"""Rows of the head that counts_cotangent() differentiates: 2 x batch_size 64, the reference's full batch (§7.1)."""
 
 
 def check_versions(allow_drift: bool = False) -> dict[str, str]:
@@ -440,3 +466,181 @@ def model_forward(
     z0 = stem_forward(X1h, w.W0, w.b0)
     hL, saved = forward_save(z0, w.blocks, w.rs, w.eps, stats)
     return Forward(head_forward(hL, w, output=output, group=group), z0, hL, saved)
+
+
+def counts_cotangent(
+    w: CheriWeights, *, group: int | None = 0, length: int, rows: int = DEFAULT_HEAD_ROWS
+) -> torch.Tensor:
+    """The cotangent of the attributed count at the final residual stream, (L, C), shared by every row (§7.1).
+
+    It is autograd's gradient of ``y.sum()`` through head_forward(), which runs the reference's own head ops on the
+    reference's layout, at `rows` rows: by default 2 x batch_size, the reference's full batch. So the backward of the
+    count Linear is the reference's own mm over that many rows, with K = n_groups (1 for one group), and the mean's
+    backward divides by L - 2T exactly as the reference's does. The result is zero outside [T, L - T). Compute it once
+    per model and broadcast it over the pairs. It turns grad mode on for itself, so the engine can run under no_grad,
+    but not under torch.inference_mode().
+    """
+    if torch.is_inference_mode_enabled():
+        raise RuntimeError("counts_cotangent needs autograd, which torch.inference_mode() switches off")
+    if rows < 1:
+        raise ValueError(f"rows must be at least 1, got {rows}")
+    with torch.enable_grad():
+        hL = torch.zeros(rows, length, w.C, device=w.device, dtype=w.dtype, requires_grad=True)
+        y = head_forward(hL, w, output="counts", group=group)
+        (grad,) = torch.autograd.grad(y.sum(), hL)
+    return grad[0].contiguous()
+
+
+def split_rows(t: torch.Tensor, S: int, K: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """View rows [x_0..x_{S-1}, r_00..r_{S-1,K-1}] as sequences (S, 1, ...) and references (S, K, ...).
+
+    Both are views, so `t` must be contiguous along its rows. A sequence row broadcasts over its K pairs.
+    """
+    if t.shape[0] != S + S * K:
+        raise ValueError(f"expected S + S*K = {S + S * K} rows for S={S}, K={K}, got {t.shape[0]}")
+    return t[:S].unsqueeze(1), t[S:].view(S, K, *t.shape[1:])
+
+
+def gelu_rescale(G: torch.Tensor, z: torch.Tensor, S: int, K: int) -> torch.Tensor:
+    """DeepLIFT's rescale rule through GELU(tanh) on the sequence half: tangermeme's _nonlinear (§8.1).
+
+    G (S, K, ...) is each pair's cotangent at the GELU's output, and z (S + S*K, ...) the GELU's input over the joint
+    rows. The result, (S, K, ...), is the cotangent at the GELU's input (TM/_deep_lift_utils.py:116-128):
+    - G times the secant (gelu(z_x) - gelu(z_r)) / (z_x - z_r);
+    - where |z_x - z_r| < 1e-6, strictly, the plain gradient instead: what nn.GELU's autograd hands tangermeme as
+      grad_input, gelu_backward(G, z_x).
+    The GELU outputs are recomputed from z over all rows at once, as the forward computed them, so the secants use the
+    forward's own values.
+    """
+    zx, zr = split_rows(z, S, K)
+    gx, gr = split_rows(F.gelu(z, approximate="tanh"), S, K)
+    din = zx - zr
+    small = din.abs() < RESCALE_EPS
+    secant = (gx - gr) / din.masked_fill(small, 1.0)  # the masked entries are never used; this keeps them finite
+    gradient = torch.ops.aten.gelu_backward(G, zx.expand_as(G), approximate="tanh")
+    return torch.where(small, gradient, G * secant)
+
+
+def ln_rule(Gn: torch.Tensor, y: torch.Tensor, mu: torch.Tensor, v: torch.Tensor, S: int, K: int) -> torch.Tensor:
+    """The normalization rule of conv_norm_op on the sequence half (§8.1).
+
+    cherimoya's conv_norm_op applies tangermeme's _layer_normalization_helper (TM/_deep_lift_utils.py:500-557) to the
+    depthwise conv's output through _ConvNormView: the whole (L, C) plane of each row, D = L*C, eps 1e-3, no affine
+    weight (CH/deep_lift_shap.py:68-72, 137-150). The helper's gamma of 1.0 multiplies exactly and is left out.
+
+    Gn (S, K, L, C) is each pair's cotangent at the normalization's output. y (S + S*K, L, C) is its input over the
+    joint rows, and mu and v (S + S*K,) are the rule statistics of rule_stats(). Returns the cotangent at y,
+    (S, K, L, C). The expressions and their order are the helper's (:534-552).
+    """
+    L, C = y.shape[-2:]
+    D = L * C
+    yx, yr = split_rows(y, S, K)
+    mx, mr = (t[..., None, None] for t in split_rows(mu, S, K))
+    vx, vr = (t[..., None, None] for t in split_rows(v, S, K))
+    v_avg = (vx + vr) / 2
+    a_sum = (yx - mx) + (yr - mr)
+    ratio = (-(vx**2) * (vr**2)) / (2 * v_avg)
+    variance_term = ratio * a_sum / (2 * D)
+    term1 = v_avg * (Gn - Gn.mean(dim=(-2, -1), keepdim=True))
+    dot = (Gn * a_sum).sum(dim=(-2, -1), keepdim=True)
+    return term1 + variance_term * dot
+
+
+def dw3_t(G: torch.Tensor, cw: torch.Tensor, d: int) -> torch.Tensor:
+    """The transpose of dw3, i.e. the depthwise conv's input gradient, as a shift-add (§8.1).
+
+    G has shape (..., L, C). ``g[l] = cw[1] * G[l] + cw[0] * G[l + d] + cw[2] * G[l - d]``, with zeros outside
+    [0, L), in the term order of the Triton backward (CH/cheri.py:410-411).
+    """
+    L = G.shape[-2]
+    Gp = F.pad(G, (0, 0, d, d))
+    return Gp[..., d : d + L, :] * cw[1] + Gp[..., 2 * d : 2 * d + L, :] * cw[0] + Gp[..., :L, :] * cw[2]
+
+
+def bwd_block(G: torch.Tensor, saved: BlockSaved, block: BlockWeights, rs: float, S: int, K: int) -> torch.Tensor:
+    """One CheriBlock's DeepLIFT backward on the sequence half: G (S, K, L, C) at its output -> at its input (§8.1).
+
+    The block computes ``h + linear2(GELU(linear1(conv_norm(h)))) * rs`` (CH/cheri.py:1179-1181). Backwards: the
+    ordinary gradient through the scale and linear2, the rescale rule at the GELU, the ordinary gradient through
+    linear1, conv_norm_op's normalization rule pushed back through the depthwise conv, and the residual. G may be a
+    broadcast view, such as the counts cotangent expanded over the pairs.
+    """
+    Gu = gelu_rescale(torch.matmul(G * rs, block.W2), saved.u, S, K)
+    Gy = ln_rule(torch.matmul(Gu, block.W1), saved.y, saved.mu, saved.v, S, K)
+    return G + dw3_t(Gy, block.cw, block.d)
+
+
+def stem_rule(G: torch.Tensor, z0: torch.Tensor, S: int, K: int) -> torch.Tensor:
+    """The stem GELU's rescale rule on the sequence half: G (S, K, L, C) at h0 -> (S*K, C, L) at iconv's output (§8.2).
+
+    G is transposed back to the GELU's (C, L) layout (CH/cherimoya.py:444-445). z0 (S + S*K, C, L) is iconv's output
+    over the joint rows. The result is contiguous, ready for input_multipliers().
+    """
+    Gz = gelu_rescale(G.transpose(-1, -2), z0, S, K)
+    return Gz.reshape(S * K, *Gz.shape[-2:]).contiguous()
+
+
+def input_multipliers(Gz: torch.Tensor, X_refs: torch.Tensor, W0: torch.Tensor) -> torch.Tensor:
+    """iconv's input gradient: the multipliers m (S*K, 4, L) at the one-hot input (§8.2).
+
+    This is the call autograd's ConvolutionBackward0 makes for ``F.conv1d(X, W0, b0, padding=10)`` when only the input
+    needs a gradient: aten.convolution_backward with output mask (True, False, False). X_refs, the reference rows
+    (S*K, 4, L), is a real contiguous tensor of the input's shape; the input gradient does not read its values.
+    """
+    return torch.ops.aten.convolution_backward(
+        Gz, X_refs, W0, None, [1], [ICONV_PADDING], [1], False, [0], 1, [True, False, False]
+    )[0]
+
+
+def epilogue(
+    m: torch.Tensor,
+    X1h: torch.Tensor,
+    y_x: torch.Tensor,
+    y_r: torch.Tensor,
+    start: int,
+    end: int,
+    S: int,
+    K: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convergence deltas over the full length, and hypothetical scores over the window [start, end) (§9).
+
+    m (S*K, 4, L) holds the multipliers, X1h (S + S*K, 4, L) the joint one-hot rows, y_x (S,) and y_r (S, K) the
+    attributed outputs. Returns:
+    - hyp (S, K, 4, end - start), contiguous. For one-hot references (an N column of zeros included) it is bitwise
+      tangermeme's hypothetical_attributions (TM/deep_lift_shap.py:93-103) sliced to the window: both round once, to
+      fl(m_i - m_b) for reference base b.
+    - delta (S, K): |(y_x - y_r) - sum((x - r) * m)| on the raw multipliers, tangermeme's convergence delta
+      (TM/deep_lift_shap.py:739-742).
+    """
+    L = X1h.shape[-1]
+    if not 0 <= start < end <= L:
+        raise ValueError(f"the window [{start}, {end}) must be non-empty and inside [0, {L})")
+    x, r = split_rows(X1h, S, K)
+    m = m.view(S, K, *m.shape[1:])
+    delta = ((y_x[:, None] - y_r) - ((x - r) * m).sum(dim=(-2, -1))).abs()
+    mw, rw = m[..., start:end], r[..., start:end]
+    return (mw - (rw * mw).sum(dim=-2, keepdim=True)).contiguous(), delta
+
+
+def mean_over_references(hyp: torch.Tensor, start: int, length: int) -> torch.Tensor:
+    """Each sequence's mean over its K references, on the CPU, bitwise as tangermeme computes it (§9).
+
+    hyp (S, K, 4, W) holds the windows [start, start + W) of full-length hypothetical scores. Returns (S, 4, W).
+
+    tangermeme stacks a sequence's K full-length scores into a contiguous (K, 4, length) block and takes
+    ``.mean(dim=0)`` on the CPU (TM/deep_lift_shap.py:760-770). The CPU kernel's summation order for a column depends on
+    where the column sits in that block: its vectorized body and its remainder group the K terms differently. So each
+    window is written at its own positions into a zeroed (K, 4, length) block, averaged there, and sliced. Columns are
+    summed independently, so the zeros outside the window change nothing inside it.
+    """
+    if hyp.device.type != "cpu":
+        raise ValueError(f"the mean over references runs on the CPU, as tangermeme's does; got {hyp.device}")
+    S, K, A, W = hyp.shape
+    if not 0 <= start <= start + W <= length:
+        raise ValueError(f"the window [{start}, {start + W}) must lie inside [0, {length})")
+    out = hyp.new_empty(S, A, W)
+    block = hyp.new_zeros(K, A, length)
+    for s in range(S):
+        block[:, :, start : start + W] = hyp[s]
+        out[s] = block.mean(dim=0)[:, start : start + W]
+    return out

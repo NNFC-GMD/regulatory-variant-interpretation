@@ -57,6 +57,26 @@ the files while they are read), or pass --lock to take it here; a lock held else
 converted or up to date, 1 when refused or failed. Run it inside a box, never on the login node: it needs h5py and
 hdf5plugin (the cherimoya environment has both) and reads the npz files block by block, about 1-2 GB of RAM at the
 default block size and W = 1000.
+
+Two checks of a whole dataset, for downstream.sh: each writes a JSON report (--report; default
+<output_dir>/validation/check_dataset.json or check_average.json) and exits 0 only when everything passes.
+
+    --check-dataset <dataset> --root <root> [--against auto|chrombpnet|fasta] [--sample-rows 2000] [--seed 0]
+        Before 06.0. Every fold of the config is converted from its current attribution (its provenance matches the
+        sources and the outputs), the idx mask hashes to what every provenance recorded, and the masks and the beds
+        (byte for byte) are one across the folds. Then V1 of the downstream plan, on each fold: against ChromBPNet's
+        own 05.0 files of the same dataset and fold (the interpretation/ directory beside the evaluation/ one the
+        fold's compare.json names), joined by peak name, the ohe equals ChromBPNet's raw/seq[:, :, c0:c0 + W] (c0 =
+        L/2 - W/2, 557 at W = 1000) and so does the converted raw/seq, and the rows only ChromBPNet has are exactly
+        those whose L-bp raw/seq holds a column of zeros: every row of the first fold, --sample-rows rows of the
+        others. Or, for a dataset ChromBPNet did not interpret, against the genome: on --sample-rows rows of every
+        fold the L-bp window around the peak's centre is A, C, G and T only and its central W bases' one-hot is the
+        ohe, and every dropped row's window holds another letter. auto picks ChromBPNet's files when every fold has
+        them.
+    --check-average <dataset> --root <root> [--sample-rows 1000] [--seed 0] [--threads 5]
+        After 06.0 (V2). The averaged h5 has the keys, dtypes and shape (N, 4, W) of the first fold's bed, its raw/seq
+        is the first fold's ohe on every row, and on --sample-rows rows its shap and projected_shap equal bit for bit
+        the average recomputed from the npz files with 06.0's float16 arithmetic, in the config's fold order.
 """
 
 from __future__ import annotations
@@ -108,6 +128,11 @@ TAGGING_KEYS = ("full_model_precision", "full_model_optimizer", "full_model_pati
 LOCK_BUSY_EXIT = 4
 CODE_FILES = ("to_chrombpnet_scores.py", "attr_status.py", "make_jobs.py")
 OUTPUT_NAMES = ("h5", "bed", "provenance")
+CHECK_SAMPLE_ROWS = 2000
+"""--check-dataset: rows compared per fold (all of them for the first fold against ChromBPNet)."""
+AVERAGE_SAMPLE_ROWS = 1000
+"""--check-average: rows of 06.0's average recomputed from the npz files."""
+ACGT = b"ACGT"
 
 
 class Refused(Exception):
@@ -204,6 +229,19 @@ def record_path(files: dict) -> tuple[str, Path]:
     if stock is not None and (meta is None or stock > meta):
         return "stock", files["stock"]
     return "meta", files["meta"]
+
+
+def fold_sources(params: dict, attribute_json: Path) -> dict[str, Path]:
+    """{role: path} of every file a fold's conversion depends on: what its provenance's `sources` fingerprint."""
+    files = attr_status.fold_files(params)
+    return {
+        "attribute_json": Path(attribute_json),
+        "peaks": Path(params["loci"][0]),
+        "ohe": files["ohe"],
+        "attr": files["attr"],
+        "idx": files["idx"],
+        "record": record_path(files)[1],
+    }
 
 
 def stat_output(path: Path) -> dict:
@@ -520,14 +558,7 @@ def convert(
         raise Refused(f"{attribute_json} names {len(params['loci'])} peaks files; the bed needs exactly one")
     files = attr_status.fold_files(params)
     kind, record_file = record_path(files)
-    source_paths = {
-        "attribute_json": attribute_json,
-        "peaks": Path(params["loci"][0]),
-        "ohe": files["ohe"],
-        "attr": files["attr"],
-        "idx": files["idx"],
-        "record": record_file,
-    }
+    source_paths = fold_sources(params, attribute_json)
     sources = stat_sources(source_paths)
     if not force:
         reason = up_to_date(where, sources)
@@ -680,12 +711,492 @@ def take_lock(fold_dir: Path) -> int | None:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# a dataset: its converted folds (--check-dataset) and 06.0's average of them (--check-average)
+
+
+def dataset_folds(root: Path, dataset: str, config: Path | None = None) -> tuple[dict, list[dict]]:
+    """The dataset's Cherimoya config and its folds in the config's order, each with its attribute.json, parameters,
+    attribution files and converted files (resolve())."""
+    config = Path(config or Path(root) / "configs" / dataset / "config.yaml")
+    cfg = read_cheri_config(config)
+    if cfg["dataset_name"] != dataset:
+        raise Refused(f"{config} is for {cfg['dataset_name']}, not {dataset}")
+    folds = []
+    for k in cfg["folds"]:
+        attribute_json = Path(os.path.abspath(Path(root) / dataset / f"fold_{k}" / "attribute.json"))
+        try:
+            params = json.loads(attribute_json.read_text())
+        except (OSError, ValueError) as exc:
+            raise Refused(f"cannot read {attribute_json}: {exc}") from exc
+        folds.append({
+            "fold": k,
+            "attribute_json": attribute_json,
+            "params": params,
+            "files": attr_status.fold_files(params),
+            "where": resolve(params, attribute_json, config, None),
+        })  # fmt: skip
+    return cfg, folds
+
+
+def bed_fields(line: bytes) -> list[str]:
+    return line.rstrip(b"\r\n").decode("utf-8", "replace").split("\t")
+
+
+def sample_rows(n: int, size: int, seed: int) -> np.ndarray:
+    """`size` distinct rows of n (all of them if size >= n), sorted; the same for the same seed."""
+    if size >= n:
+        return np.arange(n)
+    return np.sort(np.random.default_rng(seed).choice(n, size=size, replace=False))
+
+
+def take_npz_rows(path: Path, rows: np.ndarray, block_rows: int = BLOCK_ROWS) -> np.ndarray:
+    """arr_0[rows] of an npz (rows sorted and distinct), read in one pass that stops after the last row wanted."""
+    with NpzRows(path) as reader:
+        out = np.empty((rows.size, *reader.row_shape), dtype=reader.dtype)
+        n, i = reader.shape[0], 0
+        if rows.size and rows[-1] >= n:
+            raise Refused(f"{path} has {n} rows; row {int(rows[-1])} was asked for")
+        for start in range(0, n, block_rows):
+            if i >= rows.size:
+                break
+            stop = min(n, start + block_rows)
+            block = reader.read(stop - start)
+            j = int(np.searchsorted(rows, stop))
+            out[i:j] = block[rows[i:j] - start]
+            i = j
+    return out
+
+
+def take_h5_rows(ds: h5py.Dataset, rows: np.ndarray) -> np.ndarray:
+    """ds[rows] for sorted, distinct rows: one read of whole chunk rows per chunk touched."""
+    out = np.empty((rows.size, *ds.shape[1:]), dtype=ds.dtype)
+    step = ds.chunks[0] if ds.chunks else CHUNK_ROWS
+    i = 0
+    while i < rows.size:
+        first = int(rows[i]) // step * step
+        stop = min(first + step, ds.shape[0])
+        j = int(np.searchsorted(rows, stop))
+        out[i:j] = ds[first:stop][rows[i:j] - first]
+        i = j
+    return out
+
+
+def zero_column_rows(raw: np.ndarray) -> np.ndarray:
+    """Which rows of a (B, 4, L) one-hot hold a column of zeros: a base other than A, C, G or T in ChromBPNet's
+    encoding, the windows Cherimoya drops."""
+    return (raw.astype(np.int16).sum(axis=1) == 0).any(axis=1)
+
+
+def check_conversions(folds: list[dict]) -> tuple[dict, dict | None]:
+    """Every fold converted from its current attribution (its provenance describes the current sources and outputs),
+    the idx mask recorded by every provenance, and one mask and one bed (byte for byte) across the folds.
+    Returns the report and the first fold's mask and bed lines (None when the folds disagree)."""
+    report: dict = {"folds": {}, "failures": []}
+    fail = report["failures"].append
+    first: dict | None = None
+    for f in folds:
+        k, where = f["fold"], f["where"]
+        entry: dict = {"provenance": str(where["provenance"])}
+        report["folds"][k] = entry
+        try:
+            prov = json.loads(where["provenance"].read_text())
+        except FileNotFoundError:
+            fail(f"fold {k}: not converted (no {where['provenance']})")
+            continue
+        except (OSError, ValueError) as exc:
+            fail(f"fold {k}: unreadable {where['provenance']}: {exc}")
+            continue
+        try:
+            reason = up_to_date(where, stat_sources(fold_sources(f["params"], f["attribute_json"])))
+        except Refused as exc:
+            reason = str(exc)
+        if reason is not None:
+            fail(f"fold {k}: the conversion is not current: {reason}")
+        idx = np.load(f["files"]["idx"], allow_pickle=False)
+        bed = where["bed"].read_bytes() if where["bed"].exists() else b""
+        entry.update(
+            n_rows=int(idx.size),
+            n_kept=int(idx.sum()),
+            idx_sha256=hashlib.sha256(idx.astype(np.uint8).tobytes()).hexdigest(),
+            bed_sha256=hashlib.sha256(bed).hexdigest(),
+        )
+        recorded = (prov.get("rows") or {}).get("idx_sha256")
+        if entry["idx_sha256"] != recorded:
+            fail(f"fold {k}: the idx mask hashes to {entry['idx_sha256'][:12]}, its provenance has {recorded}")
+        recorded = ((prov.get("outputs") or {}).get("bed") or {}).get("sha256")
+        if entry["bed_sha256"] != recorded:
+            fail(f"fold {k}: the bed hashes to {entry['bed_sha256'][:12]}, its provenance has {recorded}")
+        if first is None:
+            first = {"fold": k, "idx": idx, "bed": bed}
+            continue
+        if not np.array_equal(idx, first["idx"]):
+            fail(f"fold {k} keeps other rows than fold {first['fold']} ({int((idx != first['idx']).sum())} differ)")
+        if bed != first["bed"]:
+            fail(f"fold {k}'s bed differs from fold {first['fold']}'s (cmp)")
+    report["pass"] = not report["failures"]
+    if first is None or not report["pass"]:
+        return report, None
+    lines = first["bed"].split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    return report, {"idx": first["idx"], "bed_lines": [line + b"\n" for line in lines]}
+
+
+def chrombpnet_interpretation(fold_dir: Path, head: str) -> dict[str, Path]:
+    """ChromBPNet's 05.0 files for the same dataset and fold: the interpretation/ directory beside the evaluation/
+    directory the fold's compare.json (make_jobs.py) names."""
+    try:
+        compare = json.loads((Path(fold_dir) / "compare.json").read_text())
+        model_dir = Path(compare["chrombpnet_predictions"]).parent.parent
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise Refused(f"cannot find ChromBPNet's fold from {Path(fold_dir) / 'compare.json'}: {exc}") from exc
+    interpretation = model_dir / "interpretation"
+    return {
+        "h5": interpretation / f"interpretation.{head}_scores.h5",
+        "bed": interpretation / "interpretation.interpreted_regions.bed",
+    }
+
+
+def v1_fold(f: dict, rows: np.ndarray | None, kept_lines: list[bytes], block_rows: int) -> dict:
+    """V1 on one fold against ChromBPNet's own 05.0 output: joined by peak name, Cherimoya's ohe equals ChromBPNet's
+    raw/seq[:, :, c0:c0 + W] (c0 = L/2 - W/2, 557 at L = 2114 and W = 1000), and so does the converted raw/seq; the
+    rows only ChromBPNet has are exactly those whose L-bp raw/seq holds a column of zeros. `rows` are the converted
+    rows to compare (None: every row, and every ChromBPNet row is scanned for zero columns; else only the sampled rows
+    and the ChromBPNet-only rows are read)."""
+    params, where, files = f["params"], f["where"], f["files"]
+    width, length = int(params["attr_window"]), int(params["in_window"])
+    c0 = length // 2 - width // 2
+    cbp = chrombpnet_interpretation(where["fold_dir"], where["head"])
+    out: dict = {"chrombpnet": {k: str(v) for k, v in cbp.items()}, "window_columns": [c0, c0 + width]}
+    failures: list[str] = []
+    out["failures"] = failures
+    missing = [str(p) for p in cbp.values() if not p.is_file()]
+    if missing:
+        failures.append(f"no {', '.join(missing)}")
+        out["pass"] = False
+        return out
+
+    cbp_lines = read_peak_lines(cbp["bed"])
+    cbp_fields = [bed_fields(line) for line in cbp_lines]
+    names = [peak_name(line) for line in cbp_lines]
+    row_of = {name: r for r, name in enumerate(names)}
+    if len(row_of) != len(names):
+        failures.append(f"{cbp['bed']}: {len(names) - len(row_of)} repeated peak names; the join needs unique names")
+    joined = np.full(len(kept_lines), -1, dtype=np.int64)
+    coordinate_mismatches = 0
+    for j, line in enumerate(kept_lines):
+        mine = bed_fields(line)
+        r = row_of.get(peak_name(line), -1)
+        joined[j] = r
+        if r >= 0 and (mine[:3] + mine[9:10]) != (cbp_fields[r][:3] + cbp_fields[r][9:10]):
+            coordinate_mismatches += 1
+    only_cbp = np.setdiff1d(np.arange(len(cbp_lines)), joined[joined >= 0])
+    out.update(
+        cbp_rows=len(cbp_lines),
+        joined=int((joined >= 0).sum()),
+        unjoined=int((joined < 0).sum()),
+        join_order_kept=bool(np.all(np.diff(joined) > 0)),
+        coordinate_mismatches=coordinate_mismatches,
+        cbp_only_rows=int(only_cbp.size),
+    )
+    if out["unjoined"]:
+        failures.append(f"{out['unjoined']} converted rows have no peak of that name in {cbp['bed']}")
+    if coordinate_mismatches:
+        failures.append(f"{coordinate_mismatches} joined rows differ in chrom, start, end or summit")
+    if not out["join_order_kept"]:
+        failures.append("joined by name, the converted rows are not in ChromBPNet's row order")
+    if failures:
+        out["pass"] = False
+        return out
+
+    with h5py.File(cbp["h5"], "r") as cbp_h5, h5py.File(where["h5"], "r") as conv_h5:
+        cbp_raw, conv_raw = cbp_h5["raw/seq"], conv_h5["raw/seq"]
+        if cbp_raw.shape != (len(cbp_lines), 4, length):
+            failures.append(f"ChromBPNet's raw/seq is {cbp_raw.shape}, not {(len(cbp_lines), 4, length)}")
+            out["pass"] = False
+            return out
+        mismatch = conv_mismatch = 0
+        if rows is None:
+            # every row: the ohe in memory, ChromBPNet's raw and the converted raw streamed
+            with np.load(files["ohe"], allow_pickle=False) as z:
+                ohe = z["arr_0"]
+            zero = np.zeros(len(cbp_lines), dtype=bool)
+            for b0 in range(0, len(cbp_lines), block_rows):
+                b1 = min(len(cbp_lines), b0 + block_rows)
+                block = cbp_raw[b0:b1]
+                zero[b0:b1] = zero_column_rows(block)
+                j0, j1 = np.searchsorted(joined, b0), np.searchsorted(joined, b1)  # joined is increasing (above)
+                theirs = block[joined[j0:j1] - b0, :, c0 : c0 + width]
+                mismatch += int((theirs != ohe[j0:j1]).any(axis=(1, 2)).sum())
+            for b0 in range(0, len(kept_lines), block_rows):
+                b1 = min(len(kept_lines), b0 + block_rows)
+                conv_mismatch += int((conv_raw[b0:b1] != ohe[b0:b1]).any(axis=(1, 2)).sum())
+            compared = len(kept_lines)
+            zero_rows = np.flatnonzero(zero)
+            out["zero_column_rows_equal_cbp_only"] = bool(np.array_equal(zero_rows, only_cbp))
+            out["zero_column_rows"] = int(zero_rows.size)
+        else:
+            ohe = take_npz_rows(files["ohe"], rows, block_rows)
+            order = np.argsort(joined[rows])
+            theirs = np.empty_like(ohe)
+            theirs[order] = take_h5_rows(cbp_raw, joined[rows][order])[:, :, c0 : c0 + width]
+            mismatch = int((theirs != ohe).any(axis=(1, 2)).sum())
+            conv_mismatch = int((take_h5_rows(conv_raw, rows) != ohe).any(axis=(1, 2)).sum())
+            compared = int(rows.size)
+            sampled_zero = int(zero_column_rows(take_h5_rows(cbp_raw, np.sort(joined[rows]))).sum())
+            only_zero = zero_column_rows(take_h5_rows(cbp_raw, only_cbp)) if only_cbp.size else np.zeros(0, bool)
+            out["sampled_rows_with_zero_column"] = sampled_zero
+            out["cbp_only_rows_with_zero_column"] = int(only_zero.sum())
+            out["zero_column_rows_equal_cbp_only"] = sampled_zero == 0 and bool(only_zero.all())
+    out.update(rows_compared=compared, ohe_mismatch_rows=mismatch, converted_raw_mismatch_rows=conv_mismatch)
+    if mismatch:
+        failures.append(f"{mismatch} of {compared} rows: the ohe is not ChromBPNet's raw/seq[:, :, {c0}:{c0 + width}]")
+    if conv_mismatch:
+        failures.append(f"{conv_mismatch} of {compared} rows: the converted raw/seq is not the ohe")
+    if not out["zero_column_rows_equal_cbp_only"]:
+        failures.append("the rows only ChromBPNet has are not exactly those with a column of zeros in its raw/seq")
+    out["pass"] = not failures
+    return out
+
+
+def fasta_fold(f: dict, rows: np.ndarray, idx: np.ndarray, block_rows: int) -> dict:
+    """Against the genome alone: on the sampled converted rows, the L-bp window [mid - L/2, mid + L/2) (mid = start +
+    (end - start) // 2, tangermeme's centre), upper-cased, is all A, C, G and T, and the one-hot (ACGT, channels
+    first) of its central W bases is the ohe row; every dropped row's window holds another letter."""
+    import pyfaidx
+
+    params, files = f["params"], f["files"]
+    width, length = int(params["attr_window"]), int(params["in_window"])
+    c0 = length // 2 - width // 2
+    lines = read_peak_lines(Path(params["loci"][0]))
+    kept, dropped = np.flatnonzero(idx), np.flatnonzero(~idx)
+    lut = np.zeros((256, 4), dtype=np.int8)
+    for k, base in enumerate(ACGT):
+        lut[base, k] = 1
+    acgt = np.zeros(256, dtype=bool)
+    acgt[list(ACGT)] = True
+    fasta = pyfaidx.Fasta(str(params["sequences"]), as_raw=True, sequence_always_upper=False, rebuild=False)
+
+    def window(i: int) -> np.ndarray | None:
+        chrom, start, end = bed_fields(lines[i])[:3]
+        mid = int(start) + (int(end) - int(start)) // 2
+        w0 = mid - length // 2
+        if chrom not in fasta or w0 < 0 or w0 + length > len(fasta[chrom]):
+            return None
+        return np.frombuffer(fasta[chrom][w0 : w0 + length].upper().encode("ascii"), dtype=np.uint8)
+
+    ohe = take_npz_rows(files["ohe"], rows, block_rows)
+    out_of_bounds, not_acgt, mismatch, dropped_acgt = [], [], [], []
+    for t, j in enumerate(rows):
+        seq = window(int(kept[j]))
+        if seq is None:
+            out_of_bounds.append(int(kept[j]))
+        elif not acgt[seq].all():
+            not_acgt.append(int(kept[j]))
+        elif not np.array_equal(lut[seq[c0 : c0 + width]].T, ohe[t]):
+            mismatch.append(int(j))
+    for i in dropped:
+        seq = window(int(i))
+        if seq is not None and acgt[seq].all():
+            dropped_acgt.append(int(i))
+    fasta.close()
+    out = {
+        "fasta": str(params["sequences"]),
+        "window": f"[mid - {length // 2}, mid + {length // 2}), central [{c0}, {c0 + width})",
+        "rows_compared": int(rows.size),
+        "kept_out_of_bounds": out_of_bounds,
+        "kept_with_other_letters": not_acgt[:20],
+        "onehot_mismatch_rows": len(mismatch),
+        "onehot_mismatch_examples": mismatch[:10],
+        "dropped_rows": int(dropped.size),
+        "dropped_all_acgt": dropped_acgt[:20],
+    }
+    failures = []
+    if out_of_bounds:
+        failures.append(f"{len(out_of_bounds)} sampled windows run off their chromosome")
+    if not_acgt:
+        failures.append(f"{len(not_acgt)} sampled kept windows hold a letter other than A, C, G or T")
+    if mismatch:
+        failures.append(f"{len(mismatch)} of {rows.size} sampled rows: the ohe is not the window's one-hot")
+    if dropped_acgt:
+        failures.append(f"{len(dropped_acgt)} dropped rows have windows of A, C, G and T only")
+    out["failures"] = failures
+    out["pass"] = not failures
+    return out
+
+
+def check_dataset(
+    root: Path,
+    dataset: str,
+    *,
+    config: Path | None = None,
+    against: str = "auto",
+    n_sample: int = CHECK_SAMPLE_ROWS,
+    seed: int = 0,
+    block_rows: int = BLOCK_ROWS,
+) -> dict:
+    """--check-dataset: the folds agree with each other (check_conversions), then V1 against ChromBPNet (the first
+    fold on every row, the others on n_sample rows) or the genome check on n_sample rows of every fold."""
+    began = time.perf_counter()
+    cfg, folds = dataset_folds(root, dataset, config)
+    report: dict = {"mode": "check-dataset", "dataset": dataset, "config": cfg["config"], "folds": cfg["folds"]}
+    report["conversions"], first = check_conversions(folds)
+    if against == "auto":
+        cbp_files = [chrombpnet_interpretation(f["where"]["fold_dir"], f["where"]["head"]) for f in folds]
+        against = "chrombpnet" if all(p.is_file() for files in cbp_files for p in files.values()) else "fasta"
+    report["against"] = against
+    report["v1"] = {}
+    if first is not None:
+        n_kept = len(first["bed_lines"])
+        for i, f in enumerate(folds):
+            seed_k = seed + 1000 * i
+            if against == "chrombpnet":
+                rows = None if i == 0 else sample_rows(n_kept, n_sample, seed_k)
+                result = v1_fold(f, rows, first["bed_lines"], block_rows)
+            else:
+                result = fasta_fold(f, sample_rows(n_kept, n_sample, seed_k), first["idx"], block_rows)
+            result["rows"] = "all" if against == "chrombpnet" and i == 0 else f"{min(n_sample, n_kept)} sampled"
+            report["v1"][f["fold"]] = result
+            logger.info("%s fold %s: V1 against %s, %s rows: %s", dataset, f["fold"], against, result["rows"],
+                        "pass" if result["pass"] else "FAIL: " + "; ".join(result["failures"]))  # fmt: skip
+    report["pass"] = (
+        report["conversions"]["pass"] and bool(report["v1"]) and all(r["pass"] for r in report["v1"].values())
+    )
+    report["timings_s"] = {"total": time.perf_counter() - began}
+    report["rss_max_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    return report
+
+
+def average_path(cfg: dict, dataset: str, head: str) -> Path:
+    """06.0's output: <output_dir>/contrib_scores/<dataset>/<dataset>_average_shaps.<head>.h5 (config.sh's
+    averaged_dir)."""
+    return Path(cfg["output_dir"]) / "contrib_scores" / dataset / f"{dataset}_average_shaps.{head}.h5"
+
+
+def check_average(
+    root: Path,
+    dataset: str,
+    *,
+    config: Path | None = None,
+    n_sample: int = AVERAGE_SAMPLE_ROWS,
+    seed: int = 0,
+    threads: int = 5,
+    block_rows: int = BLOCK_ROWS,
+) -> dict:
+    """--check-average (V2): 06.0's averaged h5 has the keys, dtypes and shape (N, 4, W) of the first fold's bed, its
+    raw/seq is the first fold's ohe on every row, and on n_sample rows its shap and projected_shap equal, bit for bit,
+    the average recomputed from the attribution npz files with 06.0's arithmetic (average_contrib_scores.py): each
+    fold cast to float16 as the converter casts it, summed in float16 in place in the config's fold order, then
+    divided in place by the number of folds. float16 sums are not associative, so the order is part of the check."""
+    began = time.perf_counter()
+    cfg, folds = dataset_folds(root, dataset, config)
+    head = folds[0]["params"]["output"]
+    avg = average_path(cfg, dataset, head)
+    width = int(folds[0]["params"]["attr_window"])
+    n_bed = len(read_peak_lines(folds[0]["where"]["bed"]))
+    report: dict = {"mode": "check-average", "dataset": dataset, "config": cfg["config"], "average": str(avg),
+                    "folds": cfg["folds"], "bed_rows": n_bed}  # fmt: skip
+    failures: list[str] = []
+    report["failures"] = failures
+    if not avg.is_file():
+        failures.append(f"no {avg}")
+    else:
+        with h5py.File(avg, "r") as fh:
+            layout = {key: (str(fh[key]["seq"].dtype), list(fh[key]["seq"].shape)) for key in KEYS if key in fh}
+            report["layout"] = layout
+            for key in KEYS:
+                want = (str(np.dtype(DTYPES[key])), [n_bed, 4, width])
+                if layout.get(key) != want:
+                    failures.append(f"{key}/seq is {layout.get(key)}, not {want}")
+            if not failures:
+                raw, mismatch = fh["raw/seq"], 0
+                with NpzRows(folds[0]["files"]["ohe"]) as ohe_rows:
+                    for b0 in range(0, n_bed, block_rows):
+                        b1 = min(n_bed, b0 + block_rows)
+                        mismatch += int((raw[b0:b1] != ohe_rows.read(b1 - b0)).any(axis=(1, 2)).sum())
+                report["raw_mismatch_rows"] = mismatch
+                if mismatch:
+                    failures.append(f"raw/seq differs from fold {folds[0]['fold']}'s ohe on {mismatch} rows")
+                rows = sample_rows(n_bed, n_sample, seed)
+                got = {key: take_h5_rows(fh[key]["seq"], rows) for key in KEYS[1:]}
+    if not failures:
+
+        def recompute(f: dict) -> tuple[np.ndarray, np.ndarray]:
+            ohe = take_npz_rows(f["files"]["ohe"], rows, block_rows)
+            attr = take_npz_rows(f["files"]["attr"], rows, block_rows)
+            return attr.astype(np.float16), (ohe.astype(np.float32) * attr).astype(np.float16)
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+            parts = list(pool.map(recompute, folds))  # zlib and h5py release the GIL while they read
+        want: dict[str, np.ndarray] = {}
+        for shap, projected in parts:  # average_contrib_scores.py: copy the first fold, += the others, /= n
+            if not want:
+                want = {"shap": shap.copy(), "projected_shap": projected.copy()}
+            else:
+                want["shap"] += shap
+                want["projected_shap"] += projected
+        for key in want:
+            want[key] /= len(parts)
+            bad = int((want[key].view(np.uint16) != got[key].view(np.uint16)).any(axis=(1, 2)).sum())
+            report[f"{key}_rows_not_bitwise_equal"] = bad
+            if bad:
+                failures.append(f"{key}/seq: {bad} of {rows.size} sampled rows differ from the recomputed average")
+        report["rows_compared"] = int(rows.size)
+    report["pass"] = not failures
+    report["timings_s"] = {"total": time.perf_counter() - began}
+    report["rss_max_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    return report
+
+
+def write_report(path: Path, report: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, report)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # command line
+
+
+def run_check(args: argparse.Namespace) -> int:
+    """--check-dataset or --check-average: write the report, log the verdict; exit 0 when every check passes."""
+    dataset = args.check_dataset or args.check_average
+    name = "check_dataset" if args.check_dataset else "check_average"
+    try:
+        if args.check_dataset:
+            report = check_dataset(args.root, dataset, config=args.config, against=args.against,
+                                   n_sample=args.sample_rows or CHECK_SAMPLE_ROWS, seed=args.seed,
+                                   block_rows=args.block_rows)  # fmt: skip
+        else:
+            report = check_average(args.root, dataset, config=args.config,
+                                   n_sample=args.sample_rows or AVERAGE_SAMPLE_ROWS, seed=args.seed,
+                                   threads=args.threads, block_rows=args.block_rows)  # fmt: skip
+        cfg = read_cheri_config(Path(report["config"]))
+    except Refused as exc:
+        logger.error("%s: %s refused: %s", dataset, name, exc)
+        return 1
+    path = args.report or Path(cfg["output_dir"]) / "validation" / f"{name}.json"
+    write_report(path, report)
+    failures = report.get("failures") or []
+    if args.check_dataset:
+        failures = report["conversions"]["failures"] + [
+            f"fold {k}: {msg}" for k, r in report["v1"].items() for msg in r["failures"]
+        ]
+    for line in failures:
+        logger.error("%s: %s", dataset, line)
+    logger.info("%s: %s %s in %.1f s (max RSS %.2f GB); report %s", dataset, name,
+                "passed" if report["pass"] else "FAILED", report["timings_s"]["total"],
+                report["rss_max_bytes"] / 1e9, path)  # fmt: skip
+    return 0 if report["pass"] else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--attribute-json", type=Path, required=True, help="<root>/<dataset>/fold_<k>/attribute.json")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--attribute-json", type=Path, help="convert this fold: <root>/<dataset>/fold_<k>/attribute.json")
+    mode.add_argument("--check-dataset", metavar="DATASET", help="check the dataset's converted folds (with --root)")
+    mode.add_argument("--check-average", metavar="DATASET", help="V2: check 06.0's average of them (with --root)")
     where = ap.add_mutually_exclusive_group()
     where.add_argument("--config", type=Path, help="the Cherimoya config.yaml (default <root>/configs/<dataset>/)")
     where.add_argument("--out-dir", type=Path, help="the interpretation directory (default: from the config)")
@@ -693,12 +1204,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--force", action="store_true", help="convert even when the provenance says up to date")
     ap.add_argument("--lock", action="store_true", help="take the fold's .task.lock here (exit 4 when it is held)")
     ap.add_argument("--block-rows", type=int, default=BLOCK_ROWS, help=f"rows per block (default {BLOCK_ROWS})")
+    ap.add_argument("--root", type=Path, help="checks: make_jobs.py's --out-root, holding <dataset>/fold_<k>/")
+    ap.add_argument("--against", choices=("auto", "chrombpnet", "fasta"), default="auto",
+                    help="--check-dataset: V1 against ChromBPNet's 05.0 files or the genome (auto: ChromBPNet's when "
+                         "every fold has them)")  # fmt: skip
+    ap.add_argument("--sample-rows", type=int, help=f"checks: rows per fold (default {CHECK_SAMPLE_ROWS} for "
+                    f"--check-dataset, {AVERAGE_SAMPLE_ROWS} for --check-average)")  # fmt: skip
+    ap.add_argument("--seed", type=int, default=0, help="checks: seed of the row samples (default 0)")
+    ap.add_argument("--threads", type=int, default=5, help="--check-average: folds read at once (default 5)")
+    ap.add_argument(
+        "--report", type=Path, help="checks: the JSON report (default <output_dir>/validation/<check>.json)"
+    )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="[%(asctime)s] %(levelname)s %(message)s", datefmt="%F %T")  # fmt: skip
     if args.block_rows <= 0:
         ap.error("--block-rows must be positive")
+    if args.check_dataset or args.check_average:
+        if args.root is None or args.out_dir is not None:
+            ap.error("--check-dataset and --check-average take --root (and --config), not --out-dir")
+        return run_check(args)
 
     fold_dir = Path(os.path.abspath(args.attribute_json)).parent
     lock = None

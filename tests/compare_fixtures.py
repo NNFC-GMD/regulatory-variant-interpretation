@@ -130,3 +130,56 @@ def write_folds_dir(path: Path) -> Path:
         train = [c for c in chroms if c not in (test, valid)]
         (path / f"fold_{k}.json").write_text(json.dumps({"test": [test], "valid": [valid], "train": train}))
     return path
+
+
+def make_attribution_dataset(tmp_path: Path, ds: str = "ds_a", *, seed: int = 0, n_chroms: int = 3) -> dict:
+    """test_check_dataset.make_dataset (W = 12, 24 peaks, 2 dropped for an N) completed into what level 2 reads.
+
+    The peaks are spread over chr1 .. chr<n_chroms> (row i on chr<1 + i % n_chroms>), in the peaks file and in
+    ChromBPNet's beds, before the folds are converted. ChromBPNet's per-fold h5 gets shap/seq (float16, normal, sd
+    0.01) and projected_shap/seq; its average is 06.0's float16 mean; Cherimoya's is average_as_06_0 of the converted
+    folds, with downstream.sh's V2 marker. Returns make_dataset's dict plus cbp_shap {fold: (N, 4, L)}, cbp_average.
+    """
+    import shutil
+
+    import h5py
+    import to_chrombpnet_scores as tcs
+    from test_check_dataset import average_as_06_0, make_dataset
+
+    data = make_dataset(tmp_path, ds, convert=False, seed=seed)
+    rows = [line.split("\t") for line in data["peaks"].read_text().splitlines()]
+    for i, fields in enumerate(rows):
+        fields[0] = f"chr{1 + i % n_chroms}"
+    data["peaks"].write_text("".join("\t".join(fields) + "\n" for fields in rows))
+    rng = np.random.default_rng(1000 + seed)
+    cbp_shap = {}
+    raw = None
+    for k in FOLDS:
+        interp = data["chrombpnet"] / f"{ds}_all_fold_{k}" / "interpretation"
+        shutil.copy(data["peaks"], interp / "interpretation.interpreted_regions.bed")
+        with h5py.File(interp / "interpretation.counts_scores.h5", "a") as fh:
+            raw = fh["raw/seq"][()]
+            shap = rng.normal(0.0, 0.01, size=raw.shape).astype(np.float16)
+            chunks = (min(16, len(raw)), 4, raw.shape[2])
+            fh.create_dataset("shap/seq", data=shap, chunks=chunks)
+            fh.create_dataset("projected_shap/seq", data=(shap * raw).astype(np.float16), chunks=chunks)
+        cbp_shap[k] = shap
+        assert tcs.convert(data["folds"][k]["json"])[0] == "converted"
+    average_as_06_0(data)
+    (data["out"] / ".done").mkdir(parents=True, exist_ok=True)
+    (data["out"] / ".done" / "v2").write_text("2026-10-08T23:13:13+02:00\tok\n")
+    avg = None
+    for k in FOLDS:
+        if avg is None:
+            avg = cbp_shap[k].copy()
+        else:
+            avg += cbp_shap[k]
+    avg /= len(FOLDS)
+    out = data["chrombpnet"].parent / "contrib_scores" / ds / f"{ds}_average_shaps.counts.h5"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(out, "w") as fh:
+        fh.create_dataset("raw/seq", data=raw, compression="gzip")
+        fh.create_dataset("shap/seq", data=avg, compression="gzip")
+        fh.create_dataset("projected_shap/seq", data=(avg * raw).astype(np.float16), compression="gzip")
+    data.update(cbp_shap=cbp_shap, cbp_average=avg, cbp_average_path=out)
+    return data

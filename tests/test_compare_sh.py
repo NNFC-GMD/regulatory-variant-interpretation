@@ -166,3 +166,14 @@ def test_sigterm_stops_the_units_and_exits_143(perf, tmp_path):
     assert processes_of(env, "sleep 60") == []
     assert not (Path(env["COMPARISON_ROOT"]) / "performance" / ".done" / "performance.json").exists()
     assert not list(Path(f"/dev/shm/{os.environ.get('USER', 'x')}/box.{env['SLURM_JOB_ID']}").glob("compare.*"))
+
+
+@pytest.mark.parametrize("script", sorted(p.name for p in COMPARE.glob("compare_*.py")))
+def test_each_level_script_starts_on_its_own(script):
+    """Run as compare.sh runs it (a fresh interpreter, no test paths): its imports resolve from its own directory."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["PYTHONPATH"] = os.environ.get("PYTHONPATH", "")  # pytest's shim only, never the test directories
+    p = subprocess.run([sys.executable, str(COMPARE / script), "--help"], env=env, capture_output=True, text=True,
+                       cwd="/", timeout=120)  # fmt: skip
+    assert p.returncode == 0, p.stderr
+    assert "usage:" in p.stdout

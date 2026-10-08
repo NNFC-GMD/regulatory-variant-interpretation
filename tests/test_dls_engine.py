@@ -455,7 +455,9 @@ def test_oracle_returns_tangermemes_deltas_in_pair_order(pytestconfig):
     """The print sink returns (N, K) deltas: |(y_x - y_r) - sum((x - r) * m)|, per pair, in pair order.
 
     The deltas are recomputed per batch of 7 pairs, packed example-major as deep_lift_shap packs them
-    (tangermeme/deep_lift_shap.py:686-692, 739-742), with the same thread count.
+    (tangermeme/deep_lift_shap.py:686-692, 739-742). The recomputation uses the same rows, batch shapes, ops and
+    thread count, so equality must be bitwise. A tolerance would hide a pair-order error: an ulp of y is about the
+    size of the deltas themselves.
     """
     model = dls_tiny.tiny_model("A")
     X = dls_tiny.sequences("A")
@@ -487,7 +489,7 @@ def test_oracle_returns_tangermemes_deltas_in_pair_order(pytestconfig):
         f"recomputed per batch: max diff {float((result.deltas - expected).abs().max()):.3g} "
         f"(bitwise {'yes' if bitwise else 'no'})",
     )
-    assert _rel(result.deltas, expected) <= 1e-6
+    assert bitwise
 
     class Boom(torch.nn.Module):
         def forward(self, X):

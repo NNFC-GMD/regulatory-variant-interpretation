@@ -67,12 +67,18 @@ and the drivers of `oracle` and `ours`, which only start and watch one child pro
       same rows, and max |y_ours - y_T64| <= 1.2 x max |y_R1 - y_T64| on the truth peaks. fp32 mode keeps 5e-5.
     - E10, fp32 mode: E4's form against F_hh, per-pair raw q99 <= max(3 F_hh(0.99), 1e-4) and q50 <=
       max(2 F_hh(0.5), 1e-5).
-    The original bounds (2e-4; p99 <= 1e-5) are still computed and reported, in report.json's "revisions" and the
-    report's "Revised criteria" section, but do not gate.
+    E3's precision-policy check is gated as revised after round 3: median <= max(0.3 F_tf(0.5), 1.5 F_rr(0.5)),
+    instead of 0.3 F_tf(0.5) alone. On the raw multipliers F_rr(0.5) / F_tf(0.5) ran from 0.22 to 0.31 on five
+    checkpoints, so the fixed fraction could fail the stock command against its own rerun; ours / F_rr(0.5) was 1.10 to
+    1.13 on all five, and a run under another precision policy lands near F_tf, above both terms. E6 meets E3's limits,
+    so its policy row follows.
+    The original bounds (2e-4; p99 <= 1e-5; 0.3 F_tf(0.5)) are still computed and reported, in report.json's
+    "revisions" and "original_bounds" and the report's "Revised criteria" section, but do not gate.
   - Context, not gated: T1' vs T1, R1_8 vs R1, every run's distance to T64, every run's forward error against T64,
     every run's deltas, and with --probe-json the cuDNN classes probe P3 (dls_probe.py) found at the row counts these
     runs used. Also E3's precision-policy margins: T1 vs R1's median, and the stock rerun's (F_rr), as fractions of
-    0.3 F_tf(0.5). And E7(a)'s ratios d(ours, T64) / d(R, T64), computed whether or not E3 and E4 pass.
+    the policy bound and of the original 0.3 F_tf(0.5). And E7(a)'s ratios d(ours, T64) / d(R, T64), computed whether
+    or not E3 and E4 pass.
   - E10 also checks that each run it compares ran at its specified S, in raw() and in run(). An out-of-memory halving
     would otherwise compare a run with itself.
   - --plan names the runs and gates of a validation (PLANS). "full" (the default) is everything above, on the pilot
@@ -198,10 +204,15 @@ def plan_runs(plan: str) -> list[str]:
 
 
 # Acceptance constants (final_rest.json acceptance_criteria E1-E10; design §15.4), as revised after round 2 for E1 in
-# reference mode and E10 in fp32 mode (design/revisions.md). Nothing else is relaxed here.
+# reference mode and E10 in fp32 mode, and after round 3 for E3's precision-policy check (design/revisions.md).
+# Nothing else is relaxed here.
 MED_FACTOR, P99_FACTOR = 2.0, 3.0  # E3/E4/E6: median <= max(2 F(0.5), 1e-5), p99 <= max(3 F(0.99), 1e-4)
 MED_MIN, P99_MIN = 1e-5, 1e-4
-POLICY_FACTOR = 0.3  # E3: median <= 0.3 F_tf(0.5)
+# E3's precision-policy check (E6 meets E3's limits, so it has the same row). Revised: median <=
+# max(0.3 F_tf(0.5), 1.5 F_rr(0.5)). The original, median <= 0.3 F_tf(0.5), is reported only: F_rr(0.5) / F_tf(0.5)
+# reaches 0.31 on the validated checkpoints, so the fixed fraction of F_tf could sit inside the stock's own rerun noise.
+POLICY_FACTOR = 0.3  # x F_tf(0.5): the original bound, and the revised bound's first term
+POLICY_RR_FACTOR = 1.5  # x F_rr(0.5): the revised bound's second term
 PEARSON_MIN, HYP_REL_MAX = 0.9999, 1e-2  # E5 caps, per peak
 E1_MAX = {"reference": 2e-4, "fp32": 5e-5}  # max-abs on the counts output; reference mode's is the original, reported
 E1_FLOOR_FACTOR = 2.0  # revised E1, reference mode: max|y_ours - y_R1| <= 2 x max|y_R1' - y_R1|
@@ -296,28 +307,57 @@ def accuracy_limited(ours: dict, ref: dict, factor: float = ACCURACY_FACTOR) -> 
     return {stat: bool(ours[stat] <= factor * ref[stat]) for stat in ("q50", "max")}
 
 
-def e3_policy(floors: dict, e3_rows: list[dict]) -> dict:
-    """E3's precision-policy check, median <= 0.3 F_tf(0.5), per metric, with its margins.
+def policy_bound(f_tf_q50: float, f_rr_q50: float) -> dict:
+    """E3's precision-policy bound as revised after round 3: max(0.3 F_tf(0.5), 1.5 F_rr(0.5)), with both terms.
 
-    T1 vs R1's median and the stock rerun's, F_rr(0.5) (R1' vs R1), are each given as a fraction of the bound. A run
-    under the reference's precision policy differs from R1 by about what a rerun does; one under another policy lands
-    near F_tf. Read from the floors and E3's rows, which every report.json has.
+    A run under the reference's precision policy differs from R1 by about what the stock's own rerun does (ours / F_rr
+    was 1.10 to 1.13 on the raw multipliers of five checkpoints); one under another policy lands near F_tf, which stays
+    above both terms as long as F_rr(0.5) < F_tf(0.5) / 1.5.
+    """
+    tf, rr = POLICY_FACTOR * f_tf_q50, POLICY_RR_FACTOR * f_rr_q50
+    return {
+        "bound": max(tf, rr),
+        "tf_term": tf,
+        "rr_term": rr,
+        "binding": "1.5*F_rr(0.5)" if rr > tf else "0.3*F_tf(0.5)",
+    }
+
+
+def e3_policy(floors: dict, e3_rows: list[dict]) -> dict:
+    """E3's precision-policy check, per metric, with its margins against the gating bound and the original one.
+
+    The gating bound is the row's: max(0.3 F_tf(0.5), 1.5 F_rr(0.5)) as revised after round 3, or 0.3 F_tf(0.5) in a
+    report written before. T1 vs R1's median and the stock rerun's, F_rr(0.5) (R1' vs R1), are each given as a fraction
+    of it, and, where the floors have F_tf, of the original bound 0.3 F_tf(0.5) too. A run under the reference's
+    precision policy differs from R1 by about what a rerun does; one under another policy lands near F_tf. Read from
+    the floors and E3's rows, which every report.json has.
     """
     out = {}
-    f_rr = floors.get("F_rr")
+    f_rr, f_tf = floors.get("F_rr"), floors.get("F_tf")
     for row in e3_rows:
         if row["statistic"] != "q50 policy" or not row["bound"]:
             continue
-        metric, bound = row["metric"], row["bound"]
+        metric, bound, ours = row["metric"], row["bound"], row["measured"]
         rerun = f_rr[metric]["q50"] if f_rr else None
+        tf = f_tf[metric]["q50"] if f_tf and metric in f_tf else None
+        original = None if tf is None else POLICY_FACTOR * tf
+        revised = None if tf is None or rerun is None else policy_bound(tf, rerun)
         out[metric] = {
             "bound": bound,
             "rule": row["rule"],
-            "ours_q50": row["measured"],
-            "ours_ratio": row["measured"] / bound,
+            "ours_q50": ours,
+            "ours_ratio": ours / bound,
             "stock_rerun_q50": rerun,
             "stock_rerun_ratio": None if rerun is None else rerun / bound,
             "pass": row["pass"],
+            "F_tf_q50": tf,
+            "ours_over_F_rr": None if not rerun else ours / rerun,
+            "original_bound": original,
+            "ours_ratio_original": None if not original else ours / original,
+            "stock_rerun_ratio_original": None if not original or rerun is None else rerun / original,
+            "pass_original": None if not original else bool(ours <= original),
+            "rr_term": None if revised is None else revised["rr_term"],
+            "binding": None if revised is None else revised["binding"],
         }
     return out
 
@@ -1189,7 +1229,11 @@ def _public(comparison: dict) -> dict:
 
 
 def _floor_rows(gate: str, cmp: dict, floor: dict, floor_name: str, tf: dict | None) -> list[dict]:
-    """E3-style limits for one comparison: median, p99 and (with tf) the precision-policy check, on both metrics."""
+    """E3-style limits for one comparison: median, p99 and (with tf) the precision-policy check, on both metrics.
+
+    The policy row gates with the revised bound, max(0.3 F_tf(0.5), 1.5 floor(0.5)); its note names the binding term.
+    The original bound, 0.3 F_tf(0.5), is _policy_original_rows' (reported only).
+    """
     rows = []
     label = f"{cmp['a']} vs {cmp['b']}"
     for metric in ("raw", "hyp"):
@@ -1201,6 +1245,7 @@ def _floor_rows(gate: str, cmp: dict, floor: dict, floor_name: str, tf: dict | N
             _row(gate, label, metric, "q99", cmp[metric]["q99"], bounds["q99"], f"max(3*{floor_name}(0.99), 1e-4)")
         )
         if tf is not None:
+            policy = policy_bound(tf[metric]["q50"], floor[metric]["q50"])
             rows.append(
                 _row(
                     gate,
@@ -1208,11 +1253,29 @@ def _floor_rows(gate: str, cmp: dict, floor: dict, floor_name: str, tf: dict | N
                     metric,
                     "q50 policy",
                     cmp[metric]["q50"],
-                    POLICY_FACTOR * tf[metric]["q50"],
-                    "0.3*F_tf(0.5)",
+                    policy["bound"],
+                    f"max(0.3*F_tf(0.5), 1.5*{floor_name}(0.5))",
+                    note=f"binding: {policy['binding'].replace('F_rr', floor_name)}",
                 )
             )
     return rows
+
+
+def _policy_original_rows(gate: str, cmp: dict, tf: dict) -> list[dict]:
+    """The precision-policy check's original bound, median <= 0.3 F_tf(0.5): computed and reported, not gated."""
+    label = f"{cmp['a']} vs {cmp['b']}"
+    return [
+        _row(
+            f"{gate} original (reported only)",
+            label,
+            metric,
+            "q50 policy",
+            cmp[metric]["q50"],
+            POLICY_FACTOR * tf[metric]["q50"],
+            "0.3*F_tf(0.5); superseded by the revised policy check",
+        )
+        for metric in ("raw", "hyp")
+    ]
 
 
 def _finite(runs: Runs, name: str) -> int:
@@ -1477,14 +1540,42 @@ def cmd_gates(args: argparse.Namespace) -> int:
         cmp = runs.compare(ours, ref)
         gate_rows = _floor_rows(gate, cmp, floors[floor_name], floor_name, floors.get("F_tf") if with_policy else None)
         gates[gate] = gate_rows
+        if with_policy and "F_tf" in floors:
+            original_rows += _policy_original_rows(gate, cmp, floors["F_tf"])
         tb = tie_breaker(ours, ref)
         if tb is not None:
             e7[gate] = tb
-    gates["E6"] = (
-        _floor_rows("E6", runs.compare("T3", "T1"), floors["F_rr"], "F_rr", floors.get("F_tf"))
-        if need("T3", "T1") and "F_rr" in floors
-        else []
-    )
+    gates["E6"] = []
+    if need("T3", "T1") and "F_rr" in floors:  # E6 meets E3's limits, the policy check included
+        cmp = runs.compare("T3", "T1")
+        gates["E6"] = _floor_rows("E6", cmp, floors["F_rr"], "F_rr", floors.get("F_tf"))
+        if "F_tf" in floors:
+            original_rows += _policy_original_rows("E6", cmp, floors["F_tf"])
+    # E3's precision-policy check as revised after round 3 (design/revisions.md), with its original bound.
+    policy_checks = {}
+    for gate in ("E3", "E6"):
+        originals = {r["metric"]: r for r in original_rows if r["gate"] == f"{gate} original (reported only)"}
+        for row in gates.get(gate, []):
+            if row["statistic"] == "q50 policy" and row["metric"] in originals:
+                policy_checks.setdefault(gate, {})[row["metric"]] = {
+                    "comparison": row["comparison"],
+                    "measured": row["measured"],
+                    "original_bound": originals[row["metric"]]["bound"],
+                    "original_pass": originals[row["metric"]]["pass"],
+                    "bound": row["bound"],
+                    "binding": row["note"].removeprefix("binding: "),
+                    "pass": row["pass"],
+                }
+    if policy_checks:
+        revisions["E3_policy"] = {
+            "original": {"rule": "median <= 0.3 F_tf(0.5)"},
+            "revised": {
+                "rule": "median <= max(0.3 F_tf(0.5), 1.5 F_rr(0.5)); E6 meets E3's limits, so it has the same check",
+                "F_tf_q50": {m: floors["F_tf"][m]["q50"] for m in ("raw", "hyp")},
+                "F_rr_q50": {m: floors["F_rr"][m]["q50"] for m in ("raw", "hyp")},
+            },
+            "checks": policy_checks,
+        }
 
     # E7: applied to a failing E3/E4 on the metrics that failed
     e7_rows = []
@@ -1852,9 +1943,10 @@ def _deviations(runs: Runs, report: dict) -> list[str]:
         "(attr_pilot/e9)."
     )
     out.append(
-        f"E1 in reference mode and E10 in fp32 mode are gated as revised after round 2 ({REVISIONS_DOC}): their "
-        "original fixed bounds sat below the stock reference's own rerun noise. The original bounds are still computed "
-        "and listed under 'Revised criteria'; they do not gate."
+        f"E1 in reference mode and E10 in fp32 mode are gated as revised after round 2, and E3's precision-policy check "
+        f"(E6's with it) as revised after round 3 ({REVISIONS_DOC}): their original fixed bounds sat below, or inside, "
+        "the stock reference's own rerun noise. The original bounds are still computed and listed under 'Revised "
+        "criteria'; they do not gate."
     )
     if (runs.root.parent / "superseded").exists():
         out.append(
@@ -1891,7 +1983,7 @@ def _open_issues(runs: Runs, summary: dict, report: dict) -> list[str]:
         )
         policy = report.get("E3_policy") or {}
         policy_note = (
-            " E3's policy margins (median / 0.3 F_tf(0.5)): "
+            " E3's policy margins (median / policy bound): "
             + "; ".join(
                 f"{m} ours {_ratio(v['ours_ratio'])}, stock rerun {_ratio(v['stock_rerun_ratio'])}"
                 for m, v in policy.items()
@@ -1972,16 +2064,16 @@ def _revisions_markdown(report: dict) -> list[str]:
     """The report's "Revised criteria" section: each revised criterion's original bound, reported only, and the
     revised bounds that gate, with the measured values."""
     rev = report.get("revisions") or {}
-    e1, e10 = rev.get("E1_reference"), rev.get("E10_fp32")
-    if not (e1 and e1.get("runs")) and not e10:
+    e1, e10, e3p = rev.get("E1_reference"), rev.get("E10_fp32"), rev.get("E3_policy")
+    if not (e1 and e1.get("runs")) and not e10 and not e3p:
         return []
     lines = [
         "",
         "## Revised criteria",
         "",
-        f"E1 in reference mode and E10 in fp32 mode gate with the revised bounds of `{rev.get('document')}`, in the "
-        "table above. Their original fixed bounds sat below the stock reference's own rerun noise. They are still "
-        "computed, here, and do not gate.",
+        f"E1 in reference mode, E10 in fp32 mode and E3's precision-policy check (E6's with it) gate with the revised "
+        f"bounds of `{rev.get('document')}`, in the table above. Their original fixed bounds sat below, or inside, the "
+        "stock reference's own rerun noise. They are still computed, here, and do not gate.",
         "",
         "| criterion | comparison | statistic | measured | original bound | passes original | revised bound | "
         "passes revised |",
@@ -2013,6 +2105,15 @@ def _revisions_markdown(report: dict) -> list[str]:
                 f"{original[1]} | max({factor} x F_hh({name}) {_fmt(hh.get(stat))}, "
                 f"{'1e-5' if stat == 'q50' else '1e-4'}) = {_fmt(check.get('bound'))} | {check.get('pass')} |"
             )
+    if e3p:
+        tf, rr = e3p["revised"]["F_tf_q50"], e3p["revised"]["F_rr_q50"]
+        for gate, checks in e3p["checks"].items():
+            for metric, v in checks.items():
+                lines.append(
+                    f"| {gate} policy | {v['comparison']}, {metric} | q50 | {_fmt(v['measured'])} | 0.3 x F_tf(0.5) "
+                    f"{_fmt(tf[metric])} = {_fmt(v['original_bound'])} | {v['original_pass']} | max(0.3 x F_tf(0.5), "
+                    f"1.5 x F_rr(0.5) {_fmt(rr[metric])}) = {_fmt(v['bound'])} ({v['binding']} binds) | {v['pass']} |"
+                )
     return lines
 
 
@@ -2036,17 +2137,21 @@ def _margins_markdown(report: dict) -> list[str]:
             "",
             "## E3 precision policy: margins",
             "",
-            "E3's policy check is median <= 0.3 F_tf(0.5). Ours is T1 vs R1; the stock rerun is R1' vs R1 (F_rr), "
-            "against the same bound.",
+            "E3's policy check, as revised after round 3, is median <= max(0.3 F_tf(0.5), 1.5 F_rr(0.5)). Ours is T1 "
+            "vs R1; the stock rerun is R1' vs R1 (F_rr), against the same bound. The original bound, 0.3 F_tf(0.5), is "
+            "reported only.",
             "",
-            "| metric | bound 0.3 F_tf(0.5) | T1 vs R1 median | ours / bound | R1' vs R1 median | stock rerun / bound | "
-            "pass |",
-            "|---|---|---|---|---|---|---|",
+            "| metric | rule | bound | binds | T1 vs R1 median | ours / bound | ours / F_rr(0.5) | R1' vs R1 median | "
+            "stock rerun / bound | original 0.3 F_tf(0.5) | ours / original | stock rerun / original | pass |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         for metric, v in policy.items():
             lines.append(
-                f"| {metric} | {_fmt(v['bound'])} | {_fmt(v['ours_q50'])} | {_ratio(v['ours_ratio'])} | "
-                f"{_fmt(v['stock_rerun_q50'])} | {_ratio(v['stock_rerun_ratio'])} | {v['pass']} |"
+                f"| {metric} | {v['rule']} | {_fmt(v['bound'])} | {v.get('binding') or '-'} | {_fmt(v['ours_q50'])} | "
+                f"{_ratio(v['ours_ratio'])} | {_ratio(v.get('ours_over_F_rr'))} | {_fmt(v['stock_rerun_q50'])} | "
+                f"{_ratio(v['stock_rerun_ratio'])} | {_fmt(v.get('original_bound'))} | "
+                f"{_ratio(v.get('ours_ratio_original'))} | {_ratio(v.get('stock_rerun_ratio_original'))} | "
+                f"{v['pass']} |"
             )
     e7 = report.get("E7_context") or {}
     if e7:
@@ -2313,6 +2418,12 @@ def _summary_markdown(entries: list[dict], reference: dict | None, notes: list[s
             ref = (reference or {}).get("E3_policy", {}).get(metric)
             if ref:
                 line += f" (reference: {_ratio(ref['ours_ratio'])} and {_ratio(ref['stock_rerun_ratio'])})"
+            original = [e["E3_policy"][metric].get("ours_ratio_original") for e in entries if metric in e["E3_policy"]]
+            if None not in original:
+                line += (
+                    f". Against the original bound 0.3 F_tf(0.5), reported only: ours {min(original):.3f} to "
+                    f"{max(original):.3f}"
+                )
             lines.append("")
             lines.append(line + ".")
 
@@ -2370,18 +2481,22 @@ def _summary_markdown(entries: list[dict], reference: dict | None, notes: list[s
         "",
         "## E3 precision policy: margins",
         "",
-        "The policy check is median <= 0.3 F_tf(0.5). Ours is T1 vs R1's median; the stock rerun's is F_rr(0.5), "
-        "R1' vs R1, against the same bound. A ratio above 1 fails the check.",
+        "The policy check, as revised after round 3, is median <= max(0.3 F_tf(0.5), 1.5 F_rr(0.5)) (each row's rule "
+        "is the one its report gated). Ours is T1 vs R1's median; the stock rerun's is F_rr(0.5), R1' vs R1, against "
+        "the same bound. A ratio above 1 fails the check. The original bound, 0.3 F_tf(0.5), is reported only.",
         "",
-        "| checkpoint | metric | bound 0.3 F_tf(0.5) | T1 vs R1 median | ours / bound | R1' vs R1 median | "
-        "stock rerun / bound | pass |",
-        "|---|---|---|---|---|---|---|---|",
+        "| checkpoint | metric | bound | binds | T1 vs R1 median | ours / bound | ours / F_rr(0.5) | R1' vs R1 median | "
+        "stock rerun / bound | original 0.3 F_tf(0.5) | ours / original | stock rerun / original | pass |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name, e in zip(names, cols):
         for metric, v in e["E3_policy"].items():
             lines.append(
-                f"| {name} | {metric} | {_fmt(v['bound'])} | {_fmt(v['ours_q50'])} | {_ratio(v['ours_ratio'])} | "
-                f"{_fmt(v['stock_rerun_q50'])} | {_ratio(v['stock_rerun_ratio'])} | {v['pass']} |"
+                f"| {name} | {metric} | {_fmt(v['bound'])} | {v.get('binding') or '-'} | {_fmt(v['ours_q50'])} | "
+                f"{_ratio(v['ours_ratio'])} | {_ratio(v.get('ours_over_F_rr'))} | {_fmt(v['stock_rerun_q50'])} | "
+                f"{_ratio(v['stock_rerun_ratio'])} | {_fmt(v.get('original_bound'))} | "
+                f"{_ratio(v.get('ours_ratio_original'))} | {_ratio(v.get('stock_rerun_ratio_original'))} | "
+                f"{v['pass']} |"
             )
 
     lines += [

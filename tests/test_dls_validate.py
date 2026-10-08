@@ -5,8 +5,9 @@ the pieces the verdicts rest on: the per-pair and per-peak rel-L2, the Pearson c
 E3/E4/E6/E10, E8's bounds and E7(a)'s tie-breaker. They also run `gates` end to end on a synthetic validation directory,
 with every run the report reads, and check that an engine with a real error fails while one at the floor passes. That
 includes E1 and E10 as revised after round 2 (design/revisions.md): E1 in reference mode within 2x the stock forward's
-rerun noise and 1.2x its distance to the fp64 truth, E10 in fp32 mode in E4's form against F_hh, with the original
-bounds reported but not gating.
+rerun noise and 1.2x its distance to the fp64 truth, E10 in fp32 mode in E4's form against F_hh; and E3's precision-
+policy check as revised after round 3, median <= max(0.3 F_tf(0.5), 1.5 F_rr(0.5)), which E6 shares. The original
+bounds are reported but do not gate.
 """
 
 from __future__ import annotations
@@ -60,6 +61,34 @@ def test_floor_relative_bounds_follow_the_acceptance_criteria():
     # E7(a): ours within 1.2 x the reference's distance to the truth at the median and the max
     assert dv.accuracy_limited({"q50": 1.2, "max": 2.0}, {"q50": 1.0, "max": 2.0}) == {"q50": True, "max": True}
     assert dv.accuracy_limited({"q50": 1.3, "max": 2.0}, {"q50": 1.0, "max": 2.0}) == {"q50": False, "max": True}
+    # E3's policy check as revised after round 3: median <= max(0.3 F_tf(0.5), 1.5 F_rr(0.5)), either term binding
+    b = dv.policy_bound(1e-3, 2.5e-4)
+    assert b["bound"] == pytest.approx(3.75e-4) and b["binding"] == "1.5*F_rr(0.5)"
+    assert b["tf_term"] == pytest.approx(3e-4) and b["rr_term"] == pytest.approx(3.75e-4)
+    b = dv.policy_bound(1e-3, 1e-4)
+    assert b["bound"] == pytest.approx(3e-4) and b["binding"] == "0.3*F_tf(0.5)"
+
+
+def test_the_policy_row_gates_with_the_revised_bound_and_reports_the_original():
+    """Between 0.3 F_tf(0.5) and 1.5 F_rr(0.5): the revised policy row passes, the original row fails, reported only."""
+    floor = {m: {"q50": 2.5e-4, "q99": 1e-3} for m in ("raw", "hyp")}
+    tf = {m: {"q50": 1e-3} for m in ("raw", "hyp")}
+    cmp = {"a": "T1", "b": "R1", **{m: {"q50": 3.3e-4, "q99": 1e-3} for m in ("raw", "hyp")}}
+    rows = dv._floor_rows("E3", cmp, floor, "F_rr", tf)
+    policy = [r for r in rows if r["statistic"] == "q50 policy"]
+    assert [r["metric"] for r in policy] == ["raw", "hyp"]
+    for r in policy:
+        assert r["bound"] == pytest.approx(3.75e-4) and r["pass"] is True and r["gate"] == "E3"
+        assert r["rule"] == "max(0.3*F_tf(0.5), 1.5*F_rr(0.5))" and r["note"] == "binding: 1.5*F_rr(0.5)"
+    originals = dv._policy_original_rows("E3", cmp, tf)
+    for r in originals:
+        assert r["gate"] == "E3 original (reported only)" and r["statistic"] == "q50 policy"
+        assert r["bound"] == pytest.approx(3e-4) and r["pass"] is False
+    # Above both terms the revised row fails too.
+    cmp_far = {"a": "T1", "b": "R1", **{m: {"q50": 4e-4, "q99": 1e-3} for m in ("raw", "hyp")}}
+    assert all(
+        r["pass"] is False for r in dv._floor_rows("E3", cmp_far, floor, "F_rr", tf) if r["statistic"] == "q50 policy"
+    )
 
 
 N, K, L, W, N_ALL = 16, 4, 60, 12, 40
@@ -89,10 +118,11 @@ def _synthetic(
     engine_noise: float,
     forward_noise: float = 1.0,
     runs: list[str] | None = None,
+    rerun_noise: float = 1e-4,
     model: str = "/data/amsc_x/fold_0/cherimoya.fold_0.torch",
     seed: int = 2,
 ) -> None:
-    """A validation directory: the truth, references at 1e-4 rerun noise, ours at `engine_noise` from R1.
+    """A validation directory: the truth, references at `rerun_noise` (1e-4) rerun noise, ours at `engine_noise` from R1.
 
     The counts outputs y carry 1e-6 relative noise per run, ours `forward_noise` times that. `runs` limits the runs
     written (default: every run of plan "full"); every engine run records the S of its spec in raw() and run().
@@ -145,7 +175,7 @@ def _synthetic(
     oracle_extra = {"gpu_memory_attribution": {"max_allocated_bytes": 5e9, "max_reserved_bytes": 6e9}, **gpu}
     oracle_extra["precision_flags"] = flags
     for name, spec in dv.ORACLE_RUNS.items():
-        scale = 1e-4 if spec["tf32"] else 1e-5
+        scale = rerun_noise if spec["tf32"] else 1e-5
         peaks = TRUTH if spec["peaks"] == "truth" else slice(None)
         arrays = noisy(scale, spec["tf32"], peaks)  # drawn whether or not it is written: every run sees the same noise
         if name in wanted:
@@ -218,7 +248,10 @@ def _check_revised_rows(report: dict) -> None:
         ("E1 original (reported only)", "T1 y vs R1 module y"),
         ("E1 original (reported only)", "T3 y vs R1 module y"),
         ("E10 original (reported only)", "T2_S8 vs T2 (fp32)"),
+        ("E3 original (reported only)", "T1 vs R1"),
+        ("E6 original (reported only)", "T3 vs T1"),
     }
+    _check_policy_rows(report, ("E3", "E6"))
     assert originals["E10 original (reported only)", "T2_S8 vs T2 (fp32)"]["bound"] == 1e-5
     for gate in ("E1", "E10"):
         assert not any("original" in r["gate"] for r in report["gates"][gate])
@@ -228,6 +261,31 @@ def _check_revised_rows(report: dict) -> None:
         "T3",
     }
     assert revisions["E10_fp32"]["original"]["bound"] == 1e-5
+
+
+def _check_policy_rows(report: dict, gates: tuple[str, ...]) -> None:
+    """E3's (and E6's) policy row gates with max(0.3 F_tf(0.5), 1.5 F_rr(0.5)); the original 0.3 F_tf(0.5) row is
+    reported only, under its own gate name, and the revision record has both."""
+    floors = report["floors"]
+    rec = report["revisions"]["E3_policy"]
+    assert set(rec["checks"]) == set(gates)
+    for gate in gates:
+        for metric in ("raw", "hyp"):
+            tf, rr = floors["F_tf"][metric]["q50"], floors["F_rr"][metric]["q50"]
+            row = next(r for r in report["gates"][gate] if r["metric"] == metric and r["statistic"] == "q50 policy")
+            assert row["bound"] == pytest.approx(max(0.3 * tf, 1.5 * rr))
+            assert row["rule"] == "max(0.3*F_tf(0.5), 1.5*F_rr(0.5))"
+            original = next(
+                r
+                for r in report["original_bounds"]
+                if r["gate"] == f"{gate} original (reported only)" and r["metric"] == metric
+            )
+            assert original["bound"] == pytest.approx(0.3 * tf) and original["measured"] == row["measured"]
+            check = rec["checks"][gate][metric]
+            assert check["bound"] == row["bound"] and check["pass"] is row["pass"]
+            assert check["original_bound"] == original["bound"] and check["original_pass"] is original["pass"]
+            assert check["binding"] == ("1.5*F_rr(0.5)" if 1.5 * rr > 0.3 * tf else "0.3*F_tf(0.5)")
+        assert not any("original" in r["gate"] for r in report["gates"][gate])
 
 
 def test_the_original_bounds_of_revised_criteria_do_not_gate(tmp_path):
@@ -342,12 +400,18 @@ def test_e3_policy_margins_and_e7_context(tmp_path):
     floors, policy = report["floors"], report["E3_policy"]
     assert set(policy) == {"raw", "hyp"}
     for metric, v in policy.items():
-        bound = 0.3 * floors["F_tf"][metric]["q50"]
+        tf, rr = floors["F_tf"][metric]["q50"], floors["F_rr"][metric]["q50"]
+        bound = max(0.3 * tf, 1.5 * rr)
         row = next(r for r in report["gates"]["E3"] if r["metric"] == metric and r["statistic"] == "q50 policy")
         assert v["bound"] == pytest.approx(bound) and v["ours_q50"] == row["measured"]
         assert v["ours_ratio"] == pytest.approx(row["measured"] / bound)
-        assert v["stock_rerun_ratio"] == pytest.approx(floors["F_rr"][metric]["q50"] / bound)
+        assert v["stock_rerun_ratio"] == pytest.approx(rr / bound)
         assert v["pass"] is (v["ours_ratio"] <= 1)
+        assert v["original_bound"] == pytest.approx(0.3 * tf) and v["F_tf_q50"] == tf
+        assert v["ours_ratio_original"] == pytest.approx(row["measured"] / (0.3 * tf))
+        assert v["stock_rerun_ratio_original"] == pytest.approx(rr / (0.3 * tf))
+        assert v["ours_over_F_rr"] == pytest.approx(row["measured"] / rr)
+        assert v["rr_term"] == pytest.approx(1.5 * rr) and v["pass_original"] is (v["ours_ratio_original"] <= 1)
     assert set(report["E7_context"]) == {"E3", "E4"}
     for gate, (ours, ref) in {"E3": ("T1", "R1"), "E4": ("T2", "R2")}.items():
         for metric in ("raw", "hyp"):
@@ -356,6 +420,22 @@ def test_e3_policy_margins_and_e7_context(tmp_path):
             assert v["ratio"]["q50"] == pytest.approx(d_ours["q50"] / d_ref["q50"])
             assert v["ratio"]["max"] == pytest.approx(d_ours["max"] / d_ref["max"])
             assert v["within"] is (max(v["ratio"].values()) <= 1.2)
+
+
+def test_e3_policy_passes_at_the_stock_rerun_noise_where_the_original_bound_failed(tmp_path):
+    """References whose rerun noise is a large share of F_tf (F_rr / F_tf about 0.4): an engine at about the rerun
+    noise fails the original 0.3 F_tf(0.5), as 3 of the 4 checkpoints did, and passes the revised bound, which the
+    1.5 F_rr(0.5) term sets. E3 passes directly, and the original rows stay out of the verdict."""
+    _synthetic(tmp_path, engine_noise=2.0, rerun_noise=3e-4, runs=CHECKPOINT_RUNS)
+    report = _gates(tmp_path, "--plan", "checkpoint")
+    _check_policy_rows(report, ("E3",))
+    for metric, v in report["E3_policy"].items():
+        assert v["binding"] == "1.5*F_rr(0.5)" and v["pass"] is True and v["pass_original"] is False, (metric, v)
+    assert report["summary"]["E3"] is True and report["all_gates_pass"] is True
+    md = (tmp_path / "report.md").read_text()
+    assert "| E3 policy | T1 vs R1, raw | q50 |" in md and "(1.5*F_rr(0.5) binds)" in md
+    tsv = (tmp_path / "report.tsv").read_text()
+    assert "E3 original (reported only)\tT1 vs R1\traw\tq50 policy" in tsv
 
 
 def test_e3_policy_reads_a_report_without_the_new_fields():
@@ -491,9 +571,12 @@ def test_summarize_puts_checkpoints_side_by_side(tmp_path):
     assert a["E3_policy"] == report_a["E3_policy"] and a["summary"] == report_a["summary"]
     raw = a["E3_policy"]["raw"]
     assert (
-        f"| amsc_a fold_0 | raw | {dv._fmt(raw['bound'])} | {dv._fmt(raw['ours_q50'])} | "
-        f"{raw['ours_ratio']:.3f} | {dv._fmt(raw['stock_rerun_q50'])} | {raw['stock_rerun_ratio']:.3f} |" in md
+        f"| amsc_a fold_0 | raw | {dv._fmt(raw['bound'])} | {raw['binding']} | {dv._fmt(raw['ours_q50'])} | "
+        f"{raw['ours_ratio']:.3f} | {raw['ours_over_F_rr']:.3f} | {dv._fmt(raw['stock_rerun_q50'])} | "
+        f"{raw['stock_rerun_ratio']:.3f} | {dv._fmt(raw['original_bound'])} | {raw['ours_ratio_original']:.3f} | "
+        f"{raw['stock_rerun_ratio_original']:.3f} | {raw['pass']} |" in md
     )
+    assert "Against the original bound 0.3 F_tf(0.5), reported only: ours" in md
     f_rr = report_a["floors"]["F_rr"]["raw"]
     assert f"| amsc_a fold_0 | F_rr | {dv._fmt(f_rr['q50'])} | {dv._fmt(f_rr['q99'])} | {dv._fmt(f_rr['max'])} |" in md
     verdicts = [line for line in md.splitlines() if line.startswith("| amsc_a fold_0 | PASS | PASS | PASS |")]

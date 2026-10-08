@@ -19,8 +19,9 @@ Subcommands, all run inside a box; only `run` needs a GPU:
   - ohe and idx: npz keys, dtypes, shapes, numpy.array_equal.
   - attr: dtype and shape; per-peak rel-L2 ||fast - stock|| / ||stock|| and Pearson over 4 x W, in float64;
     finiteness. E3 on the hyp metric: median <= max(2 F_rr(0.5), 1e-5), p99 <= max(3 F_rr(0.99), 1e-4), and the
-    precision-policy check median <= 0.3 F_tf(0.5), with F_rr and F_tf from --floors (report.json). E5: every peak's
-    Pearson >= 0.9999 and rel-L2 <= 1e-2, every value finite.
+    precision-policy check median <= max(0.3 F_tf(0.5), 1.5 F_rr(0.5)) as revised after round 3 (the original bound,
+    0.3 F_tf(0.5), is kept in E3_bounds, reported only), with F_rr and F_tf from --floors (report.json). E5: every
+    peak's Pearson >= 0.9999 and rel-L2 <= 1e-2, every value finite.
   - The stock run's printed warnings: deep_lift_shap warns once per batch whose convergence deltas exceed the
     threshold, printing that batch's deltas. The report counts the warnings and the printed deltas above the
     threshold (torch prints them with 4 significant digits), and reads E8's bounds against them as context.
@@ -428,11 +429,25 @@ def cmd_compare(args: argparse.Namespace) -> int:
     }
     f_rr, f_tf = floors["F_rr"]["hyp"], floors["F_tf"]["hyp"]
     bounds = dv.floor_bounds(f_rr)
-    policy = dv.POLICY_FACTOR * f_tf["q50"]
-    report["E3_bounds"] = {"from": {"F_rr.hyp": f_rr, "F_tf.hyp": f_tf}, **bounds, "policy": policy}
+    policy = dv.policy_bound(f_tf["q50"], f_rr["q50"])
+    report["E3_bounds"] = {
+        "from": {"F_rr.hyp": f_rr, "F_tf.hyp": f_tf},
+        **bounds,
+        "policy": policy["bound"],
+        "policy_binding": policy["binding"],
+        "policy_original": dv.POLICY_FACTOR * f_tf["q50"],
+    }
     rows.append(_row("E3 hyp median", hyp["q50"], bounds["q50"], hyp["q50"] <= bounds["q50"], "<= max(2 F_rr, 1e-5)"))
     rows.append(_row("E3 hyp p99", hyp["q99"], bounds["q99"], hyp["q99"] <= bounds["q99"], "<= max(3 F_rr, 1e-4)"))
-    rows.append(_row("E3 policy (hyp median)", hyp["q50"], policy, hyp["q50"] <= policy, "<= 0.3 F_tf(0.5)"))
+    rows.append(
+        _row(
+            "E3 policy (hyp median)",
+            hyp["q50"],
+            policy["bound"],
+            hyp["q50"] <= policy["bound"],
+            "<= max(0.3 F_tf(0.5), 1.5 F_rr(0.5))",
+        )
+    )
     rows.append(
         _row(
             "E5 Pearson (min over peaks)",

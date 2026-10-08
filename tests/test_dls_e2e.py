@@ -125,6 +125,9 @@ def test_compare_passes_outputs_at_the_floor(tmp_path):
     assert report["E3_bounds"]["q50"] == pytest.approx(1.4e-4) and report["E3_bounds"]["policy"] == pytest.approx(
         1.5e-4
     )
+    # E3's policy check as revised after round 3: max(0.3 F_tf(0.5), 1.5 F_rr(0.5)); here 0.3 F_tf binds
+    assert report["E3_bounds"]["policy_original"] == pytest.approx(1.5e-4)
+    assert report["E3_bounds"]["policy_binding"] == "0.3*F_tf(0.5)"
     text = (out / "e9_report.md").read_text()
     assert "Verdict: **PASS**" in text and "## Notes" in text and "30 peaks" in text
 

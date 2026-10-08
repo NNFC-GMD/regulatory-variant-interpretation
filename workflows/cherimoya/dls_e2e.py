@@ -38,6 +38,7 @@ Subcommands, all run inside a box; only `run` needs a GPU:
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import logging
 import os
@@ -46,6 +47,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -71,6 +73,8 @@ ENV_KEYS = (
 WARNING_TEXT = "RuntimeWarning: Convergence deltas too high"
 _TENSOR = re.compile(r"Convergence deltas too high: tensor\(\[(.*?)\]", re.S)
 _FLOAT = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?")
+_TQDM = re.compile(r"(?P<prefix>[^\r\n]*?)(?P<n>\d+)/(?P<total>\d+) \[(?P<stats>[^\]\r\n]*)\]")
+_TQDM_PCT = re.compile(r"\s*\d+%\|.*$")
 
 
 def _write_json(path: Path, obj) -> None:
@@ -123,63 +127,180 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 # run
 
 
-class GpuPoller(threading.Thread):
-    """Polls nvidia-smi for the GPU memory one process uses; keeps the maximum (MiB) and the number of samples."""
+def parse_compute_apps(rows: list[str]) -> list[tuple[str, int, int]]:
+    """(gpu_uuid, pid, MiB) from `nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory` CSV rows (noheader,
+    nounits); rows that do not parse, such as a memory of [N/A], are skipped."""
+    apps = []
+    for row in rows:
+        parts = [p.strip() for p in row.split(",")]
+        if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+            apps.append((parts[0], int(parts[1]), int(parts[2])))
+    return apps
 
-    def __init__(self, pid: int, interval: float) -> None:
+
+class GpuPoller(threading.Thread):
+    """Polls nvidia-smi for the GPU memory one process uses; keeps the maximum (MiB) and the number of samples.
+
+    With uuid (the UUID of the GPU the process runs on) it also keeps, for every other process on that GPU, the most
+    memory it used during the polling (others: pid -> MiB), and the GPU's utilization.gpu samples (util, percent:
+    the share of the sample period in which a kernel of any process was running).
+    """
+
+    def __init__(self, pid: int, interval: float, uuid: str | None = None) -> None:
         super().__init__(daemon=True)
-        self.pid, self.interval = pid, interval
+        self.pid, self.interval, self.uuid = pid, interval, uuid
         self.max_mib, self.samples, self.errors = 0, 0, 0
+        self.others: dict[int, int] = {}
+        self.util: list[int] = []
         self._halt = threading.Event()  # not _stop: threading.Thread has a method of that name
+
+    @staticmethod
+    def _smi(query: list[str]) -> list[str]:
+        return subprocess.run(
+            ["nvidia-smi", *query, "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        ).stdout.splitlines()
 
     def run(self) -> None:
         while not self._halt.wait(self.interval):
             try:
-                rows = subprocess.run(
-                    ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=60,
-                ).stdout.splitlines()
+                apps = parse_compute_apps(self._smi(["--query-compute-apps=gpu_uuid,pid,used_memory"]))
+                util = self._smi(["--query-gpu=utilization.gpu", "-i", self.uuid]) if self.uuid else []
             except (OSError, subprocess.SubprocessError):
                 self.errors += 1
                 continue
-            for row in rows:
-                parts = [p.strip() for p in row.split(",")]
-                if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) == self.pid and parts[1].isdigit():
-                    self.max_mib = max(self.max_mib, int(parts[1]))
+            for gpu, pid, mib in apps:
+                if pid == self.pid:
+                    self.max_mib = max(self.max_mib, mib)
                     self.samples += 1
+                elif self.uuid is not None and gpu == self.uuid:
+                    self.others[pid] = max(self.others.get(pid, 0), mib)
+            if util and util[0].strip().isdigit():
+                self.util.append(int(util[0].strip()))
 
     def stop(self) -> None:
         self._halt.set()
         self.join(timeout=120)
 
 
-def _run_one(side: str, command: list[str], log_path: Path, poll_s: float) -> dict:
-    """Run `command` in a fresh process with its output in log_path; wall time, exit status, max RSS, GPU MiB."""
+def _elapsed_s(stats: str) -> float | None:
+    """tqdm's elapsed time, the [MM:SS] or [H:MM:SS] before '<' in a bar's statistics, in seconds (1 s resolution)."""
+    head = stats.split("<", 1)[0].strip()
+    parts = head.split(":")
+    if not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return None
+    seconds = 0
+    for part in parts:
+        seconds = 60 * seconds + int(part)
+    return float(seconds)
+
+
+class OutputTee(threading.Thread):
+    """Copies a child's output pipe into its log, byte for byte, and dates every tqdm progress update in it.
+
+    tqdm redraws its bar in place: each update is '\\r' plus the bar, written and flushed at once, so it arrives in
+    one read of the pipe, and the clock at that read dates it. updates holds (t, desc, n, total, elapsed_s) for every
+    complete bar in arrival order; desc is the bar's description ('' for an unnamed bar such as deep_lift_shap's)
+    and elapsed_s tqdm's own elapsed field. feed() is the parser alone, for text that has already been read.
+    """
+
+    def __init__(self, pipe, log, clock: Callable[[], float] = time.perf_counter) -> None:
+        super().__init__(daemon=True)
+        self.pipe, self.log, self.clock = pipe, log, clock
+        self.updates: list[tuple[float, str, int, int, float | None]] = []
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._buffer = ""
+
+    def run(self) -> None:
+        fd = self.pipe.fileno()
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            t = self.clock()
+            self.log.write(chunk)
+            self.log.flush()
+            self.feed(self._decoder.decode(chunk), t)
+        self.feed(self._decoder.decode(b"", final=True), self.clock())
+
+    def feed(self, text: str, t: float) -> None:
+        self._buffer += text
+        end = 0
+        for match in _TQDM.finditer(self._buffer):
+            desc = _TQDM_PCT.sub("", match.group("prefix")).strip().rstrip(":").strip()
+            n, total = int(match.group("n")), int(match.group("total"))
+            self.updates.append((t, desc, n, total, _elapsed_s(match.group("stats"))))
+            end = match.end()
+        rest = self._buffer[end:]
+        cut = max(rest.rfind("\r"), rest.rfind("\n"))
+        self._buffer = rest[cut:] if cut >= 0 else rest  # a bar never spans a line break: keep the open line only
+
+
+def _run_one(
+    side: str,
+    command: list[str],
+    log_path: Path,
+    poll_s: float,
+    *,
+    env: dict[str, str] | None = None,
+    progress: bool = False,
+    uuid: str | None = None,
+) -> dict:
+    """Run `command` in a fresh process with its output in log_path; wall time, exit status, max RSS, GPU MiB.
+
+    env replaces the environment (default: this process's). progress=True reads the output through a pipe
+    (OutputTee) and records the tqdm updates, dated in seconds since the start, as `progress`. uuid also records the
+    other processes on that GPU and its utilization (GpuPoller). CPU times and context switches come from os.wait4:
+    the process and the children it waited for.
+    """
     logger.info("%s: %s", side, " ".join(command))
     record = {"command": command, "log": str(log_path), "started_et": _now_et()}
-    with open(log_path, "w") as log:
+    with open(log_path, "wb" if progress else "w") as log:
         began = time.perf_counter()
-        proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=str(HERE))
-        poller = GpuPoller(proc.pid, poll_s)
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE if progress else log,
+            stderr=subprocess.STDOUT,
+            cwd=str(HERE),
+            env=env,
+        )
+        tee = None
+        if progress:
+            tee = OutputTee(proc.stdout, log, clock=lambda: time.perf_counter() - began)
+            tee.start()
+        poller = GpuPoller(proc.pid, poll_s, uuid=uuid)
         poller.start()
         _, status, usage = os.wait4(proc.pid, 0)
         wall = time.perf_counter() - began
         proc.returncode = os.waitstatus_to_exitcode(status)
         poller.stop()
+        if tee is not None:
+            tee.join(timeout=120)  # the pipe closes when the last holder of its write end exits
+            if tee.is_alive():
+                logger.warning("%s: output still open 120 s after the process exited", side)
+            proc.stdout.close()
     record.update(
         finished_et=_now_et(),
         pid=proc.pid,
         returncode=proc.returncode,
         wall_s=wall,
         max_rss_bytes=usage.ru_maxrss * 1024,
+        cpu_user_s=usage.ru_utime,
+        cpu_system_s=usage.ru_stime,
+        voluntary_switches=usage.ru_nvcsw,
+        involuntary_switches=usage.ru_nivcsw,
         gpu_max_used_mib=poller.max_mib,
         gpu_samples=poller.samples,
         gpu_poll_errors=poller.errors,
         gpu_poll_s=poll_s,
     )
+    if uuid is not None:
+        record.update(gpu_others_max_mib={str(k): v for k, v in sorted(poller.others.items())}, gpu_util=poller.util)
+    if tee is not None:
+        record["progress"] = [list(u) for u in tee.updates]
     logger.info(
         "%s: exit %d after %.1f s; max RSS %.2f GB; GPU at most %d MiB (%d samples)",
         side,

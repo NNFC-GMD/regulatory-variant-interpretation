@@ -272,3 +272,16 @@ cherimoya`, into `.../evaluation/motif_qc_counts/`), at most `CHERI_QC_MAX`
 `cherimoya_qc.done.json` there names the current scores and their sources are
 unchanged; a fold attributed again has its QC directory moved aside and is
 redone. Rows go to `${BOX_DIR}/cheri_qc.tsv`; the header lists every knob.
+
+`bias_control.sh <chrombpnet config.yaml> <fold> <out_dir>` is the bias
+control: ChromBPNet attributes its bias-free model, Cherimoya has no bias
+model, so Tn5 patterns can appear only on Cherimoya's side. It attributes
+ChromBPNet's bias-included `models/chrombpnet.h5` of that fold on the fold's
+QC subsample with 05.0's `chrombpnet contribs_bw` (counts head, `--shap-seed
+1234`) on a GPU claimed as `full_chain.sh` claims one (a claim file under
+`/dev/shm/$USER/box.<job>/gpu_claims/`, JAX capped at 0.09 of the GPU), then
+runs `motif_qc.py` on the scores as 04.5 does (`--prefix chrombpnet`). The
+chrombpnet DeepSHAP has no rule for the logsumexp joining a bias-included
+model's two count heads and refuses that head before reading any peak; the
+script records the refusal in `<out_dir>/status.json`, skips MoDISco and exits
+3. `CHERI_BIAS_HEAD=profile` runs the profile head, which it accepts.

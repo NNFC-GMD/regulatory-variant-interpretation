@@ -13,8 +13,12 @@ statistics the levels leave out, and writes, under --out-dir (default <compariso
                     wilcoxon), over (datasets or folds), n, estimate (the median of the values, or of the paired
                     differences), ci95_lo and ci95_hi (percentile bootstrap, --n-boot resamples, --seed; datasets are
                     resampled, and for rows over folds whole datasets with their folds unless the note says
-                    otherwise), statistic and p (two-sided Wilcoxon signed-rank), higher and lower (how many
-                    datasets or folds the difference is above or below 0), note
+                    otherwise), statistic and p (two-sided Wilcoxon signed-rank), p_method (how scipy's 'auto'
+                    computed p: exact, the signed-rank distribution; permutation, every sign flip, for up to 13
+                    values with ties or zeros; normal, the normal approximation with tie and continuity corrections,
+                    for more than 50 values or ties or zeros among 14-50; the page marks these with a dagger),
+                    higher and lower (how many datasets or folds the difference is above or below 0; the test drops
+                    the differences of 0), note
   tables/*.tsv      the tables behind the numbers on the page (level<l>_*.tsv, bias_*.tsv, inputs.tsv, checks.tsv)
   figures/*.pdf/.png
                     the page's figures (Okabe-Ito blue for ChromBPNet and vermillion for Cherimoya in every panel;
@@ -47,7 +51,7 @@ finemo/<ds>/production/). A part that cannot be computed is shown on the page wi
 still written, and the script exits 1. Each run writes the page again; .done/report.json records what it read.
 
     python workflows/cherimoya/compare/report.py [--comparison-root <dir>] [--out-dir <dir>] [--cheri-root <dir>]
-        [--compendia-root <dir>] [--datasets <shared list>] [--pending-eta "Saturday 2026-10-10"]
+        [--compendia-root <dir>] [--datasets <shared list>] [--pending-eta "<sentence>"]
         [--repo <name>=<checkout> ...] [--n-boot 10000] [--seed 0] [--dpi 144]
 
 The roots default to the environment compare.sh exports (COMPARISON_ROOT, CHERI_ROOT, COMPENDIA_ROOT), else to the
@@ -203,6 +207,12 @@ def isnum(x) -> bool:
         return False
 
 
+def window_name(w: str, full: bool = True) -> str:
+    """A level-2 window by its width: 'w500' -> '500-bp window (summit ± 250 bp)' (full) or '500-bp window'."""
+    width = int(w[1:])
+    return f"{width:,}-bp window (summit ± {width // 2:,} bp)" if full else f"{width:,}-bp window"
+
+
 def png_size(data: bytes) -> tuple[int, int]:
     return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
 
@@ -231,11 +241,28 @@ def git_info(path: Path) -> dict:
 # statistics
 
 
+def p_method(diffs) -> str:
+    """How common.wilcoxon's scipy call (method 'auto') computes p for these paired differences: 'exact' (the
+    signed-rank distribution: at most 50 values, no ties, no zeros), 'permutation' (every sign flip: at most 13 values
+    with ties or
+    zeros) or 'normal' (the normal approximation with tie and continuity corrections: more than 50 values, or ties or
+    zeros among 14-50); '' when there is no test (no difference other than 0)."""
+    d = finite(diffs)
+    nz = d[d != 0]
+    if nz.size == 0:
+        return ""
+    if d.size > 50:
+        return "normal"
+    if nz.size == d.size and np.unique(np.abs(nz)).size == nz.size:
+        return "exact"
+    return "permutation" if d.size <= 13 else "normal"
+
+
 class Stats:
     """Every interval and test of the page: the rows of statistics.tsv."""
 
     COLUMNS = ("level", "family", "quantity", "test", "over", "n", "estimate", "ci95_lo", "ci95_hi", "statistic", "p",
-               "higher", "lower", "note")  # fmt: skip
+               "p_method", "higher", "lower", "note")  # fmt: skip
 
     def __init__(self, n_boot: int, seed: int) -> None:
         self.n_boot, self.seed = n_boot, seed
@@ -270,6 +297,7 @@ class Stats:
     def add(self, **row) -> dict:
         full = {c: row.get(c, NAN) for c in self.COLUMNS}
         full["note"] = row.get("note", "")
+        full["p_method"] = row.get("p_method", "")
         self.rows.append(full)
         return full
 
@@ -292,8 +320,8 @@ class Stats:
             est, lo, hi = self.ci(d)
         w, p, _ = common.wilcoxon(d)
         return self.add(level=level, family=family, quantity=quantity, test="wilcoxon", over=over, n=int(d.size),
-                        estimate=est, ci95_lo=lo, ci95_hi=hi, statistic=w, p=p, higher=int((d > 0).sum()),
-                        lower=int((d < 0).sum()), note=note)  # fmt: skip
+                        estimate=est, ci95_lo=lo, ci95_hi=hi, statistic=w, p=p, p_method=p_method(d),
+                        higher=int((d > 0).sum()), lower=int((d < 0).sum()), note=note)  # fmt: skip
 
     def find(self, level: str, family: str, quantity: str, over: str = "datasets") -> dict | None:
         for r in reversed(self.rows):
@@ -448,8 +476,9 @@ def level1(rep: Report) -> dict:
         rep.pending.append(
             {
                 "part": "Level 1",
-                "what": f"{len(missing)} of {expected or '?'} folds without both "
-                "models' comparison yet; the numbers below cover the folds there are",
+                "short": f"{len(missing)} level-1 folds",
+                "what": f"{len(missing)} of {expected or '?'} folds do not have both models' comparison yet; the "
+                "numbers below cover the folds there are",
                 "detail": missing,
             }
         )
@@ -486,6 +515,7 @@ def level1(rep: Report) -> dict:
                 ci95_hi=s["ci95_hi"],
                 statistic=s["wilcoxon_datasets_stat"],
                 p=s["wilcoxon_datasets_p"],
+                p_method=p_method(means),
                 higher=int((means > 0).sum()),
                 lower=int((means < 0).sum()),
                 note=f"{better} is better",
@@ -494,6 +524,7 @@ def level1(rep: Report) -> dict:
                                     over="folds", groups=[p["dataset"] for p in sub],
                                     note=f"{better} is better; the CI resamples datasets with their folds")  # fmt: skip
             s.update(set=key, fold_ci95_lo=fold["ci95_lo"], fold_ci95_hi=fold["ci95_hi"],
+                     wilcoxon_datasets_p_method=p_method(means), wilcoxon_folds_p_method=fold["p_method"],
                      chrombpnet_mean=float(np.mean([p[f"{m}_chrombpnet"] for p in sub])),
                      cherimoya_mean=float(np.mean([p[f"{m}_cherimoya"] for p in sub])))  # fmt: skip
             measures.append(s)
@@ -530,7 +561,7 @@ def level1(rep: Report) -> dict:
                 "rmse_chrombpnet_median": float(rm["chrombpnet"].median()),
                 "rmse_cherimoya_median": float(rm["cherimoya"].median()),
                 "rmse_diff_median": row["estimate"], "ci95_lo": row["ci95_lo"], "ci95_hi": row["ci95_hi"],
-                "wilcoxon_stat": row["statistic"], "wilcoxon_p": row["p"],
+                "wilcoxon_stat": row["statistic"], "wilcoxon_p": row["p"], "wilcoxon_p_method": row["p_method"],
                 "cherimoya_lower_rmse_datasets": int((diff < 0).sum()),
                 "mean_residual_chrombpnet_median": float(mr["chrombpnet"].median()),
                 "mean_residual_cherimoya_median": float(mr["cherimoya"].median()),
@@ -662,7 +693,8 @@ def level2(rep: Report) -> dict:
 
     d = rep.root / "attributions"
     if not (d / "summary.tsv").is_file():
-        rep.pending.append({"part": "Level 2", "what": "no summary yet (compare.sh 2 writes it)", "detail": []})
+        rep.pending.append({"part": "Level 2", "short": "level 2", "what": "Level 2 has not summarized any dataset yet",
+                            "detail": []})  # fmt: skip
         return {"state": "pending"}
     summary = read_tsv(rep.use("level2/summary", d / "summary.tsv"), dtype={"level": str})
     info = {}
@@ -672,8 +704,8 @@ def level2(rep: Report) -> dict:
             info[ds] = json.loads(rep.use(f"level2/{ds}/dataset", p).read_text())
     missing = [ds for ds in rep.shared if ds not in info]
     if missing:
-        rep.pending.append({"part": "Level 2", "what": f"{len(missing)} of {len(rep.shared)} datasets not compared "
-                            "yet", "detail": missing})  # fmt: skip
+        rep.pending.append({"part": "Level 2", "short": f"{len(missing)} level-2 datasets", "what": f"{len(missing)} "
+                            f"of {len(rep.shared)} datasets are not compared yet", "detail": missing})  # fmt: skip
     if not info:
         return {"state": "pending"}
     summary = summary[summary["dataset"].isin(list(info))].copy()
@@ -845,7 +877,7 @@ def plot_level2_agreement(rep: Report, q: dict, window: str) -> None:
             strip(ax, x, vals, COLOURS[kind])
             median_bar(ax, x, vals, rep)
         ax.set_xticks(range(len(CROSS_ORDER)), [f"{letter}\n{desc}" for _, letter, desc, _ in CROSS_ORDER])
-        ax.set_title(f"{METRIC_NAMES[metric]}, {window[1:]} bp around the summit")
+        ax.set_title(f"{METRIC_NAMES[metric]}, {window_name(window)}")
         ax.set_ylabel("mean over peaks" if metric == "jaccard_mean" else "median over peaks")
         ax.grid(axis="x", visible=False)
         ax.set_xlim(-0.6, len(CROSS_ORDER) - 0.35)
@@ -855,7 +887,7 @@ def plot_level2_agreement(rep: Report, q: dict, window: str) -> None:
     rep.figure(
         fig,
         "level2_agreement",
-        f"Four panels, one per agreement metric at {window[1:]} bp: per dataset, "
+        f"Four panels, one per agreement metric in the {window_name(window)}: per dataset, "
         "cross-model agreement on single folds (A), on fold averages (B), each model's leave-one-out ceiling "
         "(C) and cross-model agreement on held-out folds (D), with medians and confidence intervals.",
     )
@@ -868,7 +900,7 @@ def plot_level2_strata(rep: Report, ssum, window: str, metric: str = "pearson") 
              ("loo_chrombpnet", "C  ChromBPNet ceiling", "chrombpnet", "-", None),
              ("loo_cherimoya", "C  Cherimoya ceiling", "cherimoya", "-", None))  # fmt: skip
     fig, axes = plt.subplots(1, 2, figsize=(10.6, 4.1), sharey=True, squeeze=False)
-    titles = {"signal_decile": "signalValue decile", "gc_decile": "GC decile"}
+    titles = {"signal_decile": "peak-signal decile", "gc_decile": "GC decile"}
     for ax, (stratum, xlabel) in zip(
         axes[0],
         (
@@ -888,13 +920,13 @@ def plot_level2_strata(rep: Report, ssum, window: str, metric: str = "pearson") 
                     markerfacecolor=face or COLOURS[kind], label=label)  # fmt: skip
         ax.set_xticks(range(1, 11))
         ax.set_xlabel(xlabel)
-        ax.set_title(f"{METRIC_NAMES[metric]}, {window[1:]}-bp window, by {titles[stratum]}")
+        ax.set_title(f"{METRIC_NAMES[metric]}, {window_name(window, full=False)}, by {titles[stratum]}")
     axes[0][0].set_ylabel("median over datasets, 95% CI")
     handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=4, bbox_to_anchor=(0.5, 0.0))
     fig.tight_layout(rect=(0, 0.07, 1, 1))
-    rep.figure(fig, "level2_strata", "Two line charts of attribution agreement by signal decile and by GC decile, for "
-               "cross-model single folds, fold averages and both models' ceilings.")  # fmt: skip
+    rep.figure(fig, "level2_strata", "Two line charts of attribution agreement by peak-signal decile and by GC decile, "
+               "for cross-model single folds, fold averages and both models' ceilings.")  # fmt: skip
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -925,14 +957,15 @@ def level3(rep: Report) -> dict:
 
     d = rep.root / "modisco"
     if not (d / "summary.tsv").is_file() or not (d / "qc_pairs.tsv").is_file():
-        rep.pending.append({"part": "Level 3", "what": "no summary yet (compare.sh 3 writes it)", "detail": []})
+        rep.pending.append({"part": "Level 3", "short": "level 3", "what": "Level 3 has not summarized any dataset yet",
+                            "detail": []})  # fmt: skip
         return {"state": "pending"}
     summary = read_tsv(rep.use("level3/summary", d / "summary.tsv"))
     summary = summary[summary["dataset"].isin(rep.shared)].reset_index(drop=True)
     missing = [ds for ds in rep.shared if ds not in set(summary["dataset"])]
     if missing:
-        rep.pending.append({"part": "Level 3", "what": f"{len(missing)} of {len(rep.shared)} datasets not compared "
-                            "yet", "detail": missing})  # fmt: skip
+        rep.pending.append({"part": "Level 3", "short": f"{len(missing)} level-3 datasets", "what": f"{len(missing)} "
+                            f"of {len(rep.shared)} datasets are not compared yet", "detail": missing})  # fmt: skip
     if summary.empty:
         return {"state": "pending"}
     qc = read_tsv(rep.use("level3/qc_pairs", d / "qc_pairs.tsv"), dtype={"fold_a": str, "fold_b": str})
@@ -1097,7 +1130,7 @@ def plot_level3(rep: Report, per) -> None:
 
     for i, col in enumerate(("shared_cluster_count", "shared_tomtom_count")):
         paired_columns(ax1, i, col)
-    ax1.set_xticks([0, 1], ["same joint20\ncluster", "tomtom partner\n(q ≤ 0.05)"])
+    ax1.set_xticks([0, 1], ["same joint\ncluster", "tomtom partner\n(q ≤ 0.05)"])
     ax1.set_ylim(0, 1.04)
     ax1.set_ylabel("share of the model's patterns")
     ax1.set_title("Fold-average patterns\nmatched in the other model")
@@ -1209,26 +1242,42 @@ def bias_control(rep: Report, l3: dict | None) -> dict:
         kind = {}
     bc["reference_kind"] = [kind.get((r, p), "unknown") if mt else "no match"
                             for r, p, mt in zip(bc["reference"], bc["reference_match"], bc["matched"])]  # fmt: skip
-    own = {}
+    # each checked pattern's own level-3 flag, and whether bias-corrected ChromBPNet has a tomtom partner for it (fold
+    # averages: patterns.tsv's matched_tomtom; the control's QC fold: qc_patterns.tsv's matched_cross)
+    own, partner = {}, {}
     if l3 is not None:
         pt = l3["patterns"]
         pt = pt[pt["model"] == "cherimoya"]
         own.update({(ds, "fold average", p): f for ds, p, f in zip(pt["dataset"], pt["pattern"], pt["bias_flag"])})
+        partner.update({(ds, "fold average", p): bool(t) for ds, p, t in zip(pt["dataset"], pt["pattern"],
+                                                                             pt["matched_tomtom"])})  # fmt: skip
         qp = l3["qc_patterns"]
         qp = qp[qp["model"] == "cherimoya"]
         own.update({(ds, f"QC fold {k}", p): f for ds, k, p, f in zip(qp["dataset"], qp["fold"], qp["pattern"],
                                                                       qp["bias_flag"])})  # fmt: skip
-    bc["own_bias_flag"] = [own.get((ds, s, p)) for ds, s, p in zip(bc["dataset"], bc["scale"], bc["pattern"])]
+        if "matched_cross" in qp:
+            partner.update({(ds, f"QC fold {k}", p): bool(t) for ds, k, p, t in zip(
+                qp["dataset"], qp["fold"], qp["pattern"], as_bool(qp["matched_cross"]))})  # fmt: skip
+    keys = list(zip(bc["dataset"], bc["scale"], bc["pattern"]))
+    bc["own_bias_flag"] = [own.get(k) for k in keys]
+    bc["chrombpnet_tomtom_partner"] = [partner.get(k) for k in keys]
     rep.table("bias_control_patterns", bc)
     rep.table("bias_reference_patterns", ref)
+
+    def n_true(s) -> int:
+        return int(sum(bool(x) for x in s if x is not None))
+
     split = (bc.groupby("reference_kind").agg(patterns=("pattern", "size"), seqlets=("n_seqlets", "sum"),
-                                              db_flagged=("own_bias_flag", lambda s: int(sum(bool(x) for x in s
-                                                                                             if x is not None))))
+                                              db_flagged=("own_bias_flag", n_true),
+                                              chrombpnet_partner=("chrombpnet_tomtom_partner", n_true))
              .reset_index())  # fmt: skip
     rep.table("bias_control_split", split)
+    scales = {k: int(v) for k, v in bc["scale"].map(lambda x: "fold average" if x == "fold average" else "QC fold")
+              .value_counts().items()}  # fmt: skip
     if l3 is not None or not ref.empty:
         plot_bias(rep, l3, ref)
-    return {"state": "done", "controls": controls, "table": bc, "json": bj, "reference": ref, "split": split}
+    return {"state": "done", "controls": controls, "table": bc, "json": bj, "reference": ref, "split": split,
+            "scales": scales}  # fmt: skip
 
 
 def plot_bias(rep: Report, l3: dict | None, ref) -> None:
@@ -1267,6 +1316,7 @@ def plot_bias(rep: Report, l3: dict | None, ref) -> None:
         ax2.set_xlabel("Cherimoya patterns without a cluster partner that match it")
         ax2.set_title("Reference: the bias-included ChromBPNet's patterns (profile head)")
         ax2.grid(axis="y", visible=False)
+        ax2.set_axisbelow(True)
         ax2.set_xlim(0, max(1.0, float(r["cherimoya_patterns"].max())) * 1.15)
         from matplotlib.patches import Patch
 
@@ -1276,7 +1326,8 @@ def plot_bias(rep: Report, l3: dict | None, ref) -> None:
         ax2.set_visible(False)
     fig.tight_layout()
     rep.figure(fig, "bias_control", "Left: Tn5/DNase-flagged patterns per dataset for each model. Right: for each "
-               "pattern of the bias-included ChromBPNet, how many unmatched Cherimoya patterns match it, coloured by "
+               "pattern of the bias-included ChromBPNet, labelled with its MotifCompendium match or, for Tn5/DNase "
+               "patterns, its motifs.meme entry, how many unmatched Cherimoya patterns match it, coloured by "
                "whether the reference pattern is a Tn5/DNase pattern.")  # fmt: skip
 
 
@@ -1395,9 +1446,14 @@ def level4(rep: Report) -> dict:
         sup = json.loads(rep.use("level4/supplement", d / "supplement.json").read_text())
     else:
         built = (a.compendia_root / supplement / "compendium.json").is_file()
-        rep.pending.append({"part": "Level 4", "what": f"the {supplement} supplement (all of Cherimoya's datasets "
-                            "against the shared ones)", "detail": [f"compendia/{supplement} is built; level 4 has not "
-                            "run again yet" if built else f"compendia/{supplement} is not built yet"]})  # fmt: skip
+        n_all = len(rep.everything)
+        rep.pending.append({"part": "Level 4", "key": "supplement", "label": f"{n_all}-dataset supplement",
+                            "short": f"the {n_all}-dataset Cherimoya supplement (level 4)",
+                            "what": f"The supplement, Cherimoya's compendium of all {n_all} datasets set against its "
+                            f"compendium of the {len(rep.shared)} shared ones, is not in this report yet",
+                            "note": f"The {n_all}-dataset compendium is built, but level 4 has not compared it "
+                            "yet" if built else f"The {n_all}-dataset compendium is not built yet",
+                            "detail": []})  # fmt: skip
     sens_json = json.loads(rep.use("level4/sensitivity", d / "sensitivity.json").read_text()) \
         if (d / "sensitivity.json").is_file() else None  # fmt: skip
     plot_level4(rep, cdf, sdf)
@@ -1425,6 +1481,7 @@ def plot_level4(rep: Report, cdf, sdf) -> None:
     ax1.set_xlabel("clusters of the joint compendium")
     ax1.set_title("Joint compendium clusters by whose patterns they hold\n(solid: threshold 0.95; light: 0.90)")
     ax1.grid(axis="y", visible=False)
+    ax1.set_axisbelow(True)
     ax1.set_xlim(0, float(cdf["clusters"].max()) * 1.32)
     if not sdf.empty:
         for i, thr in enumerate(thresholds):
@@ -1473,8 +1530,8 @@ def level5(rep: Report, l4: dict | None) -> dict:
     summ = summ[summ["dataset"].isin(rep.shared)].reset_index(drop=True)
     missing = [ds for ds in rep.shared if ds not in set(summ["dataset"])]
     if missing:
-        rep.pending.append({"part": "Level 5", "what": f"{len(missing)} of {len(rep.shared)} datasets not compared "
-                            "yet", "detail": missing})  # fmt: skip
+        rep.pending.append({"part": "Level 5", "short": f"{len(missing)} level-5 datasets", "what": f"{len(missing)} "
+                            f"of {len(rep.shared)} datasets are not compared yet", "detail": missing})  # fmt: skip
     mot = read_tsv(rep.use("level5/motifs", d / "motifs.tsv"))
     mot = mot[mot["dataset"].isin(rep.shared)].copy()
     hits = {ds: json.loads(rep.use(f"level5/{ds}/hits", d / ds / "hits.json").read_text()) for ds in summ["dataset"]}
@@ -1630,10 +1687,15 @@ def level5(rep: Report, l4: dict | None) -> dict:
         for col in [c for c in prod.columns if c.startswith(("precision_", "recall_"))]:
             rep.stats.level("5", "Fi-NeMo production hits (cbp10 vs cheri39)", col, prod[col])
     if len(prod) < len(rep.shared):
-        rep.pending.append({"part": "Level 5", "what": "the production hits (ChromBPNet's on cbp10 against "
-                            "Cherimoya's on cheri39, through level 4's cluster matches)", "detail":
-                            [f"{len(prod)} of {len(rep.shared)} datasets compared; they need the cheri39 compendium, "
-                             "Cherimoya's Fi-NeMo on it and level 4's matches"]})  # fmt: skip
+        n_all = len(rep.everything)
+        rep.pending.append({"part": "Level 5", "key": "production", "label": "production hits",
+                            "short": "the production hits (level 5)",
+                            "what": f"The production hits, ChromBPNet's on its own {len(rep.shared)}-dataset "
+                            f"compendium against Cherimoya's on its {n_all}-dataset compendium, paired through level "
+                            "4's cluster matches, are not in this report yet",
+                            "note": f"{len(prod)} of {len(rep.shared)} datasets are compared; they need the "
+                            f"{n_all}-dataset compendium, Cherimoya's Fi-NeMo run on it and level 4's matches",
+                            "detail": []})  # fmt: skip
     plot_level5(rep, groups, top)
     return {"state": "done", "totals": tot, "groups": groups, "motifs": mot, "top": top, "reports": mrdf,
             "production": prod, "missing": missing}  # fmt: skip
@@ -1769,9 +1831,18 @@ def h(text) -> str:
 
 
 def num(x, d: int = 3, signed: bool = False) -> str:
+    """x to d decimals; a value that is not 0 but rounds to 0 gets one more decimal when that shows it, and a value
+    that still rounds to 0 is shown unsigned, so a CI end never reads −0.000."""
     if not isnum(x):
         return "NA"
-    s = f"{float(x):+.{d}f}" if signed else f"{float(x):.{d}f}"
+    v = float(x)
+    if v != 0 and round(v, d) == 0:
+        first = -int(np.floor(np.log10(abs(v))))
+        if first <= d + 1:
+            d = first
+    if round(v, d) == 0:
+        return f"{0:.{d}f}"  # no sign on a zero
+    s = f"{v:+.{d}f}" if signed else f"{v:.{d}f}"
     return s.replace("-", "−")
 
 
@@ -1781,14 +1852,19 @@ def ci(lo, hi, d: int = 3, signed: bool = False) -> str:
     return f"[{num(lo, d, signed)}, {num(hi, d, signed)}]"
 
 
-def pval(p) -> str:
+APPROX = '<span class="approx" title="normal approximation">†</span>'
+"""Marks a p-value from the normal approximation (p_method 'normal'); every other p on the page is exact."""
+
+
+def pval(p, method: str = "") -> str:
     if not isnum(p):
         return "NA"
     p = float(p)
+    mark = APPROX if method == "normal" else ""
     if p < 1e-3:
         mant, exp = f"{p:.1e}".split("e")
-        return f"{mant}×10<sup>{int(exp)}</sup>".replace("-", "−")
-    return f"{p:.2g}" if p < 0.1 else f"{p:.2f}"
+        return f"{mant}×10<sup>{int(exp)}</sup>".replace("-", "−") + mark
+    return (f"{p:.2g}" if p < 0.1 else f"{p:.2f}") + mark
 
 
 def count(n) -> str:
@@ -1811,14 +1887,31 @@ def diff_cell(r) -> str:
     return f'{num(r["median_dataset_diff"], 4, True)}<span class="sub">{ci(r["ci95_lo"], r["ci95_hi"], 4, True)}</span>'
 
 
-def test_cell(row: dict | None, d: int = 3, total: int | None = None) -> str:
-    """The median difference, its CI, how many were above 0, and p."""
-    if row is None:
-        return "NA"
+def sign_counts(row: dict) -> str:
+    """How many differences were above 0 ('7/10 above 0'), and below and at 0 when some were 0 (the test drops those):
+    '24 above, 3 below, 23 at 0'."""
     n = int(row["n"]) if isnum(row["n"]) else 0
     hi = int(row["higher"]) if isnum(row["higher"]) else 0
+    lo = int(row["lower"]) if isnum(row["lower"]) else 0
+    if hi + lo < n:
+        return f"{hi} above, {lo} below, {n - hi - lo} at 0"
+    return f"{hi}/{n} above 0"
+
+
+def ds_counts(row: dict) -> str:
+    """'10/10 datasets' (above 0), or sign_counts' form when some differences were 0."""
+    n = int(row["n"]) if isnum(row["n"]) else 0
+    hi = int(row["higher"]) if isnum(row["higher"]) else 0
+    lo = int(row["lower"]) if isnum(row["lower"]) else 0
+    return f"{hi}/{n} datasets" if hi + lo == n else sign_counts(row)
+
+
+def test_cell(row: dict | None, d: int = 3) -> str:
+    """The median difference, its CI, how many were above (below, at) 0, and p."""
+    if row is None:
+        return "NA"
     return (f'{num(row["estimate"], d, True)}<span class="sub">{ci(row["ci95_lo"], row["ci95_hi"], d, True)} · '
-            f'{hi}/{total or n} above 0 · p {pval(row["p"])}</span>')  # fmt: skip
+            f'{sign_counts(row)} · p {pval(row["p"], row.get("p_method", ""))}</span>')  # fmt: skip
 
 
 def key(model: str) -> str:
@@ -1851,12 +1944,15 @@ def figure_html(rep: Report, n: Numbering, name: str, caption: str, wide: bool =
             f'decoding="async"></div><figcaption><b>Figure {k}.</b> {caption}</figcaption></figure>')  # fmt: skip
 
 
-def table_html(n: Numbering, caption: str, header: list[str], rows: list[list[str]], left: int = 1,
+def table_html(n: Numbering, caption: str, header: list[str], rows: list[list[str]], left: int | set[int] = 1,
                cls: str = "") -> str:  # fmt: skip
+    """A numbered table; the first column heads the rows. left: how many leading columns are text (left-aligned), or
+    the set of their indexes."""
     k = n.table()
-    head = "".join(f'<th scope="col"{' class="l"' if i < left else ""}>{c}</th>' for i, c in enumerate(header))
+    is_left = (lambda i: i < left) if isinstance(left, int) else (lambda i: i in left)
+    head = "".join(f'<th scope="col"{' class="l"' if is_left(i) else ""}>{c}</th>' for i, c in enumerate(header))
     body = "".join("<tr>" + "".join((f'<th scope="row" class="l">{c}</th>' if i == 0 else
-                                     f'<td{" class=\"l\"" if i < left else ""}>{c}</td>') for i, c in enumerate(r))
+                                     f'<td{" class=\"l\"" if is_left(i) else ""}>{c}</td>') for i, c in enumerate(r))
                    + "</tr>" for r in rows)  # fmt: skip
     return (
         f'<div class="tblock"><p class="tcap"><b>Table {k}.</b> {caption}</p><div class="tbl {cls}">'
@@ -1868,15 +1964,24 @@ def note_html(state: str, label: str, body: str) -> str:
     return f'<div class="note"><span class="chip {state}">{h(label)}</span><div>{body}</div></div>'
 
 
+def pending_eta(rep: Report) -> str:
+    """--pending-eta as its own sentence (with a leading space), or ''."""
+    eta = (rep.args.pending_eta or "").strip()
+    if not eta:
+        return ""
+    return f" {h(eta if eta[-1] in '.!?' else eta + '.')}"
+
+
 def pending_html(rep: Report, part: str) -> str:
     out = []
-    eta = f" Expected {h(rep.args.pending_eta)}." if rep.args.pending_eta else ""
     for p in rep.pending:
         if p["part"] != part:
             continue
-        detail = p.get("detail") or []
-        more = f" ({h('; '.join(str(x) for x in detail[:6]))}{' …' if len(detail) > 6 else ''})" if detail else ""
-        out.append(note_html("pending", "Pending", f"<p><b>{h(p['what'])}</b>{more}.{eta}</p>"))
+        names = p.get("detail") or []
+        more = (f" Still missing: {h('; '.join(str(x) for x in names[:6]))}{' …' if len(names) > 6 else ''}."
+                if names else "")  # fmt: skip
+        note = f" {h(p['note'])}." if p.get("note") else ""
+        out.append(note_html("pending", "Pending", f"<p>{h(p['what'])}.{note}{more}{pending_eta(rep)}</p>"))
     return "".join(out)
 
 
@@ -1897,8 +2002,8 @@ CSS = """
 @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,\
 wght@0,400;0,500;0,600;1,400&family=Spectral:wght@500;600&display=swap");
 /* Layout: one reading column (max 74rem) under a masthead; the sections follow the plan's levels in order; figures
-   sit on light plates in both themes; every table scrolls inside its own frame. The two models' hues are the only
-   saturated colours on the page. */
+   sit on light plates in both themes; every table scrolls inside its own frame. The two models' hues are the page's
+   saturated colours, with the Tn5 orange of the bias control and the status chips' muted tints. */
 :root {
   --bg: #f5f6f7;
   --surface: #ffffff;
@@ -1960,6 +2065,7 @@ sup { font-size: 0.72em; line-height: 0; }
 .eyebrow { font-family: var(--font-mono); font-size: 0.74rem; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--muted); }
 .masthead { display: grid; gap: 14px; padding-bottom: 26px; border-bottom: 1px solid var(--rule); }
+.masthead > *, .head > *, figure > *, .findings li > * { min-width: 0; }
 .dek { font-size: var(--step-1); line-height: 1.5; color: var(--ink-2); max-width: 66ch; }
 .meta { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: var(--step--1); color: var(--muted); }
 .legend { display: flex; flex-wrap: wrap; gap: 6px 26px; font-size: var(--step--1); color: var(--ink-2); }
@@ -2018,9 +2124,8 @@ td .sub, th .sub { display: block; font-size: 0.74rem; color: var(--muted); font
 .tbl.compact td, .tbl.compact th { padding-block: 4px; }
 .note { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px 12px; align-items: baseline;
   padding: 12px 14px; background: var(--surface); border: 1px solid var(--rule); border-radius: 4px; }
-.note p { max-width: 80ch; }
-.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 24rem), 1fr)); gap: 20px 32px; }
-.cols > * { min-width: 0; }
+.note p { max-width: 80ch; overflow-wrap: anywhere; }
+.approx { margin-left: 1px; }
 details { border-top: 1px solid var(--rule-soft); padding-top: 10px; }
 details > * + * { margin-top: 12px; }
 summary { cursor: pointer; font-size: var(--step--1); font-weight: 500; color: var(--ink-2); }
@@ -2040,6 +2145,7 @@ dl.defs dd { margin: 0; min-width: 0; max-width: 80ch; }
   dl.defs { grid-template-columns: minmax(0, 1fr); }
   dl.defs dd { margin-bottom: 6px; }
   h1 { font-size: 1.85rem; }
+  .plate img.wide { min-width: 900px; }  /* phones: scroll the plate at a legible scale */
 }
 """
 
@@ -2068,9 +2174,9 @@ def masthead(rep: Report, R: dict, generated: str) -> str:
             miss = part.get("missing") or []
             chip(f"Level {i} · {len(rep.shared) - len(miss)}/{len(rep.shared)} datasets", "pending" if miss else "done")
     for p in rep.pending:
-        if p["part"] in ("Level 4", "Level 5") and ("supplement" in p["what"] or "production" in p["what"]):
-            chip(("cheri39 supplement" if "supplement" in p["what"] else "production hits") + " · pending", "pending")
-    eta = f" (expected {h(rep.args.pending_eta)})" if rep.args.pending_eta and rep.pending else ""
+        if p.get("key") in ("supplement", "production"):
+            chip(f"{p['label']} · pending", "pending")
+    eta = pending_eta(rep) if rep.pending else ""
     return f"""
 <header class="masthead">
   <p class="eyebrow">AMSC · 10x multiome ATAC · model comparison</p>
@@ -2083,7 +2189,7 @@ def masthead(rep: Report, R: dict, generated: str) -> str:
   <span class="lg">{key("cross")}<span class="lgd">agreement between the two</span></span></div>
   <div class="status">{"".join(chips)}</div>
   <p class="meta"><span>Generated {h(generated)}</span><span>Data as of the newest input,
-  {h(R.get("newest_input", "NA"))}</span><span>Pending parts{eta} are marked as such</span></p>
+  {h(R.get("newest_input", "NA"))}</span><span>Pending parts are marked as such.{eta}</span></p>
 </header>"""
 
 
@@ -2107,169 +2213,427 @@ def s(rep: Report, level: str, family: str, quantity: str, over: str = "datasets
     return rep.stats.find(level, family, quantity, over)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# the findings: each level's sentences in one place, read by the Summary and by the level's lead
+
+
+def ordinal(k: int) -> str:
+    """'' for 1, 'second-' for 2, ... (as in 'the third-largest')."""
+    return {1: "", 2: "second-", 3: "third-", 4: "fourth-", 5: "fifth-"}.get(k, f"{k}th-")
+
+
+def ranges(values: list[int]) -> str:
+    """[1, 2, 3, 5] -> '1–3 and 5'; [1, 2, 9, 10] -> '1, 2, 9 and 10'."""
+    runs: list[list[int]] = []
+    for v in sorted(values):
+        if runs and v == runs[-1][-1] + 1:
+            runs[-1].append(v)
+        else:
+            runs.append([v])
+    parts = [p for r in runs for p in ([f"{r[0]}–{r[-1]}"] if len(r) > 2 else [str(x) for x in r])]
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def change(x: float, d: int = 4) -> str:
+    """'falls by 0.0011' or 'rises by 0.0011'."""
+    return f"{'falls' if x < 0 else 'rises'} by {num(abs(x), d)}"
+
+
+def relation(b: float, c1: float, c2: float) -> str:
+    """Where b sits against two ceilings."""
+    if b < min(c1, c2):
+        return "sit below both ceilings"
+    if b > max(c1, c2):
+        return "sit above both ceilings"
+    return "fall between the two ceilings"
+
+
+def l1_finding(l1: dict) -> dict:
+    """Level 1: 'headline' (who predicts better, by how much), 'detail' (the dataset difference, the folds) and
+    'where' (where the gain sits, from the residual deciles; '' when no decile is lower at p < 0.01)."""
+    md = l1["measures"]
+    a = md[md["set"] == "all"].set_index("measure")
+    nf, nd = l1["n_folds"], l1["n_datasets"]
+    pear, jsd = a.loc["counts_pearson"], a.loc["median_jsd"]
+    full = [m for m in MEASURES if a.loc[m, "cherimoya_better_folds"] == nf]
+    part = [m for m in MEASURES if m not in full]
+    all_ds = all(a.loc[m, "cherimoya_better_datasets"] == nd for m in MEASURES)
+    headline = (f"Cherimoya predicts held-out accessibility better than ChromBPNet"
+                f"{f' in all {nd} datasets, on all five measures' if all_ds else ''}: over {nf} test folds the median "
+                f"counts Pearson r rises from {num(pear['chrombpnet_median'])} to {num(pear['cherimoya_median'])} and "
+                f"the median profile JSD falls from {num(jsd['chrombpnet_median'])} to "
+                f"{num(jsd['cherimoya_median'])}.")  # fmt: skip
+    detail = (
+        f"For counts Pearson r, the median over datasets of each dataset's mean fold difference is "
+        f"{num(pear['median_dataset_diff'], 3, True)} (95% CI {ci(pear['ci95_lo'], pear['ci95_hi'], 3, True)})."
+    )
+    if full:
+        detail += f" Cherimoya is better on every fold for {', '.join(MEASURE_SHORT[m] for m in full)}"
+        detail += (f"; for {', '.join(MEASURE_SHORT[m] for m in part)} on "
+                   + ", ".join(f"{int(a.loc[m, 'cherimoya_better_folds'])}" for m in part) + f" of {nf}."
+                   if part else ".")  # fmt: skip
+    rd = l1["residuals"]
+    r = rd[rd["set"] == "all"].sort_values("decile")
+    lower = [int(x) for x in r[(r["rmse_diff_median"] < 0) & (r["wilcoxon_p"] < 0.01)]["decile"]]
+    higher = [int(x) for x in r[(r["rmse_diff_median"] > 0) & (r["wilcoxon_p"] < 0.01)]["decile"]]
+    where = ""
+    if lower:
+        d1 = r[r["decile"] == min(lower)].iloc[0]
+        where = "The gain sits at the extremes of accessibility. " if {1, 10} <= set(lower) else ""
+        where += (f"Cherimoya's RMSE is lower in deciles "
+                 f"{ranges(lower)} of observed counts (decile {int(d1['decile'])}: "
+                 f"{num(d1['rmse_diff_median'], 3, True)} log counts)")  # fmt: skip
+        where += (
+            f" and slightly higher in deciles {ranges(higher)} (at most "
+            f"{num(r[r['decile'].isin(higher)]['rmse_diff_median'].max(), 3, True)})."
+            if higher
+            else "."
+        )
+        first, last = r.iloc[0], r.iloc[-1]
+        if min(first["mean_residual_chrombpnet_median"], first["mean_residual_cherimoya_median"]) > 0 and max(
+                last["mean_residual_chrombpnet_median"], last["mean_residual_cherimoya_median"]) < 0:  # fmt: skip
+            where += " Both models over-predict the least accessible peaks and under-predict the most accessible."
+        below = [
+            int(x) for x in r[r["mean_residual_cherimoya_median"] < r["mean_residual_chrombpnet_median"]]["decile"]
+        ]
+        if below:
+            mid = r[r["decile"] == below[len(below) // 2]].iloc[0]
+            where += (f" Cherimoya's predictions sit lower than ChromBPNet's in deciles {ranges(below)} (median mean "
+                      f"residual in decile {int(mid['decile'])}: {num(mid['mean_residual_cherimoya_median'], 2, True)} "
+                      f"against {num(mid['mean_residual_chrombpnet_median'], 2, True)}), a downward shift that shrinks "
+                      "its over-prediction at the low end and leaves it under-predicting more in the middle deciles, "
+                      "where its RMSE is higher.")  # fmt: skip
+    return {"headline": headline, "detail": detail, "where": where, "lower": lower}
+
+
+def l2_finding(rep: Report, l2: dict) -> dict | None:
+    """Level 2: 'headline' and 'caveat' (fold averages against the ceilings), 'spread' (the other metrics), 'single'
+    (single folds), 'lead' (one sentence for the section), 'heldout' (held-out against training chromosomes)."""
+    w = l2["windows"][0]
+    q = {(m, x): s(rep, "2", f"attributions, {w}, {m}", x) for m in L2_METRICS
+         for x in ("cross_fold", "cross_average", "loo_chrombpnet", "loo_cherimoya")}  # fmt: skip
+    A, B, Cc, Ck = (q[("pearson", x)] for x in ("cross_fold", "cross_average", "loo_chrombpnet", "loo_cherimoya"))
+    if not (A and B and Cc and Ck):
+        return None
+    out = {
+        "window": w,
+        "headline": f"On Pearson r, the fold-averaged attributions of the two models agree per peak at "
+        f"{num(B['estimate'])} in the {window_name(w)}, about as high as one fold agrees with the mean of its own "
+        f"model's other four (the leave-one-out ceilings: {num(Cc['estimate'])} for ChromBPNet, "
+        f"{num(Ck['estimate'])} for Cherimoya).",
+        "caveat": "That comparison favours the fold averages, which average five folds on each side, so it does not "
+        "show that the two models agree as well as each agrees with itself; a like-for-like ceiling was not computed.",
+        "single": f"Single folds agree less across the models ({num(A['estimate'])}), a comparison tilted the other "
+        "way, since one fold is noisier than the mean of four.",
+        "lead": f"Per peak, the fold-averaged attributions of the two models correlate at Pearson r "
+        f"{num(B['estimate'])} in the {window_name(w)}, close to each model's leave-one-out ceiling "
+        f"({num(Cc['estimate'])} and {num(Ck['estimate'])}), but that comparison favours the fold averages (five "
+        f"folds averaged on each side, against one fold against the mean of four); single folds agree at "
+        f"{num(A['estimate'])}.",
+    }
+    spread = []
+    for m, what in (("spearman", "Spearman ρ"), ("jaccard_mean", "the top-50 Jaccard")):
+        b, c1, c2 = (q[(m, x)] for x in ("cross_average", "loo_chrombpnet", "loo_cherimoya"))
+        if b and c1 and c2:
+            spread.append(f"on {what} the fold averages ({num(b['estimate'])}) "
+                          f"{relation(b['estimate'], c1['estimate'], c2['estimate'])} ({num(c1['estimate'])} for "
+                          f"ChromBPNet, {num(c2['estimate'])} for Cherimoya)")  # fmt: skip
+    out["spread"] = ("Other metrics give a mixed picture: " + "; ".join(spread) + ".") if spread else ""
+    fam = f"attributions, {w}, pearson"
+    ho = [s(rep, "2", fam, f"{x} - {y}") for x, y in (("heldout_chrombpnet", "train_chrombpnet"),
+                                                     ("heldout_cherimoya", "train_cherimoya"),
+                                                     ("cross_heldout", "cross_train"))]  # fmt: skip
+    role_names = {"cross_fold": "cross-model agreement (A)", "loo_chrombpnet": "ChromBPNet's ceiling",
+                  "loo_cherimoya": "Cherimoya's ceiling"}  # fmt: skip
+    role = {k: s(rep, "2", f"attribution strata, {w}, pearson", f"role test - train: {k}") for k in role_names}
+    role = {k: v for k, v in role.items() if v}
+    out["heldout"] = ""
+    if all(ho):
+        rows = ho + list(role.values())
+        worst = max(abs(x["estimate"]) for x in rows)
+        est = [x["estimate"] for x in ho]
+        if all(e < 0 for e in est) or all(e > 0 for e in est):
+            by = (f"{'falls' if est[0] < 0 else 'rises'} by {num(abs(est[0]), 4)} for ChromBPNet, "
+                  f"{num(abs(est[1]), 4)} for Cherimoya and {num(abs(est[2]), 4)} across the models")  # fmt: skip
+        else:
+            by = (f"{change(est[0])} for ChromBPNet, {change(est[1])} for Cherimoya and {change(est[2])} across "
+                  "the models")  # fmt: skip
+        text = (
+            f"On chromosomes a fold never trained on, attribution agreement differs by at most {num(worst, 4)} in "
+            f"Pearson r ({window_name(w, full=False)}). Per peak at the held-out fold against the folds that "
+            f"trained on the chromosome, it {by}"
+        )
+        if role:
+            k, r = max(role.items(), key=lambda kv: abs(kv[1]["estimate"]))
+            text += f"; split by the chromosome's role in each fold, {role_names[k]} {change(r['estimate'])}"
+        lower_all = all(x["estimate"] < 0 and int(x["higher"]) == 0 for x in rows)
+        text += (". The drop holds in every dataset but is tiny: no sign of meaningful memorization." if lower_all
+                 else ". The differences are tiny: no sign of meaningful memorization.")  # fmt: skip
+        out["heldout"] = text
+    return out
+
+
+def l3_finding(rep: Report) -> dict | None:
+    """Level 3: 'primary' (the cluster rule), 'secondary' (tomtom), 'qc' (the QC scale against its ceilings),
+    'lead', and the tile's numbers."""
+    fam = "TF-MoDISco, per model"
+
+    def med(col: str, m: str) -> float:
+        r = s(rep, "3", fam, f"{NAMES[m]}: {col}")
+        return r["estimate"] if r else NAN
+
+    v = {(col, m): med(col, m) for m in MODELS for col in ("shared_cluster_count", "shared_cluster_seqlets",
+                                                           "shared_tomtom_count", "shared_tomtom_seqlets",
+                                                           "qc_cross", "qc_within")}  # fmt: skip
+    if not all(isnum(x) for x in v.values()):
+        return None
+    famq = "TF-MoDISco QC, cross-model - ceiling"
+    dq = {m: s(rep, "3", famq, f"QC: {m} patterns matched across models - within {m} (ceiling)") for m in MODELS}
+
+    def two(col: str, d: int = 1) -> tuple[str, str]:
+        return pct(v[(col, "chrombpnet")], d), pct(v[(col, "cherimoya")], d)
+
+    pc, pk = two("shared_cluster_count")
+    sc, sk = two("shared_cluster_seqlets")
+    tc, tk = two("shared_tomtom_count")
+    ttc, ttk = two("shared_tomtom_seqlets")
+    qc = (num(v[("qc_cross", "chrombpnet")], 2), num(v[("qc_cross", "cherimoya")], 2))
+    qw = (num(v[("qc_within", "chrombpnet")], 2), num(v[("qc_within", "cherimoya")], 2))
+    out = {
+        "primary": f"By the primary rule, a partner in the same joint-compendium cluster, {pc} of ChromBPNet's and "
+        f"{pk} of Cherimoya's fold-average patterns are matched (medians over datasets), and those hold {sc} and "
+        f"{sk} of the seqlets.",
+        "secondary": "The rule is strict, since at threshold 0.95 the joint compendium keeps close variants of a "
+        f"motif apart: by tomtom (secondary), {tc} and {tk} of the patterns have a partner in the other model, "
+        f"holding {ttc} and {ttk} of the seqlets.",
+        "qc": f"At QC scale the cross-model match ({qc[0]} and {qc[1]}) comes close to each model's fold-to-fold "
+        f"ceiling ({qw[0]} and {qw[1]}), but that comparison favours the cross-model match: both models' runs of a "
+        "fold use the same 30K-peak subsample, while the ceiling compares folds whose subsamples differ.",
+        "tile": (
+            f"{pc} / {pk}",
+            f"ChromBPNet / Cherimoya, median of datasets; by tomtom {tc} / {tk}. No ceiling here; "
+            f"at QC scale {qc[0]} / {qc[1]} against fold-to-fold ceilings {qw[0]} / {qw[1]}",
+        ),
+    }
+    lead = (f"{pc} of ChromBPNet's and {pk} of Cherimoya's fold-average patterns share a joint-compendium cluster with "
+            f"a pattern of the other model (medians over datasets), and those patterns hold {sc} and {sk} of the "
+            f"seqlets; by tomtom, {tc} and {tk} have a partner.")  # fmt: skip
+    if all(dq.values()):
+        lead += (f" At QC scale the cross-model match sits {num(abs(dq['chrombpnet']['estimate']), 3)} and "
+                 f"{num(abs(dq['cherimoya']['estimate']), 3)} below each model's fold-to-fold ceiling, a comparison "
+                 "that favours the cross-model match.")  # fmt: skip
+    out["lead"] = lead
+    return out
+
+
+def l4_finding(rep: Report, l4: dict, l5: dict | None) -> dict | None:
+    """Level 4: 'text' (the joint compendium's classes, the threshold 0.90 rebuild, the hits the model-only clusters
+    draw) and 'lead'."""
+    c = l4["classes"]
+    c95 = c[c["threshold"] == "0.95"].set_index("class")
+    c90 = c[c["threshold"] == "0.90"].set_index("class") if "0.90" in set(c["threshold"]) else None
+    if not set(CLASSES) <= set(c95.index):
+        return None
+    n = {k: int(c95.loc[k, "clusters"]) for k in CLASSES}
+    single = {k: int(c95.loc[k, "single_pattern_clusters"]) for k in CLASSES}
+    text = (f"In the joint compendium, {n['shared']} clusters hold patterns of both models and carry "
+            f"{pct(c95.loc['shared', 'seqlet_share_chrombpnet'])} of ChromBPNet's and "
+            f"{pct(c95.loc['shared', 'seqlet_share_cherimoya'])} of Cherimoya's seqlets. The {n['chrombpnet_only']} "
+            f"ChromBPNet-only and {n['cherimoya_only']} Cherimoya-only clusters are small by seqlets "
+            f"({pct(c95.loc['chrombpnet_only', 'seqlet_share_chrombpnet'])} and "
+            f"{pct(c95.loc['cherimoya_only', 'seqlet_share_cherimoya'])} of their model's) and mostly single patterns "
+            f"({single['chrombpnet_only']} and {single['cherimoya_only']})")  # fmt: skip
+    if c90 is not None and set(CLASSES) <= set(c90.index):
+        text += (f", and many merge when the compendium is rebuilt at threshold 0.90 "
+                 f"({int(c90.loc['chrombpnet_only', 'clusters'])} and {int(c90.loc['cherimoya_only', 'clusters'])}, "
+                 f"while the shared core keeps {int(c90.loc['shared', 'clusters'])}).")  # fmt: skip
+    else:
+        text += "."
+    hits = ""
+    if l5 is not None and l5.get("state") == "done":
+        hc = s(rep, "5", "Fi-NeMo hits, class chrombpnet_only", "share_of_chrombpnet_hits")
+        hk = s(rep, "5", "Fi-NeMo hits, class cherimoya_only", "share_of_cherimoya_hits")
+        if hc and hk:
+            hits = (f" They matter more for the hits: their motifs draw {pct(hc['estimate'])} of ChromBPNet's and "
+                    f"{pct(hk['estimate'])} of Cherimoya's Fi-NeMo hits (medians over datasets)")  # fmt: skip
+            top = l5["top"].reset_index(drop=True)
+            own = top[top["class"].isin(("chrombpnet_only", "cherimoya_only"))]
+            if len(own):
+                i = int(own.index[0])
+                r = top.loc[i]
+                m = "cherimoya" if r["class"] == "cherimoya_only" else "chrombpnet"
+                hits += (f", and the {NAMES[m]}-only {h(r['annotation'] or r['motif'])} is the {ordinal(i + 1)}largest "
+                         f"motif ({count(r[f'hits_{m}'])} {NAMES[m]} hits)")  # fmt: skip
+            hits += "."
+    lead = (f"{n['shared']} clusters of the joint compendium hold patterns of both models and carry "
+            f"{pct(c95.loc['shared', 'seqlet_share_chrombpnet'])} and "
+            f"{pct(c95.loc['shared', 'seqlet_share_cherimoya'])} of the two models' seqlets; the "
+            f"{n['chrombpnet_only']} ChromBPNet-only and {n['cherimoya_only']} Cherimoya-only clusters are mostly "
+            "single patterns with little of the seqlets.")  # fmt: skip
+    return {"text": text + hits, "lead": lead + hits}
+
+
+def l5_finding(rep: Report) -> dict | None:
+    """Level 5: 'text' (hit counts, precision and recall, tolerance, by class) and 'lead'."""
+    fam = "Fi-NeMo hits, joint vocabulary"
+    P, Rr = s(rep, "5", fam, "precision_5bp"), s(rep, "5", fam, "recall_5bp")
+    ratio = s(rep, "5", fam, "hits, ChromBPNet / Cherimoya")
+    if not (P and Rr and ratio):
+        return None
+    tol = {t: (s(rep, "5", fam, f"precision_{t}bp"), s(rep, "5", fam, f"recall_{t}bp")) for t in (0, 10)}
+    text = (f"Called with one shared motif vocabulary, ChromBPNet has {num(ratio['estimate'], 2)}× as many hits as "
+            f"Cherimoya. {pct(P['estimate'], 0)} of Cherimoya's hits match a ChromBPNet hit of the same motif and "
+            f"strand within 5 bp (precision), and Cherimoya recovers {pct(Rr['estimate'], 0)} of ChromBPNet's "
+            f"(recall).")  # fmt: skip
+    if all(a and b for a, b in tol.values()):
+        text += (f" Matched hits sit at the same position: at 0 bp the shares are already {num(tol[0][0]['estimate'])} "
+                 f"and {num(tol[0][1]['estimate'])}, and at 10 bp {num(tol[10][0]['estimate'])} and "
+                 f"{num(tol[10][1]['estimate'])}.")  # fmt: skip
+    cls = {c: (s(rep, "5", f"Fi-NeMo hits, class {c}", "precision_5bp"),
+               s(rep, "5", f"Fi-NeMo hits, class {c}", "recall_5bp")) for c in CLASSES}  # fmt: skip
+    by_class = ""
+    if all(a and b for a, b in cls.values()):
+        best_p = max(CLASSES, key=lambda c: cls[c][0]["estimate"])
+        best_r = max(CLASSES, key=lambda c: cls[c][1]["estimate"])
+        if best_p == best_r == "shared":
+            by_class = (f" Agreement is highest on motifs of clusters both models hold (precision "
+                        f"{num(cls['shared'][0]['estimate'])}, recall {num(cls['shared'][1]['estimate'])}) and "
+                        f"Cherimoya's hits on Cherimoya-only motifs are the ones ChromBPNet reproduces least "
+                        f"(precision {num(cls['cherimoya_only'][0]['estimate'])}).")  # fmt: skip
+    lead = (
+        f"With one shared motif vocabulary, ChromBPNet calls {num(ratio['estimate'], 2)}× as many hits as Cherimoya; "
+        f"{pct(P['estimate'], 0)} of Cherimoya's hits have a ChromBPNet hit of the same motif and strand within 5 "
+        f"bp (precision), and Cherimoya recovers {pct(Rr['estimate'], 0)} of ChromBPNet's (recall)"
+        + (", with the highest agreement on motifs of clusters both models hold." if by_class else ".")
+    )
+    return {"text": text + by_class, "lead": lead, "tile": (P, Rr)}
+
+
+def bias_finding(rep: Report, bc: dict, l3: dict) -> dict:
+    """The bias control: 'flagged' (the database flags of both models), 'checked' (the control's split), 'lead',
+    'closing' (what the split means), and the counts."""
+    per = l3["per"]
+    nd = per["dataset"].nunique()
+    fc = int(per[per["model"] == "chrombpnet"]["bias_flagged"].sum())
+    fk = int(per[per["model"] == "cherimoya"]["bias_flagged"].sum())
+    t = s(rep, "3", "TF-MoDISco, Cherimoya - ChromBPNet", "Tn5/DNase-flagged patterns: Cherimoya - ChromBPNet")
+    split = bc["split"].set_index("reference_kind")
+
+    def get(kind: str, col: str) -> int:
+        return int(split.loc[kind, col]) if kind in split.index and col in split.columns else 0
+
+    n = {k: get(k, "patterns") for k in ("Tn5/DNase", "TF or other", "no match", "unknown")}
+    partner = {k: get(k, "chrombpnet_partner") for k in n}
+    flagged = {k: get(k, "db_flagged") for k in n}
+    n_checked = int(split["patterns"].sum())
+    scales = bc.get("scales") or {}
+    n_fa, n_qc = scales.get("fold average", 0), scales.get("QC fold", 0)
+    p = f"p {pval(t['p'], t['p_method'])}" if t else "p NA"
+    out = {"fc": fc, "fk": fk, "n": n, "partner": partner, "db_flagged": flagged, "n_checked": n_checked}
+    out["flag_text"] = (f"Cherimoya, which has no bias model, carries more Tn5/DNase-flagged patterns: {fk} "
+                      f"fold-average patterns over the {nd} datasets against {fc} for bias-corrected ChromBPNet ({p}). "
+                      "Bias-corrected ChromBPNet has some too, so the difference is one of degree.")  # fmt: skip
+    checked = (
+        f"{n_fa} fold-average patterns without a cluster partner and {n_qc} of the control's own QC fold "
+        f"without a tomtom partner"
+        if n_qc
+        else f"{n_fa} fold-average patterns without a cluster partner"
+    )
+    matched = n["Tn5/DNase"] + n["TF or other"]
+    out["checked"] = (f"Of the {n_checked} Cherimoya patterns checked against the bias-included ChromBPNet "
+                      f"({checked}), {matched} match one of its patterns: {n['Tn5/DNase']} its Tn5/DNase patterns "
+                      f"and {n['TF or other']} its TF patterns, and {partner['TF or other']} of those "
+                      f"{n['TF or other']} also have a tomtom partner in bias-corrected ChromBPNet.")  # fmt: skip
+    out["lead"] = (f"Cherimoya carries more Tn5/DNase-flagged patterns than bias-corrected ChromBPNet ({fk} against "
+                   f"{fc} over the {nd} datasets, {p}), but bias-corrected ChromBPNet has some too, so the difference "
+                   "is one of degree; and most of Cherimoya's unmatched patterns that the bias-included ChromBPNet "
+                   f"also finds match its TF patterns ({n['TF or other']} of {matched}), not its Tn5 "
+                   "patterns.")  # fmt: skip
+    ref = bc["reference"]
+    tf_names = []
+    if ref is not None and not ref.empty:
+        tf = ref[(ref["kind"] == "TF or other") & (ref["cherimoya_patterns"] > 0)]
+        tf = tf.sort_values("cherimoya_patterns", ascending=False)
+        tf_names = list(dict.fromkeys(str(x) for x in tf["annotation"].dropna()))
+    names = f" ({', '.join(tf_names)})" if tf_names else ""
+    out["closing"] = (
+        f"Most of the Cherimoya patterns that the bias-included model also finds match its TF patterns{names}, not "
+        f"its Tn5 patterns: they are mostly TF motifs that the cluster rule left unmatched "
+        f"({partner['TF or other']} of {n['TF or other']} have a tomtom partner in bias-corrected ChromBPNet), "
+        f"though {flagged['TF or other']} of them are themselves database-flagged Tn5/DNase. Of the "
+        f"{n['Tn5/DNase']} that match its Tn5/DNase patterns, {partner['Tn5/DNase']} also have a tomtom partner in "
+        f"bias-corrected ChromBPNet, so it carries similar patterns too. The {n['no match']} checked patterns that "
+        f"match no reference pattern are not cleared by this control: {partner['no match']} of them have a tomtom "
+        f"partner in bias-corrected ChromBPNet and {flagged['no match']} are database-flagged. The control is one "
+        "dataset and fold, on the profile head (DeepSHAP has no rule for the counts head of the full model), while "
+        "every other pattern here comes from the counts head, so it indicates, but does not measure, how much of "
+        "Cherimoya's extra signal is bias."
+    )
+    return out
+
+
 def summary_section(rep: Report, R: dict) -> str:
     items, keys = [], []
     l1, l2, l3, l4, l5, bc = (R.get(k) for k in ("l1", "l2", "l3", "l4", "l5", "bias"))
     if l1 and l1.get("state") == "done":
+        f1 = l1_finding(l1)
+        items.append(("Performance", f"{f1['headline']} {f1['detail']}"))
         md = l1["measures"]
-        a = md[md["set"] == "all"].set_index("measure")
-        nf, nd = l1["n_folds"], l1["n_datasets"]
-        pear, jsd = a.loc["counts_pearson"], a.loc["median_jsd"]
-        full = [m for m in MEASURES if a.loc[m, "cherimoya_better_folds"] == nf]
-        part = [m for m in MEASURES if m not in full]
-        all_ds = all(a.loc[m, "cherimoya_better_datasets"] == nd for m in MEASURES)
-        text = (f"Cherimoya predicts held-out accessibility better than ChromBPNet"
-                f"{f' in all {nd} datasets, on all five measures' if all_ds else ''}. Over {nf} test folds the median "
-                f"counts Pearson r rises from {num(pear['chrombpnet_median'])} to {num(pear['cherimoya_median'])} "
-                f"(difference of dataset means {num(pear['median_dataset_diff'], 3, True)}, 95% CI "
-                f"{ci(pear['ci95_lo'], pear['ci95_hi'], 3, True)}) and the median profile JSD falls from "
-                f"{num(jsd['chrombpnet_median'])} to {num(jsd['cherimoya_median'])}.")  # fmt: skip
-        if full:
-            text += f" Cherimoya is better on every fold for {', '.join(MEASURE_SHORT[m] for m in full)}"
-            text += (
-                (
-                    f"; for {', '.join(MEASURE_SHORT[m] for m in part)} on "
-                    + ", ".join(f"{int(a.loc[m, 'cherimoya_better_folds'])}" for m in part)
-                    + f" of {nf}."
-                )
-                if part
-                else "."
-            )
-        items.append(("Performance", text))
-        keys.append(
-            (
-                "Counts Pearson r, median of " + str(nf) + " folds",
-                f"{num(pear['chrombpnet_median'])} → {num(pear['cherimoya_median'])}",
-                f"ChromBPNet → Cherimoya; Cherimoya better on {int(pear['cherimoya_better_folds'])}/{nf} folds",
-            )
-        )
-        rd = l1["residuals"]
-        r = rd[rd["set"] == "all"]
-        lower = [int(x) for x in r[(r["rmse_diff_median"] < 0) & (r["wilcoxon_p"] < 0.01)]["decile"]]
-        higher = [int(x) for x in r[(r["rmse_diff_median"] > 0) & (r["wilcoxon_p"] < 0.01)]["decile"]]
-        if lower:
-            d1 = r[r["decile"] == min(lower)].iloc[0]
-            text = (f"The gain sits at the extremes of accessibility. Cherimoya's RMSE is lower in deciles "
-                    f"{', '.join(map(str, lower))} of observed counts (decile {int(d1['decile'])}: "
-                    f"{num(d1['rmse_diff_median'], 3, True)} log counts)")  # fmt: skip
-            text += (
-                f" and slightly higher in deciles {', '.join(map(str, higher))} (at most "
-                f"{num(r[r['decile'].isin(higher)]['rmse_diff_median'].max(), 3, True)})."
-                if higher
-                else "."
-            )
-            text += (" Both models over-predict the least accessible peaks and under-predict the most accessible; "
-                     "Cherimoya less so at the low end.")  # fmt: skip
-            items.append(("Where it gains", text))
+        pear = md[md["set"] == "all"].set_index("measure").loc["counts_pearson"]
+        keys.append((f"Counts Pearson r, median of {l1['n_folds']} folds",
+                     f"{num(pear['chrombpnet_median'])} → {num(pear['cherimoya_median'])}",
+                     f"ChromBPNet → Cherimoya; Cherimoya better on {int(pear['cherimoya_better_folds'])}/"
+                     f"{l1['n_folds']} folds"))  # fmt: skip
+        if f1["where"]:
+            items.append(("Where it gains", f1["where"]))
     if l2 and l2.get("state") == "done":
-        w = l2["windows"][0]
-        fam = f"attributions, {w}, pearson"
-        A, B = s(rep, "2", fam, "cross_fold"), s(rep, "2", fam, "cross_average")
-        Cc, Ck = s(rep, "2", fam, "loo_chrombpnet"), s(rep, "2", fam, "loo_cherimoya")
-        if A and B and Cc and Ck:
-            text = (
-                f"Per peak, the fold-averaged attributions of the two models agree about as well as each model "
-                f"agrees with its own folds: Pearson r {num(B['estimate'])} in the {int(w[1:])}-bp window around "
-                f"the summit, "
-                f"against leave-one-out ceilings of {num(Cc['estimate'])} (ChromBPNet) and {num(Ck['estimate'])} "
-                f"(Cherimoya). Single folds agree less across the models ({num(A['estimate'])}); part of that gap "
-                f"is built in, because a ceiling compares one fold with the mean of the other four."
-            )
-            items.append(("Attributions", text))
-            keys.append(
-                (
-                    "Attribution Pearson r, fold averages",
-                    f"{num(B['estimate'])}",
-                    f"ceilings {num(Cc['estimate'])} (ChromBPNet), {num(Ck['estimate'])} (Cherimoya)",
-                )
-            )
-        ho = [s(rep, "2", fam, f"{a} - {b}") for a, b in (("heldout_chrombpnet", "train_chrombpnet"),
-                                                       ("heldout_cherimoya", "train_cherimoya"),
-                                                       ("cross_heldout", "cross_train"))]  # fmt: skip
-        if all(ho):
-            worst = max(abs(x["estimate"]) for x in ho)
-            text = (f"On chromosomes a fold never trained on, agreement is within {num(worst, 4)} of agreement on its "
-                    f"training chromosomes, for each model and across the models (Pearson r). The drop is consistent "
-                    f"but tiny: no sign that either model memorized its training chromosomes.")  # fmt: skip
-            items.append(("Held-out chromosomes", text))
+        f2 = l2_finding(rep, l2)
+        if f2:
+            items.append(("Attributions", " ".join(x for x in (f2["headline"], f2["caveat"], f2["spread"],
+                                                                f2["single"]) if x)))  # fmt: skip
+            fam = f"attributions, {f2['window']}, pearson"
+            B = s(rep, "2", fam, "cross_average")
+            Cc, Ck = s(rep, "2", fam, "loo_chrombpnet"), s(rep, "2", fam, "loo_cherimoya")
+            keys.append(("Attribution Pearson r, fold averages (B)", num(B["estimate"]),
+                         f"ceilings {num(Cc['estimate'])} (ChromBPNet), {num(Ck['estimate'])} (Cherimoya); not like "
+                         "for like: B averages five folds on each side, a ceiling one fold against four"))  # fmt: skip
+            if f2["heldout"]:
+                items.append(("Held-out chromosomes", f2["heldout"]))
     if l3 and l3.get("state") == "done":
-        w = l3["wide"]
-        tc, tk = w[("shared_tomtom_count", "chrombpnet")].median(), w[("shared_tomtom_count", "cherimoya")].median()
-        sc, sk = w[("shared_tomtom_seqlets", "chrombpnet")].median(), w[("shared_tomtom_seqlets", "cherimoya")].median()
-        qc_c, qc_k = w[("qc_cross", "chrombpnet")].median(), w[("qc_cross", "cherimoya")].median()
-        qw_c, qw_k = w[("qc_within", "chrombpnet")].median(), w[("qc_within", "cherimoya")].median()
-        text = (f"TF-MoDISco finds the same motifs in both. {pct(tc, 0)} of ChromBPNet's and {pct(tk, 0)} of "
-                f"Cherimoya's fold-average patterns have a tomtom partner in the other model (medians over datasets), "
-                f"and those patterns hold {pct(sc)} and {pct(sk)} of the seqlets. At QC scale, the cross-model match "
-                f"({num(qc_c, 2)} and {num(qc_k, 2)}) sits just under each model's fold-to-fold ceiling "
-                f"({num(qw_c, 2)} and {num(qw_k, 2)}).")  # fmt: skip
-        items.append(("Motifs", text))
-        keys.append(("Patterns with a partner in the other model", f"{pct(tc, 0)} / {pct(tk, 0)}",
-                     "ChromBPNet / Cherimoya, tomtom q ≤ 0.05, median of datasets"))  # fmt: skip
+        f3 = l3_finding(rep)
+        if f3:
+            items.append(("Motifs", f"TF-MoDISco finds largely the same motifs in both models. {f3['primary']} "
+                                    f"{f3['secondary']} {f3['qc']}"))  # fmt: skip
+            keys.append(("Fold-average patterns in a joint cluster with the other model's", *f3["tile"]))
+    f5 = l5_finding(rep) if l5 and l5.get("state") == "done" else None
     if l4 and l4.get("state") == "done":
-        c = l4["classes"]
-        c95 = c[c["threshold"] == "0.95"].set_index("class")
-        c90 = c[c["threshold"] == "0.90"].set_index("class") if "0.90" in set(c["threshold"]) else None
-        if set(CLASSES) <= set(c95.index):
-            text = (f"In the joint compendium, {int(c95.loc['shared', 'clusters'])} clusters hold patterns of both "
-                    f"models and carry {pct(c95.loc['shared', 'seqlet_share_chrombpnet'])} of ChromBPNet's and "
-                    f"{pct(c95.loc['shared', 'seqlet_share_cherimoya'])} of Cherimoya's seqlets. The "
-                    f"{int(c95.loc['chrombpnet_only', 'clusters'])} ChromBPNet-only and "
-                    f"{int(c95.loc['cherimoya_only', 'clusters'])} Cherimoya-only clusters are small, mostly single "
-                    f"patterns")  # fmt: skip
-            if c90 is not None and set(CLASSES) <= set(c90.index):
-                text += (f", and many merge when the compendium is rebuilt at threshold 0.90 "
-                         f"({int(c90.loc['chrombpnet_only', 'clusters'])} and "
-                         f"{int(c90.loc['cherimoya_only', 'clusters'])}, while the shared core keeps "
-                         f"{int(c90.loc['shared', 'clusters'])}).")  # fmt: skip
-            else:
-                text += "."
-            items.append(("Compendia", text))
-    if l5 and l5.get("state") == "done":
-        fam = "Fi-NeMo hits, joint vocabulary"
-        P, Rr = s(rep, "5", fam, "precision_5bp"), s(rep, "5", fam, "recall_5bp")
-        ratio = s(rep, "5", fam, "hits, ChromBPNet / Cherimoya")
-        if P and Rr and ratio:
-            text = (
-                f"Called with one shared motif vocabulary, ChromBPNet has {num(ratio['estimate'], 2)}× as many "
-                f"hits as Cherimoya. {pct(P['estimate'], 0)} of Cherimoya's hits match a ChromBPNet hit of the same "
-                f"motif and strand within 5 bp (precision), and Cherimoya recovers {pct(Rr['estimate'], 0)} of "
-                f"ChromBPNet's (recall). Agreement is highest on motifs both models found."
-            )
-            items.append(("Hits", text))
-            keys.append(("Fi-NeMo hits matched within 5 bp", f"{pct(P['estimate'], 0)} / {pct(Rr['estimate'], 0)}",
-                         "of Cherimoya's hits / of ChromBPNet's hits, median of datasets"))  # fmt: skip
+        f4 = l4_finding(rep, l4, l5)
+        if f4:
+            items.append(("Compendia", f4["text"]))
+    if f5:
+        items.append(("Hits", f5["text"]))
+        P, Rr = f5["tile"]
+        keys.append(("Fi-NeMo hits matched within 5 bp", f"{pct(P['estimate'], 0)} / {pct(Rr['estimate'], 0)}",
+                     "of Cherimoya's hits / of ChromBPNet's hits, median of datasets; no within-model ceiling (Fi-NeMo "
+                     "ran on fold averages only)"))  # fmt: skip
     if bc and bc.get("state") == "done" and l3 and l3.get("state") == "done":
-        per = l3["per"]
-        fc, fk = (
-            int(per[per["model"] == "chrombpnet"]["bias_flagged"].sum()),
-            int(per[per["model"] == "cherimoya"]["bias_flagged"].sum()),
-        )
-        t = s(rep, "3", "TF-MoDISco, Cherimoya - ChromBPNet", "Tn5/DNase-flagged patterns: Cherimoya - ChromBPNet")
-        split = bc["split"].set_index("reference_kind")
-        n_checked = int(split["patterns"].sum())
-        n_tn5 = int(split.loc["Tn5/DNase", "patterns"]) if "Tn5/DNase" in split.index else 0
-        n_tf = int(split.loc["TF or other", "patterns"]) if "TF or other" in split.index else 0
-        text = (
-            f"Cherimoya, which has no bias model, carries more Tn5/DNase patterns: {fk} database-flagged "
-            f"fold-average patterns over the {len(per['dataset'].unique())} datasets against {fc} for bias-corrected "
-            f"ChromBPNet (p {pval(t['p']) if t else 'NA'}). Of the {n_checked} Cherimoya patterns without a "
-            f"cluster partner, {n_tn5 + n_tf} match a pattern of the bias-included ChromBPNet, but only {n_tn5} "
-            f"match one of its Tn5/DNase patterns; {n_tf} match its TF patterns."
-        )
-        items.append(("Bias", text))
+        fb = bias_finding(rep, bc, l3)
+        items.append(("Bias", f"{fb['flag_text']} {fb['checked']}"))
     if rep.pending:
-        what = sorted({p["what"].split(" (")[0] for p in rep.pending})
-        eta = f" Expected {h(rep.args.pending_eta)}." if rep.args.pending_eta else ""
-        items.append(("Pending", f"Not in this report yet: {'; '.join(what)}.{eta}"))
+        what = list(dict.fromkeys(p.get("short") or p["what"] for p in rep.pending))
+        items.append(("Pending", f"Not in this report yet: {h('; '.join(what))}.{pending_eta(rep)}"))
     if rep.problems:
-        items.append(("Not computed", "; ".join(f"{n}: {m}" for n, m in rep.problems)))
+        items.append(("Not computed", h("; ".join(f"{n}: {m}" for n, m in rep.problems))))
     lis = "".join(f'<li><span class="topic">{h(t)}</span><p>{x}</p></li>' for t, x in items)
     kd = "".join(f"<div><dt>{h(a)}</dt><dd>{b}<small>{h(c)}</small></dd></div>" for a, b, c in keys)
-    floor = ("<p class=\"tcap\">p-values are two-sided Wilcoxon signed-rank tests. With n paired values the exact p "
-             "cannot fall below 2/2<sup>n</sup>: 0.002 for 10 datasets and 3.6×10<sup>−12</sup> for 39, while over 50 "
-             "or 195 folds it saturates further. At those floors read p as “every dataset (or fold) went the same "
-             "way”, not as a measure of effect size.</p>")  # fmt: skip
+    n_sh, n_all = len(rep.shared), len(rep.everything)
+    floors = ", ".join(f"{pval(2.0 / 2**k)} for {k} {what}" for k, what in ((n_sh, "datasets"), (n_all, "datasets"))
+                       if k)  # fmt: skip
+    floor = (f"<p class=\"tcap\">p-values are two-sided Wilcoxon signed-rank tests. With n paired values the exact p "
+             f"cannot fall below 2/2<sup>n</sup>: {floors}. p marked {APPROX} comes from the normal approximation, "
+             f"used for more than 50 values (the folds of all datasets) or for ties or zeros among 14–50, and can fall "
+             f"further. At those floors read p as “every dataset (or fold) went the same way”, not as a measure of "
+             f"effect size.</p>")  # fmt: skip
     return f"""
 <section id="summary">
   <div class="head"><p class="eyebrow">Summary</p><h2>What the comparison shows</h2></div>
@@ -2286,10 +2650,13 @@ def section_level1(rep: Report, n: Numbering, l1: dict | None) -> str:
     if l1.get("state") != "done":
         return f'<section id="level-1">{head}{pending_html(rep, "Level 1")}</section>'
     md, nf, nd = l1["measures"], l1["n_folds"], l1["n_datasets"]
+    fnd = l1_finding(l1)
+    gain = (" The gain is largest for the least and the most accessible peaks." if {1, 10} <= set(fnd["lower"])
+            else "")  # fmt: skip
     lead = (
-        f'<p class="lead">compare_chrombpnet.py scored both models on ChromBPNet\'s test peaks of each fold '
-        f"(about {count(l1['paired']['n_regions'].mean())} peaks per fold) with ChromBPNet's own measures. "
-        f"ChromBPNet is scored here as its evaluation scores it, with the full bias-included model. {nf} folds over "
+        f'<p class="lead">{fnd["headline"]}{gain} Both models were scored on ChromBPNet\'s test peaks of each fold '
+        f"({count(round(l1['paired']['n_regions'].mean()))} peaks per fold on average) with ChromBPNet's own measures; "
+        f"ChromBPNet is scored as its own evaluation scores it, with the full bias-included model. {nf} folds over "
         f"{nd} datasets; the {len(rep.shared)} shared datasets are the ones interpreted below.</p>"
     )
     a = md[md["set"] == "all"].set_index("measure")
@@ -2305,14 +2672,14 @@ def section_level1(rep: Report, n: Numbering, l1: dict | None) -> str:
                 diff_cell(r),
                 f"{int(r['cherimoya_better_folds'])}/{nf}",
                 f"{int(r['cherimoya_better_datasets'])}/{nd}",
-                pval(r["wilcoxon_datasets_p"]),
-                pval(r["wilcoxon_folds_p"]),
+                pval(r["wilcoxon_datasets_p"], r["wilcoxon_datasets_p_method"]),
+                pval(r["wilcoxon_folds_p"], r["wilcoxon_folds_p_method"]),
             ]
         )
     t1 = table_html(n, f"The five measures over all {nd} datasets. Medians over the {nf} folds; the difference is "
                     "Cherimoya minus ChromBPNet, as the median over datasets of each dataset's mean fold difference, "
-                    "with its bootstrap 95% CI. p from Wilcoxon signed-rank tests over the dataset means and over the "
-                    "folds.",
+                    f"with its bootstrap 95% CI. p from Wilcoxon signed-rank tests over the dataset means and over the "
+                    f"folds ({APPROX}: normal approximation).",
                     ["Measure", "Better", "ChromBPNet", "Cherimoya", "Difference [95% CI]", "Cherimoya better, folds",
                      "Cherimoya better, datasets", f"p, {nd} datasets", f"p, {nf} folds"], rows, left=2)  # fmt: skip
     sub_rows = []
@@ -2333,14 +2700,16 @@ def section_level1(rep: Report, n: Numbering, l1: dict | None) -> str:
                     diff_cell(r),
                     f"{int(r['cherimoya_better_folds'])}/{nfk}",
                     f"{int(r['cherimoya_better_datasets'])}/{ndk}",
-                    pval(r["wilcoxon_datasets_p"]),
+                    pval(r["wilcoxon_datasets_p"], r["wilcoxon_datasets_p_method"]),
+                    pval(r["wilcoxon_folds_p"], r["wilcoxon_folds_p_method"]),
                 ]
             )
     t2 = (
         table_html(
             n,
-            "The same for the shared datasets (the ones interpreted at levels 2-5) and for the others "
-            "apart. The shared-dataset numbers equal level 1's own statistics.tsv.",
+            f"The same measures for the {len(rep.shared)} shared datasets (interpreted at levels 2–5) and for the "
+            "other datasets, separately; Wilcoxon p over the dataset means and over the folds "
+            f"({APPROX}: normal approximation). The shared-dataset values match level 1's own statistics.",
             [
                 "Datasets",
                 "Measure",
@@ -2349,6 +2718,7 @@ def section_level1(rep: Report, n: Numbering, l1: dict | None) -> str:
                 "Cherimoya better, folds",
                 "Cherimoya better, datasets",
                 "p, datasets",
+                "p, folds",
             ],
             sub_rows,
             left=2,
@@ -2367,17 +2737,22 @@ def section_level1(rep: Report, n: Numbering, l1: dict | None) -> str:
             num(r["rmse_cherimoya_median"]),
             f'{num(r["rmse_diff_median"], 3, True)}<span class="sub">{ci(r["ci95_lo"], r["ci95_hi"], 3, True)}</span>',
             f"{int(r['cherimoya_lower_rmse_datasets'])}/{int(r['n_datasets'])}",
-            pval(r["wilcoxon_p"]),
+            pval(r["wilcoxon_p"], r["wilcoxon_p_method"]),
             num(r["mean_residual_chrombpnet_median"], 2, True),
             num(r["mean_residual_cherimoya_median"], 2, True),
         ]
         for _, r in r_all.iterrows()
     ]
+    below = [int(x) for x in r_all[r_all["mean_residual_cherimoya_median"]
+                                   < r_all["mean_residual_chrombpnet_median"]]["decile"]]  # fmt: skip
     t3 = table_html(
         n,
         "Residuals by decile of observed log(1 + counts), each dataset's test peaks of all folds pooled. "
-        "Medians over datasets; the RMSE difference is Cherimoya minus ChromBPNet (below 0: Cherimoya "
-        "closer), with its bootstrap CI and the Wilcoxon p over datasets.",
+        "Medians over datasets. The RMSE difference is the median over datasets of each dataset's difference, "
+        "Cherimoya minus ChromBPNet (below 0: Cherimoya closer), so it is not the difference of the two RMSE "
+        "columns; with its bootstrap CI and the Wilcoxon p over datasets. The mean residual is predicted minus "
+        "observed log counts"
+        + (f": Cherimoya's sits below ChromBPNet's in deciles {ranges(below)}." if below else "."),
         [
             "Decile",
             "Observed mean",
@@ -2395,7 +2770,7 @@ def section_level1(rep: Report, n: Numbering, l1: dict | None) -> str:
     drows = [
         [
             h(rep.labels.get(r["dataset"], r["dataset"])),
-            "shared" if r["shared"] else "",
+            "shared" if r["shared"] else "other",
             f"{int(r['n_folds'])}",
             num(r["counts_pearson_chrombpnet"]),
             num(r["counts_pearson_cherimoya"]),
@@ -2415,7 +2790,8 @@ def section_level1(rep: Report, n: Numbering, l1: dict | None) -> str:
         rep,
         n,
         "level1_scatter",
-        "Each dot is one test fold (dataset × fold); filled dots are the "
+        "One panel each for counts Pearson r, counts MSE (log counts) and profile median JSD; x: ChromBPNet, "
+        "y: Cherimoya. Each dot is one test fold (dataset × fold); filled dots are the "
         f"{len(rep.shared)} shared datasets, open dots the others. Above the diagonal Cherimoya's value is "
         "higher; for MSE and JSD lower is better, so Cherimoya is better below it.",
     )
@@ -2425,7 +2801,8 @@ def section_level1(rep: Report, n: Numbering, l1: dict | None) -> str:
         "level1_residuals",
         "Left: mean residual (predicted minus observed log counts) of each "
         "model by decile of observed counts, median over datasets with the interquartile range. Right: the "
-        "RMSE difference per dataset (grey) and its median over datasets with the bootstrap 95% CI.",
+        "RMSE difference, Cherimoya minus ChromBPNet (below 0: Cherimoya closer), per dataset (grey) and its "
+        "median over datasets with the bootstrap 95% CI.",
     )
     return f"""
 <section id="level-1">
@@ -2439,6 +2816,19 @@ def section_level1(rep: Report, n: Numbering, l1: dict | None) -> str:
   {t3}
   {details(f"Per dataset ({len(pd_)} datasets)", t4)}
 </section>"""
+
+
+def float16_split(f16) -> dict:
+    """The float16 check's medians: those that read Cherimoya's per-fold attribution files (fold_<k>, loo_cherimoya_<k>,
+    heldout_cross: these can move) and the others (the fold averages and ChromBPNet's leave-one-out: these cannot)."""
+    read = f16["comparison"].astype(str).str.match(r"^(fold_|loo_cherimoya_|heldout_cross)")
+    diff = f16["median_diff"].abs()
+    return {
+        "n_read": int(read.sum()),
+        "max_read": float(diff[read].max()) if read.any() else NAN,
+        "n_other": int((~read).sum()),
+        "max_other": float(diff[~read].max()) if (~read).any() else NAN,
+    }
 
 
 def l2_cell(rep: Report, w: str, m: str, quantity: str, d: int = 3) -> str:
@@ -2456,21 +2846,25 @@ def section_level2(rep: Report, n: Numbering, l2: dict | None) -> str:
     if l2.get("state") != "done":
         return f'<section id="level-2">{head}{pending_html(rep, "Level 2")}</section>'
     joins = l2["joins"]
-    lead = (f"<p class=\"lead\">The counts-head DeepLIFT/SHAP scores of both models on every peak both attributed "
-            f"({count(joins['compared_peaks'].min())}–{count(joins['compared_peaks'].max())} per dataset), joined by "
-            "peak name. The projected score (the hypothetical score of the base present) is compared per peak within "
-            "250 bp and 500 bp of the summit. <b>A</b> compares the two models fold by fold, <b>B</b> their fold "
-            "averages, <b>C</b> each model's fold against the mean of its other four folds (the ceiling), <b>D</b> "
-            "agreement on the fold that held the peak's chromosome out.</p>")  # fmt: skip
+    fnd = l2_finding(rep, l2)
+    wins = " and ".join(window_name(x) for x in l2["windows"])
+    lead = (f"<p class=\"lead\">{fnd['lead'] + ' ' if fnd else ''}The counts-head DeepLIFT/SHAP scores of both models "
+            f"on every peak both attributed ({count(joins['compared_peaks'].min())}–"
+            f"{count(joins['compared_peaks'].max())} per dataset) are joined by peak name, and the projected score "
+            f"(the hypothetical score of the base present) is compared per peak in the {wins}. <b>A</b> compares "
+            "the two models fold by fold, <b>B</b> their fold averages, <b>C</b> each model's fold against the mean "
+            "of its other four folds (the ceiling), and <b>D</b> looks at the fold that held the peak's chromosome "
+            "out: the two models there (cross-model), and each model's fold against the mean of its other four there "
+            "(per model).</p>")  # fmt: skip
     blocks = []
     for wi, w in enumerate(l2["windows"]):
         rows = []
         for name in ("cross_fold", "cross_average", "loo_chrombpnet", "loo_cherimoya", "cross_heldout",
                      "heldout_chrombpnet", "heldout_cherimoya"):  # fmt: skip
             rows.append([h(QUANTITY_NAMES[name])] + [l2_cell(rep, w, m, name) for m in L2_METRICS])
-        t_levels = table_html(n, f"Agreement within {int(w[1:]) // 2} bp of the summit ({w[1:]}-bp window): the median "
-                              f"over datasets [bootstrap 95% CI] of each dataset's median over peaks (Jaccard: mean "
-                              f"over peaks).", ["Quantity"] + [METRIC_NAMES[m] for m in L2_METRICS], rows)  # fmt: skip
+        t_levels = table_html(n, f"Agreement in the {window_name(w)}: the median over datasets [bootstrap 95% CI] of "
+                              f"each dataset's median over peaks (Jaccard: mean over peaks).",
+                              ["Quantity"] + [METRIC_NAMES[m] for m in L2_METRICS], rows)  # fmt: skip
         trows = []
         for x, y, label in (
             ("cross_fold", "loo_chrombpnet", "A − ChromBPNet ceiling"),
@@ -2488,32 +2882,36 @@ def section_level2(rep: Report, n: Numbering, l2: dict | None) -> str:
             cells = [test_cell(s(rep, "2", f"attributions, {w}, {m}", f"cross_fold - loo_{model}", "folds"), 4)
                      if m != "jaccard_mean" else "—" for m in L2_METRICS]  # fmt: skip
             trows.append([h(f"A − {NAMES[model]} ceiling, over the dataset × fold pairs")] + cells)
-        t_tests = table_html(n, f"Paired differences ({w[1:]}-bp window), each over the datasets: the median "
-                             "difference, its bootstrap 95% CI, how many datasets were above 0, and the Wilcoxon p.",
-                             ["Contrast"] + [METRIC_NAMES[m] for m in L2_METRICS], trows)  # fmt: skip
+        t_tests = table_html(n, f"Paired differences in the {window_name(w)}: the median difference over the "
+                             f"{len(l2['datasets'])} datasets, its bootstrap 95% CI, how many datasets were above 0, "
+                             f"and the Wilcoxon p. The last two rows are over the dataset × fold pairs instead (the CI "
+                             f"resamples datasets with their folds; {APPROX}: normal approximation); — : not computed "
+                             f"for the mean Jaccard.", ["Contrast"] + [METRIC_NAMES[m] for m in L2_METRICS],
+                             trows)  # fmt: skip
         if wi == 0:
             blocks.append(
                 figure_html(
                     rep,
                     n,
                     "level2_agreement",
-                    f"Agreement within {int(w[1:]) // 2} bp of the "
-                    "summit. Dots are datasets (cross-model quantities in ink, each model's ceiling in "
-                    "its colour); bars are medians over datasets, the thin line beside each its "
-                    "bootstrap 95% CI. Top-50 Jaccard uses per-peak means, since its medians take "
-                    "only a few values (k/(100 − k)).",
+                    f"Agreement in the {window_name(w)}. One panel per metric (Pearson r, Spearman ρ, "
+                    "cosine, top-50 Jaccard); x: the comparisons A–D; y: each dataset's median over peaks "
+                    "(Jaccard: mean, since its medians take only a few values, k/(100 − k)). Dots are datasets "
+                    "(cross-model quantities in ink, each model's ceiling in its colour); bars are medians over "
+                    "datasets, the thin line beside each its bootstrap 95% CI.",
                 )
                 + t_levels
                 + t_tests
             )
         else:
-            blocks.append(details(f"The same at {w[1:]} bp", t_levels + t_tests))
+            blocks.append(details(f"The same in the {window_name(w)}", t_levels + t_tests))
     w = l2["windows"][0]
     st = l2["strata"]
     srows = []
-    for stratum, levels, label in (("signal_decile", ("1", "5", "10"), "signalValue decile"),
+    role_label = {"train": "training", "valid": "validation", "test": "test"}
+    for stratum, levels, label in (("signal_decile", ("1", "5", "10"), "Peak signal (narrowPeak signalValue) decile"),
                                    ("gc_decile", ("1", "5", "10"), "GC decile"),
-                                   ("role", ("train", "valid", "test"), "chromosome's role in the fold")):  # fmt: skip
+                                   ("role", ("train", "valid", "test"), "Chromosome in the fold's")):  # fmt: skip
         for lev in levels:
             cells = []
             for name in ("cross_fold", "cross_average", "loo_chrombpnet", "loo_cherimoya"):
@@ -2525,11 +2923,12 @@ def section_level2(rep: Report, n: Numbering, l2: dict | None) -> str:
                     if len(r)
                     else "—"
                 )
-            srows.append([h(f"{label} {lev}")] + cells)
+            srows.append([h(f"{label} {role_label[lev]} set" if stratum == "role" else f"{label} {lev}")] + cells)
     t_strata = table_html(
         n,
-        f"Pearson r by stratum ({w[1:]}-bp window), median over datasets [95% CI]. Deciles are "
-        "taken over each dataset's joined peaks; B has no role stratum (fold averages have no "
+        f"Pearson r by stratum in the {window_name(w)}, median over datasets [95% CI]. Deciles are "
+        "taken over each dataset's joined peaks; the GC decile is of the GC content of the "
+        f"{window_name(l2['windows'][-1], full=False)}. B has no role stratum (fold averages have no "
         "held-out chromosomes).",
         ["Stratum", "A same fold", "B fold averages", "C ChromBPNet", "C Cherimoya"],
         srows,
@@ -2549,13 +2948,13 @@ def section_level2(rep: Report, n: Numbering, l2: dict | None) -> str:
         strata_text = (
             f"<p>Agreement rises with peak strength. On fold averages (B), Pearson r is "
             f"{num(abs(sig['estimate']), 3)} {'higher' if sig['estimate'] > 0 else 'lower'} in the top "
-            f"signalValue decile than in the bottom one ({int(sig['higher'])}/{int(sig['n'])} datasets, p "
-            f"{pval(sig['p'])}); both ceilings move with it, and B stays within {num(gap, 3)} of the higher "
+            f"peak-signal decile than in the bottom one ({ds_counts(sig)}, p {pval(sig['p'], sig['p_method'])}); "
+            f"both ceilings move with it, and B stays within {num(gap, 3)} of the higher "
             f"ceiling in every decile. Single folds (A) change most, from "
             f"{num(stv('signal_decile', '1', 'cross_fold'))} to {num(stv('signal_decile', '10', 'cross_fold'))}. "
             f"Agreement {'falls' if gc['estimate'] < 0 else 'rises'} with GC content: B is "
             f"{num(abs(gc['estimate']), 3)} {'lower' if gc['estimate'] < 0 else 'higher'} in the most GC-rich "
-            f"decile than in the least (p {pval(gc['p'])}), and there the ceilings part: ChromBPNet "
+            f"decile than in the least (p {pval(gc['p'], gc['p_method'])}), and there the ceilings part: ChromBPNet "
             f"{num(stv('gc_decile', '10', 'loo_chrombpnet'))}, Cherimoya "
             f"{num(stv('gc_decile', '10', 'loo_cherimoya'))}.</p>"
         )
@@ -2575,7 +2974,7 @@ def section_level2(rep: Report, n: Numbering, l2: dict | None) -> str:
         )
     t_mag = table_html(
         n,
-        f"Attribution magnitude per model ({w[1:]}-bp window): medians over datasets [95% CI] of each "
+        f"Attribution magnitude per model in the {window_name(w)}: medians over datasets [95% CI] of each "
         "dataset's median per peak. The two models' scales differ, so the columns describe each model; "
         "the last column shows how much averaging four folds shrinks the norm (fold-to-fold noise).",
         [
@@ -2592,10 +2991,15 @@ def section_level2(rep: Report, n: Numbering, l2: dict | None) -> str:
     f16_text = ""
     if f16 is not None and len(f16):
         ds16 = sorted(set(f16["dataset"]))
+        fx = float16_split(f16)
         f16_text = (
             f"<p>Float16 check on {h(', '.join(rep.labels.get(x, x) for x in ds16))}: computed again from "
-            f"Cherimoya's float16 h5 instead of its float32 npz, the {len(f16)} medians of this level move by at "
-            f"most {num(f16['median_diff'].abs().max(), 6)}.</p>"
+            f"Cherimoya's float16 attribution files instead of its float32 ones, the {fx['n_read']} per-fold medians "
+            f"that read them (cross-model per fold and on the held-out fold, and Cherimoya's leave-one-out ceiling; "
+            f"both windows, four metrics) move by at most {num(fx['max_read'], 6)}. The other {fx['n_other']} "
+            f"medians of the check (the fold averages, which come from float16 in both runs, and ChromBPNet's "
+            f"ceiling) do not read them; the per-model held-out medians and the magnitudes were not computed "
+            f"again.</p>"
         )
     return f"""
 <section id="level-2">
@@ -2608,9 +3012,10 @@ def section_level2(rep: Report, n: Numbering, l2: dict | None) -> str:
             rep,
             n,
             "level2_strata",
-            "Pearson r of the projected scores by decile of peak signal (left) and of GC "
-            "content (right): medians over datasets with bootstrap 95% CIs. The dashed line is A (single folds), "
-            "the solid ink line B (fold averages).",
+            f"Pearson r of the projected scores in the {window_name(w)}, by decile of peak signal (left) "
+            f"and of the GC content of the {window_name(l2['windows'][-1], full=False)} (right): medians over "
+            "datasets with bootstrap 95% CIs. The dashed line is A (single folds), the solid ink line B (fold "
+            "averages), the blue and vermillion lines the ceilings (C) of ChromBPNet and Cherimoya.",
         )
     }
   {strata_text}
@@ -2634,13 +3039,15 @@ def section_level3(rep: Report, n: Numbering, l3: dict | None) -> str:
     if l3.get("state") != "done":
         return f'<section id="level-3">{head}{pending_html(rep, "Level 3")}</section>'
     per = l3["per"]
+    fnd = l3_finding(rep)
     lead = (
-        '<p class="lead">Both models ran the same TF-MoDISco (08.0, 500-bp window, same flags) on their '
-        "fold-average attributions, and the same QC-scale run (window 400, 5,000 seqlets) on each fold's 30K-peak "
-        "subsample. A fold-average pattern is matched when the joint compendium puts a pattern of the other "
-        "model's same dataset in its cluster (the primary rule), or when tomtom-lite finds it a partner among the "
-        "other model's patterns at q ≤ 0.05 with the MotifCompendium database as decoys (secondary). Seqlets are "
-        "placed in the genome through each model's own bed and count as shared at ≥ 50% reciprocal overlap.</p>"
+        f'<p class="lead">{fnd["lead"] + " " if fnd else ""}Both models ran the same TF-MoDISco (the same settings, '
+        "500-bp window) on their fold-average attributions, and the same QC-scale run (window 400, 5,000 seqlets) "
+        "on each fold's 30K-peak subsample. A fold-average pattern is matched when the joint compendium puts a "
+        "pattern of the other model's same dataset in its cluster (the primary rule), or when tomtom-lite finds it a "
+        "partner among the other model's patterns at q ≤ 0.05 with the MotifCompendium database as decoys "
+        "(secondary). Seqlets are placed in the genome through each model's own peak file and count as shared at "
+        "≥ 50% reciprocal overlap.</p>"
     )
     fam_m, fam_d = "TF-MoDISco, per model", "TF-MoDISco, Cherimoya - ChromBPNet"
 
@@ -2680,7 +3087,9 @@ def section_level3(rep: Report, n: Numbering, l3: dict | None) -> str:
     )
     unm = {m: totals[m] for m in MODELS}
     unmatched_text = (f"<p>By the cluster rule, {int(unm['chrombpnet']['cluster_unmatched'].sum())} ChromBPNet and "
-                      f"{int(unm['cherimoya']['cluster_unmatched'].sum())} Cherimoya patterns are unmatched, but "
+                      f"{int(unm['cherimoya']['cluster_unmatched'].sum())} Cherimoya fold-average patterns are "
+                      "unmatched (the bias control below checks these "
+                      f"{int(unm['cherimoya']['cluster_unmatched'].sum())} Cherimoya patterns), but "
                       f"{int(unm['chrombpnet']['cluster_unmatched_with_tomtom'].sum())} and "
                       f"{int(unm['cherimoya']['cluster_unmatched_with_tomtom'].sum())} of them still have a tomtom "
                       f"partner; by tomtom only {int(unm['chrombpnet']['tomtom_unmatched'].sum())} and "
@@ -2693,16 +3102,20 @@ def section_level3(rep: Report, n: Numbering, l3: dict | None) -> str:
     for m in MODELS:
         qrows.append([key(m), est_ci(s(rep, "3", fam_m, f"{NAMES[m]}: qc_cross")),
                       est_ci(s(rep, "3", fam_m, f"{NAMES[m]}: qc_within")),
-                      test_cell(s(rep, "3", famq, f"QC: {m} patterns matched across models - within {m} (ceiling)")),
+                      test_cell(s(rep, "3", famq, f"QC: {m} patterns matched across models - within {m} (ceiling)"),
+                                4),
                       test_cell(s(rep, "3", famq, f"QC: {m} patterns matched across models - within {m}, per fold",
-                                  "folds")),
+                                  "folds"), 4),
                       est_ci(s(rep, "3", fam_m, f"{NAMES[m]}: qc_seqlet_overlap")),
                       est_ci(s(rep, "3", fam_m, f"{NAMES[m]}: qc_patterns_per_fold"), 1)])  # fmt: skip
     t2 = table_html(n, "QC scale (each fold's 30K-peak subsample): the share of a fold's patterns matched by tomtom in "
                     "the other model's same fold, against the model's own fold-to-fold matching (every pair of its "
-                    "folds; the ceiling). Medians over datasets [95% CI]; the differences are over the 10 datasets "
-                    "and over the 50 folds (that CI resamples datasets with their folds). Seqlet overlap has no "
-                    "ceiling, because the subsamples differ between folds.",
+                    "folds; the ceiling). The comparison favours the cross-model match: both models' runs of a fold "
+                    "use the same subsample, while the ceiling compares folds whose subsamples differ. Medians over "
+                    f"datasets [95% CI]; the differences are over the {len(l3['datasets'])} datasets and over the "
+                    "dataset × fold pairs (that CI resamples datasets with their folds; "
+                    f"{APPROX}: normal approximation). Seqlet overlap has no ceiling, because the subsamples differ "
+                    "between folds.",
                     ["Model", "Across the models", "Fold to fold (ceiling)", "Across − ceiling, datasets",
                      "Across − ceiling, folds", "Seqlets overlapped across", "Patterns per fold"], qrows)  # fmt: skip
     return f"""
@@ -2726,11 +3139,12 @@ def section_level3(rep: Report, n: Numbering, l3: dict | None) -> str:
   {unmatched_text}
   {t2}
   <p>The fold-average scale has no ceiling (one fold average per model), so cross-model matching there can only be
-  read against the QC-scale ceiling. The bias control (level 3c) follows the hits, in its own section below.</p>
+  read against the QC-scale ceiling, which is itself tilted towards the cross-model match. The bias control (level 3c)
+  follows the hits, in its own section below.</p>
 </section>"""
 
 
-def section_level4(rep: Report, n: Numbering, l4: dict | None) -> str:
+def section_level4(rep: Report, n: Numbering, l4: dict | None, l5: dict | None = None) -> str:
     head = '<div class="head"><p class="eyebrow">Level 4</p><h2>Motif compendia</h2></div>'
     if l4 is None:
         return f'<section id="level-4">{head}{problem_html(rep, "Level 4")}{pending_html(rep, "Level 4")}</section>'
@@ -2738,11 +3152,13 @@ def section_level4(rep: Report, n: Numbering, l4: dict | None) -> str:
         return f'<section id="level-4">{head}{pending_html(rep, "Level 4")}</section>'
     tags, lfl = l4["tags"], l4["lfl"]
     ag, bs = l4["agreement"], l4["by_sign"]
-    lead = (f"<p class=\"lead\">09.0 (MotifCompendium) clustered each model's fold-average patterns of the "
-            f"{len(rep.shared)} shared datasets into a compendium per model ({h(tags['cbp'])}, {h(tags['cheri'])}) and "
-            f"both models' patterns together into a joint one ({h(tags['joint'])}, threshold 0.95). Like-for-like "
-            "clusters are paired by reciprocal best tomtom-lite match of their CWMs; every cluster has some best match "
-            "at q ≤ 0.05 (there are no decoys), so only the reciprocal pairs say something.</p>")  # fmt: skip
+    fnd = l4_finding(rep, l4, l5)
+    lead = (f"<p class=\"lead\">{fnd['lead'] + ' ' if fnd else ''}MotifCompendium clustered each model's fold-average "
+            f"patterns of the {len(rep.shared)} shared datasets into a compendium per model ({h(tags['cbp'])}, "
+            f"{h(tags['cheri'])}) and both models' patterns together into a joint one ({h(tags['joint'])}, threshold "
+            "0.95). Like-for-like clusters are paired by reciprocal best tomtom-lite match of their CWMs; every "
+            "cluster has some best match at q ≤ 0.05 (there are no decoys), so only the reciprocal pairs say "
+            "something.</p>")  # fmt: skip
     cl = lfl.get("clusters", {})
     ann, fam = lfl.get("annotations", {}), lfl.get("families", {})
 
@@ -2750,17 +3166,17 @@ def section_level4(rep: Report, n: Numbering, l4: dict | None) -> str:
         return count(len(v)) if isinstance(v, list | tuple | set) else count(v)
 
     n_recip = int(lfl.get("matched", {}).get("reciprocal_pairs", sum(ag.values())))
-    rows = [["Clusters", count(cl.get("cbp")), count(cl.get("cheri"))],
-            ["Reciprocal best pairs", f"{n_recip} ({bs.get('pos', 0)} positive, {bs.get('neg', 0)} negative)", ""],
-            ["… with the same annotation", count(ag.get("same annotation", 0)), ""],
-            ["… with different annotations", count(ag.get("different annotation", 0)), ""],
-            ["… with an unannotated side", count(ag.get("unannotated", 0)), ""],
+    rows = [["Clusters (ChromBPNet / Cherimoya)", f"{count(cl.get('cbp'))} / {count(cl.get('cheri'))}"],
+            ["Reciprocal best pairs", f"{n_recip} ({bs.get('pos', 0)} positive, {bs.get('neg', 0)} negative)"],
+            ["… with the same annotation", count(ag.get("same annotation", 0))],
+            ["… with different annotations", count(ag.get("different annotation", 0))],
+            ["… with an unannotated side", count(ag.get("unannotated", 0))],
             ["Annotations (shared / ChromBPNet only / Cherimoya only)",
-             f"{size(ann.get('shared'))} / {size(ann.get('only_a'))} / {size(ann.get('only_b'))}",
-             f"Jaccard {num(ann.get('jaccard'))}"],
+             f"{size(ann.get('shared'))} / {size(ann.get('only_a'))} / {size(ann.get('only_b'))} (Jaccard "
+             f"{num(ann.get('jaccard'))})"],
             ["TF families (shared / ChromBPNet only / Cherimoya only)",
-             f"{size(fam.get('shared'))} / {size(fam.get('only_a'))} / {size(fam.get('only_b'))}",
-             f"Jaccard {num(fam.get('jaccard'))}"]]  # fmt: skip
+             f"{size(fam.get('shared'))} / {size(fam.get('only_a'))} / {size(fam.get('only_b'))} (Jaccard "
+             f"{num(fam.get('jaccard'))})"]]  # fmt: skip
     only = ""
     if isinstance(ann.get("only_a"), list) and isinstance(ann.get("only_b"), list):
         only = details("Annotations of one model's compendium only",
@@ -2769,7 +3185,7 @@ def section_level4(rep: Report, n: Numbering, l4: dict | None) -> str:
     t1 = table_html(n, f"Like for like: {h(tags['cbp'])} (ChromBPNet) against {h(tags['cheri'])} (Cherimoya). "
                     "Annotations are each cluster's most frequent MotifCompendium annotation of score ≥ 0.7; a family "
                     "is the annotation without its _&lt;n&gt; suffix.",
-                    ["", h(tags["cbp"]), h(tags["cheri"])], [[h(r[0])] + r[1:] for r in rows])  # fmt: skip
+                    ["", "Value"], [[h(r[0])] + r[1:] for r in rows])  # fmt: skip
     c = l4["classes"]
     crow = []
     for _, r in c.iterrows():
@@ -2870,12 +3286,13 @@ def section_level5(rep: Report, n: Numbering, l5: dict | None) -> str:
     if l5.get("state") != "done":
         return f'<section id="level-5">{head}{pending_html(rep, "Level 5")}</section>'
     tot = l5["totals"]
-    lead = ("<p class=\"lead\">Both models' fold-average attributions were scanned by Fi-NeMo (10.0) with the same "
-            "vocabulary, the joint compendium (the same compiled h5 for both). Only peaks both beds hold are "
-            "compared. A hit is matched when the other model has a hit of the same motif on the same strand with its "
-            "centre within 5 bp (0 and 10 bp are also reported). Precision is the share of Cherimoya's hits matched; "
-            "recall the share of ChromBPNet's hits matched. There is no within-model ceiling here: Fi-NeMo ran on "
-            "fold averages only.</p>")  # fmt: skip
+    fnd = l5_finding(rep)
+    lead = (f"<p class=\"lead\">{fnd['lead'] + ' ' if fnd else ''}Both models' fold-average attributions were scanned "
+            "by Fi-NeMo with the same vocabulary, the joint compendium (the same compiled motif file for both). Only "
+            "peaks both models' peak files hold are compared. A hit is matched when the other model has a hit of the "
+            "same motif on the same strand with its centre within 5 bp (0 and 10 bp are also reported). Precision is "
+            "the share of Cherimoya's hits matched; recall the share of ChromBPNet's hits matched. There is no "
+            "within-model ceiling here: Fi-NeMo ran on fold averages only.</p>")  # fmt: skip
     fam = "Fi-NeMo hits, joint vocabulary"
     rows = [[key(m), count(tot[f"hits_{m}"].sum()), est_ci(s(rep, "5", fam, f"{NAMES[m]}: hits per shared peak"), 2)]
             for m in MODELS]  # fmt: skip
@@ -2924,10 +3341,10 @@ def section_level5(rep: Report, n: Numbering, l5: dict | None) -> str:
                 est_ci(s(rep, "5", f, "motif_median_coefficient_spearman")),
             ]
         )
-    t3 = table_html(n, "By the class of the motif's joint cluster and by its sign (from joint_clusters.tsv, not the "
-                    "motif's name prefix): the share of each model's hits, precision and recall at 5 bp pooled over "
-                    "the class's hits, and the per-motif medians of the peak-set Jaccard and of the coefficient "
-                    "Spearman correlation. Medians over datasets [95% CI].",
+    t3 = table_html(n, "By the class of the motif's joint cluster and by its sign (from the joint compendium's cluster "
+                    "table, not the motif's name prefix): the share of each model's hits, precision and recall at "
+                    "5 bp pooled over the class's hits, and the per-motif medians of the peak-set Jaccard and of the "
+                    "coefficient Spearman correlation. Medians over datasets [95% CI].",
                     ["Motifs of", "Share of ChromBPNet's hits", "Share of Cherimoya's hits", "Precision", "Recall",
                      "Peak Jaccard, per motif", "Coefficient ρ, per motif"], crow)  # fmt: skip
     cc = [s(rep, "5", "Fi-NeMo hits, by cluster class", q) for q in (
@@ -2937,11 +3354,12 @@ def section_level5(rep: Report, n: Numbering, l5: dict | None) -> str:
     if all(cc):
         class_text = (
             f"<p>Cherimoya puts a {num(cc[0]['estimate'], 3)} larger share of its hits on Cherimoya-only motifs "
-            f"than ChromBPNet does ({int(cc[0]['higher'])}/{int(cc[0]['n'])} datasets, p {pval(cc[0]['p'])}), "
+            f"than ChromBPNet does ({int(cc[0]['higher'])}/{int(cc[0]['n'])} datasets, p "
+            f"{pval(cc[0]['p'], cc[0]['p_method'])}), "
             f"and those hits are the ones ChromBPNet reproduces least: precision is "
             f"{num(abs(cc[1]['estimate']), 3)} {'lower' if cc[1]['estimate'] > 0 else 'higher'} on "
             f"Cherimoya-only motifs than on motifs of both models ({int(cc[1]['higher'])}/{int(cc[1]['n'])} "
-            f"datasets, p {pval(cc[1]['p'])}).</p>"
+            f"datasets, p {pval(cc[1]['p'], cc[1]['p_method'])}).</p>"
         )
     top = l5["top"].head(8)
     trow = [
@@ -2981,7 +3399,7 @@ def section_level5(rep: Report, n: Numbering, l5: dict | None) -> str:
             for m in MODELS
         ]
         dd = s(rep, "5", fr, "per-motif hit-seqlet CWM similarity: Cherimoya - ChromBPNet (median per dataset)")
-        t5 = table_html(n, "11.0's motif reports side by side: the cosine similarity of the hits' mean contribution "
+        t5 = table_html(n, "Fi-NeMo's motif reports side by side: the cosine similarity of the hits' mean contribution "
                         "scores to the seqlets' (per motif, median over motifs with a value for both models), and the "
                         "share of hits inside TF-MoDISco's input regions. Medians over datasets [95% CI]. Cherimoya − "
                         f"ChromBPNet in CWM similarity: {test_cell(dd)}.",
@@ -3001,7 +3419,8 @@ def section_level5(rep: Report, n: Numbering, l5: dict | None) -> str:
         ]
         prod_html = table_html(
             n,
-            "Production hits (cbp10 against cheri39, through level 4's reciprocal cluster pairs).",
+            f"Production hits: ChromBPNet's on its {len(rep.shared)}-dataset compendium against Cherimoya's on its "
+            f"{len(rep.everything)}-dataset compendium, through level 4's reciprocal cluster pairs.",
             ["Dataset", "ChromBPNet hits", "Cherimoya hits", "Precision 5 bp", "Recall 5 bp"],
             prows,
         )
@@ -3020,9 +3439,9 @@ def section_level5(rep: Report, n: Numbering, l5: dict | None) -> str:
             "Left: per dataset (dots), the share of Cherimoya's hits matched by ChromBPNet "
             "(precision, vermillion) and of ChromBPNet's hits matched by Cherimoya (recall, blue), over all motifs "
             "and by the class of the motif's joint cluster; bars are medians, thin lines bootstrap 95% CIs. Right: "
-            "hits per 10,000 shared peaks of each motif, mean over datasets, on log axes, coloured by whose patterns "
-            "its cluster holds; the three motifs with the most hits are numbered, and motifs without hits for a "
-            "model sit at 0.01.",
+            "each motif's hits per 10,000 shared peaks, mean over datasets (x: ChromBPNet, y: Cherimoya, log axes), "
+            "coloured by whose patterns its cluster holds; the three motifs with the most hits are numbered, and "
+            "motifs without hits for a model sit at 0.01.",
         )
     }
   {t1}
@@ -3038,24 +3457,40 @@ def section_level5(rep: Report, n: Numbering, l5: dict | None) -> str:
 </section>"""
 
 
+def control_sentence(rep: Report, bc: dict) -> str:
+    """The controls used, in one sentence for the lead ('' when none was used)."""
+    used = [c for c in bc["controls"] if c["state"] == "done"]
+    if not used:
+        return ""
+    ref = bc.get("reference")
+    names = {f"bias_control/{c['name']}" for c in used}
+    n_pat = int(ref["reference"].isin(names).sum()) if ref is not None and not ref.empty else 0
+    parts = [
+        f"the {h(c['head'])} head of ChromBPNet's bias-included model on "
+        f"{h(rep.labels.get(c.get('dataset'), c.get('dataset')))} fold {h(c.get('fold'))}"
+        for c in used
+    ]
+    heads = sorted({h(c["head"]) for c in bc["controls"] if c["state"] != "done"})
+    return (
+        f" The control attributes {' and '.join(parts)} with DeepSHAP, runs TF-MoDISco on it"
+        + (f" ({n_pat} patterns)" if n_pat else "")
+        + " and asks which of Cherimoya's unmatched patterns it also finds"
+        + (f"; DeepSHAP cannot attribute that model's {' or '.join(heads)} head (see Methods)." if heads else ".")
+    )
+
+
 def section_bias(rep: Report, n: Numbering, bc: dict | None, l3: dict | None, l4: dict | None) -> str:
     head = '<div class="head"><p class="eyebrow">Level 3c</p><h2>Bias control</h2></div>'
     if bc is None:
         return f'<section id="bias-control">{head}{problem_html(rep, "Bias control")}</section>'
     if bc.get("state") != "done":
         return f'<section id="bias-control">{head}<p>No bias control has been compared yet.</p></section>'
-    lead = ("<p class=\"lead\">ChromBPNet's attributions come from its bias-corrected model, while Cherimoya has no "
-            "bias model, so Tn5 or DNase I sequence preference can surface as motifs on Cherimoya's side only. Two "
-            "checks: the motif-database flag of level 3 (a pattern whose best match in chrombpnet's motifs.meme is a "
-            "TN5_ or DNASE_ entry at q ≤ 0.05), and a control that attributes ChromBPNet's bias-included model and "
-            "asks which of Cherimoya's unmatched patterns it also finds.</p>")  # fmt: skip
-    ctrl = []
-    for c in bc["controls"]:
-        state = "done" if c["state"] == "done" else "problem"
-        what = (f"<p><b>{h(c['name'])}</b>: {h(c['head'])} head of the bias-included model, "
-                f"{h(rep.labels.get(c.get('dataset'), c.get('dataset')))} fold {h(c.get('fold'))}"
-                + (f" — {h(c['reason'])}" if c.get("reason") else "") + "</p>")  # fmt: skip
-        ctrl.append(note_html(state, "Used" if state == "done" else "Refused", what))
+    fnd = bias_finding(rep, bc, l3) if l3 else None
+    lead = (f"<p class=\"lead\">{fnd['lead'] + ' ' if fnd else ''}ChromBPNet's attributions come from its "
+            "bias-corrected model; without a bias model, Cherimoya can learn Tn5 or DNase I sequence preference that "
+            "ChromBPNet's bias model absorbs. Two checks: the motif-database flag of level 3 (a pattern whose best "
+            "match in ChromBPNet's motif database, motifs.meme, is a TN5_ or DNASE_ entry at q ≤ 0.05), and a "
+            f"control.{control_sentence(rep, bc)}</p>")  # fmt: skip
     per = l3["per"] if l3 else None
     t1 = ""
     if per is not None:
@@ -3078,13 +3513,13 @@ def section_bias(rep: Report, n: Numbering, bc: dict | None, l3: dict | None, l4
             cc = l4["classes"]
             c95 = cc[cc["threshold"] == "0.95"].set_index("class")
             if "bias_clusters" in c95:
-                jt = (
-                    f" In the joint compendium, {int(c95.loc['cherimoya_only', 'bias_clusters'])} Cherimoya-only, "
-                    f"{int(c95.loc['chrombpnet_only', 'bias_clusters'])} ChromBPNet-only and "
-                    f"{int(c95.loc['shared', 'bias_clusters'])} shared clusters are mostly flagged patterns."
-                )
+                b = {k: int(c95.loc[k, "bias_clusters"]) for k in CLASSES}
+                jt = (f" In the joint compendium, {b['cherimoya_only']} Cherimoya-only, {b['chrombpnet_only']} "
+                      f"ChromBPNet-only and {b['shared']} shared cluster{'s' if b['shared'] != 1 else ''} have at "
+                      "least half of their patterns flagged.")  # fmt: skip
         t1 = table_html(n, "Patterns flagged as Tn5/DNase by the motif database, summed over the datasets. Cherimoya − "
-                        f"ChromBPNet per dataset: {test_cell(t, 1)}; per QC fold: {test_cell(tq, 1)}.{jt}",
+                        f"ChromBPNet per dataset: {test_cell(t, 1)}; per QC fold (dataset × fold): {test_cell(tq, 1)} "
+                        f"({APPROX}: normal approximation).{jt}",
                         ["Model", "Fold-average patterns flagged", "Per dataset", "Their seqlets",
                          "QC patterns flagged (all folds)"], rows)  # fmt: skip
     ref = bc["reference"]
@@ -3092,7 +3527,7 @@ def section_bias(rep: Report, n: Numbering, bc: dict | None, l3: dict | None, l4
     t2 = t3 = ""
     if ref is not None and not ref.empty:
         rr = ref.sort_values("cherimoya_patterns", ascending=False)
-        rows = [[h(r["pattern"]), count(r["n_seqlets"]), h(r["consensus"]), h(r["annotation"]), pval(r["annotation_q"]),
+        rows = [[h(r["pattern"]), h(r["consensus"]), count(r["n_seqlets"]), h(r["annotation"]), pval(r["annotation_q"]),
                  h(r["bias_db_best"]), pval(r["bias_db_best_q"]), h(r["kind"]), count(r["cherimoya_patterns"]),
                  count(r["cherimoya_seqlets"])] for _, r in rr.iterrows()]  # fmt: skip
         t2 = table_html(
@@ -3102,39 +3537,50 @@ def section_bias(rep: Report, n: Numbering, bc: dict | None, l3: dict | None, l4
             "database decoys).",
             [
                 "Pattern",
-                "Seqlets",
                 "Consensus",
+                "Seqlets",
                 "MotifCompendium match",
-                "q",
+                "MotifCompendium q",
                 "motifs.meme match",
-                "q",
+                "motifs.meme q",
                 "Kind",
                 "Cherimoya patterns matched",
                 "Their seqlets",
             ],
             rows,
-            left=4,
+            left={0, 1, 3, 5, 7},
             cls="compact",
         )
+        scales = bc.get("scales") or {}
         srows = []
         for k in ("Tn5/DNase", "TF or other", "no match", "unknown"):
             if k in split.index:
                 r = split.loc[k]
                 srows.append([h({"Tn5/DNase": "a Tn5/DNase pattern", "TF or other": "a TF or other pattern",
                                  "no match": "no reference pattern", "unknown": "an unannotated reference"}[k]),
-                              count(r["patterns"]), count(r["seqlets"]), count(r["db_flagged"])])  # fmt: skip
+                              count(r["patterns"]), count(r["seqlets"]), count(r["db_flagged"]),
+                              count(r["chrombpnet_partner"]) if "chrombpnet_partner" in r else "NA"])  # fmt: skip
+        what = (f"{scales.get('fold average', 0)} fold-average patterns without a cluster partner (level 3)"
+                + (f" and {scales['QC fold']} of the control's own QC fold without a tomtom partner"
+                   if scales.get("QC fold") else ""))  # fmt: skip
         t3 = table_html(
             n,
-            f"The {int(split['patterns'].sum())} Cherimoya patterns checked (those without a cluster "
-            "partner: every dataset's fold averages, and the control's own QC fold), by what they match.",
-            ["Matches", "Cherimoya patterns", "Their seqlets", "Themselves flagged Tn5/DNase"],
+            f"The {int(split['patterns'].sum())} Cherimoya patterns checked, {what}, by what they match in the "
+            "reference, with how many are themselves flagged Tn5/DNase and how many have a tomtom partner in "
+            "bias-corrected ChromBPNet (its fold average, or its same QC fold).",
+            [
+                "Matches",
+                "Cherimoya patterns",
+                "Their seqlets",
+                "Themselves flagged Tn5/DNase",
+                "With a partner in bias-corrected ChromBPNet",
+            ],
             srows,
         )
     return f"""
 <section id="bias-control">
   {head}
   {lead}
-  {"".join(ctrl)}
   {
         figure_html(
             rep,
@@ -3142,90 +3588,105 @@ def section_bias(rep: Report, n: Numbering, bc: dict | None, l3: dict | None, l4
             "bias_control",
             "Left: Tn5/DNase-flagged patterns per dataset (lines join a dataset's two "
             "values), at fold averages and per QC fold. Right: each pattern of the bias-included ChromBPNet "
-            "(profile head), labelled with its best MotifCompendium match, and how many unmatched Cherimoya patterns "
-            "match it; orange marks Tn5/DNase patterns.",
+            "(profile head) and how many unmatched Cherimoya patterns match it; a bar is labelled with the pattern's "
+            "best MotifCompendium match or, for the Tn5/DNase patterns (orange), with its motifs.meme Tn5/DNase "
+            "entry.",
         )
     }
   {t1}
   {t2}
   {t3}
-  <p>Most of the Cherimoya patterns that the bias-included model also finds match its TF patterns (CEBP, AP-1, NFI,
-  CTCF), not its Tn5 patterns: they are TF motifs that the strict cluster rule left unmatched, not bias. The control is
-  one dataset and fold, on the profile head (DeepSHAP has no rule for the counts head of the full model), while every
-  other pattern here comes from the counts head, so it bounds rather than measures the bias share.</p>
+  {f"<p>{fnd['closing']}</p>" if fnd else ""}
 </section>"""
 
 
 def section_caveats(rep: Report, R: dict) -> str:
+    """The plan's caveats (bias model, float16, dropped N windows), the ceilings and the p-value floors; each item's
+    text is HTML."""
     l2, l3, l4, l5 = (R.get(k) for k in ("l2", "l3", "l4", "l5"))
     bias_bits = []
     if l3 and l3.get("state") == "done":
         per = l3["per"]
+        t = s(rep, "3", "TF-MoDISco, Cherimoya - ChromBPNet", "Tn5/DNase-flagged patterns: Cherimoya - ChromBPNet")
         bias_bits.append(
             f"Tn5/DNase-flagged fold-average patterns: {int(per[per['model'] == 'cherimoya']['bias_flagged'].sum())} "
             f"for Cherimoya against {int(per[per['model'] == 'chrombpnet']['bias_flagged'].sum())} for ChromBPNet"
+            + (f" (p {pval(t['p'], t['p_method'])} over datasets)" if t else "")
         )
     if l4 and l4.get("state") == "done":
         c95 = l4["classes"][l4["classes"]["threshold"] == "0.95"].set_index("class")
         if "bias_clusters" in c95:
             bias_bits.append(
-                f"bias clusters in the joint compendium: {int(c95.loc['cherimoya_only', 'bias_clusters'])} "
-                f"Cherimoya-only, {int(c95.loc['chrombpnet_only', 'bias_clusters'])} ChromBPNet-only, "
+                f"clusters of the joint compendium with at least half of their patterns flagged: "
+                f"{int(c95.loc['cherimoya_only', 'bias_clusters'])} Cherimoya-only, "
+                f"{int(c95.loc['chrombpnet_only', 'bias_clusters'])} ChromBPNet-only, "
                 f"{int(c95.loc['shared', 'bias_clusters'])} shared"
             )
     f16 = ""
     if l2 and l2.get("state") == "done" and l2.get("float16") is not None and len(l2["float16"]):
+        fx = float16_split(l2["float16"])
+        ds16 = sorted(set(l2["float16"]["dataset"]))
         f16 = (
-            f" Computed again from Cherimoya's float16 h5 on one dataset, level 2's medians move by at most "
-            f"{num(l2['float16']['median_diff'].abs().max(), 6)}."
+            f" Level 2 reads Cherimoya's float32 per-fold files; computed again from its float16 files on "
+            f"{h(', '.join(rep.labels.get(x, x) for x in ds16))}, the {fx['n_read']} level-2 medians that read them "
+            f"move by at most {num(fx['max_read'], 6)}."
         )
     drop = ""
     if l2 and l2.get("state") == "done":
         j = l2["joins"]
         drop = (
             f" {int(j['chrombpnet_only_peaks'].min())}–{int(j['chrombpnet_only_peaks'].max())} peaks per dataset "
-            f"({int(j['chrombpnet_only_peaks'].sum())} over the {len(j)} datasets) are in ChromBPNet's beds only."
+            f"({int(j['chrombpnet_only_peaks'].sum())} over the {len(j)} datasets) are in ChromBPNet's peak files only."
         )
     if l5 and l5.get("state") == "done":
         dd = l5["totals"]["chrombpnet_hits_on_dropped_peaks"]
         drop += f" ChromBPNet has {count(dd.min())}–{count(dd.max())} hits per dataset on them."
+    n_sh, n_all = len(rep.shared), len(rep.everything)
+    floors = [(n_sh, "datasets"), (n_all - n_sh, "datasets"), (n_all, "datasets"), (5 * n_sh, "folds")]
+    floor_text = ", ".join(f"{pval(2.0 / 2**k)} for {k} {what}" for k, what in floors if k > 0)
     items = [
         (
             "Bias model",
-            "ChromBPNet's attributions (levels 2–5) come from its bias-corrected model (chrombpnet_nobias); "
-            "Cherimoya attributes its log-counts head with no bias model, so Tn5/DNase motifs can appear on "
-            "Cherimoya's side only. Level 1 is not affected: it scores ChromBPNet's full bias-included model against "
-            "observed counts. "
-            + ("; ".join(bias_bits) + ". " if bias_bits else "")
-            + "The bias control used one dataset and fold and the "
-            "profile head, so it bounds rather than measures how much of Cherimoya's extra signal is bias.",
+            "ChromBPNet's attributions (levels 2–5) come from its bias-corrected model; Cherimoya attributes its "
+            "log-counts head with no bias model, so it can learn Tn5/DNase motifs that ChromBPNet's bias model "
+            "absorbs. Bias-corrected ChromBPNet still shows some, so the difference is one of degree."
+            + (" " + "; ".join(bias_bits) + "." if bias_bits else "")
+            + " Level 1 is not affected: it scores ChromBPNet's full bias-included model against observed counts. "
+            "The bias control used one dataset and fold and the profile head, so it indicates, but does not measure, "
+            "how much of Cherimoya's extra signal is bias.",
         ),
         (
             "Float16",
-            "Both models' attributions go through float16: ChromBPNet's 05.0 h5 stores them so, and Cherimoya's "
-            "converted h5 files, which 06.0–08.0 and Fi-NeMo read, do too (06.0 sums float16)." + f16,
+            "Both models' attributions go through float16: ChromBPNet stores its attribution files in float16, and "
+            "so do Cherimoya's converted files, from which the fold averages are computed and which TF-MoDISco and "
+            "Fi-NeMo read." + f16,
         ),
         (
             "Dropped N windows",
-            "Cherimoya drops the windows that contain an N, so a few peaks have ChromBPNet attributions "
-            "only. Levels 2, 3 and 5 compare only the peaks both models hold." + drop,
+            "Cherimoya drops the windows that contain an N, so a few peaks have ChromBPNet attributions only. "
+            "Levels 2 and 5, and level 3's seqlet overlaps, compare only the peaks both models hold; the TF-MoDISco "
+            "patterns (level 3) and the compendia (level 4) come from each model's full peak set." + drop,
         ),
         (
             "Ceilings",
             "A ceiling (C) compares one fold with the mean of the other four. Cross-model agreement on single "
             "folds (A) compares one fold with one fold and so sits below a like-for-like ceiling; fold averages (B) "
-            "compare a mean of five with a mean of five and sit above one. A single-fold-against-single-fold ceiling "
-            "was not computed. At level 3 only the QC scale has a ceiling; levels 4 and 5 have none.",
+            "compare a mean of five with a mean of five and sit above one, so B close to C does not show that the "
+            "models agree as well as each agrees with itself. A like-for-like ceiling (one fold against one fold, or "
+            "a mean against a mean of as many folds) was not computed. At level 3 only the QC scale has a ceiling, "
+            "and it is tilted the same way: both models' runs of a fold share one 30K-peak subsample, while the "
+            "fold-to-fold ceiling compares folds whose subsamples differ. Levels 4 and 5 have no ceiling.",
         ),
         (
             "p-value floors",
-            "With n paired values the exact two-sided Wilcoxon p cannot go below 2/2^n: 0.002 for 10 "
-            "datasets, 3.6×10⁻¹² for 39. Folds of one dataset share its peaks, so the dataset-level test is the one "
-            "to read; with 50 or 195 folds p saturates further. At those floors, read p as “all in the same "
-            "direction”, not as an effect size.",
+            f"With n paired values the exact two-sided Wilcoxon p cannot go below 2/2<sup>n</sup>: {floor_text}. "
+            f"Over more than 50 values, or with ties or zeros among 14–50, p comes from the normal approximation "
+            f"(marked {APPROX}) and can fall further. The folds of one dataset share its library and most of their "
+            "training data, so the dataset-level test is the one to read. At those floors, read p as “all in the "
+            "same direction”, not as an effect size.",
         ),
     ]
-    lis = "".join(f"<li><b>{h(t)}.</b> {h(x)}</li>" for t, x in items)
+    lis = "".join(f"<li><b>{h(t)}.</b> {x}</li>" for t, x in items)
     return f"""
 <section id="caveats">
   <div class="head"><p class="eyebrow">Caveats</p><h2>Read the numbers with these in mind</h2></div>
@@ -3236,18 +3697,28 @@ def section_caveats(rep: Report, R: dict) -> str:
 def section_methods(rep: Report, R: dict, prov: dict, generated: str) -> str:
     a = rep.args
     defs = [
-        ("Statistics", f"Every interval is a percentile bootstrap 95% CI of the median, {a.n_boot:,} resamples, seed "
-         f"{a.seed}, resampling datasets; for rows over folds, whole datasets are resampled with their folds (level "
-         "2 and 3 files resample folds instead). Tests are two-sided Wilcoxon signed-rank tests on paired values "
-         "(scipy; exact for small n without ties or zeros). statistics.tsv lists all of them with n, the statistic, p "
-         "and how many values were above and below 0."),
+        ("Statistics", f"Every interval on this page is a percentile bootstrap 95% CI of the median, {a.n_boot:,} "
+         f"resamples, seed {a.seed}, and every one resamples datasets: for values over datasets, the datasets; for "
+         "values over folds, whole datasets with all their folds. (The levels' own statistics files resample single "
+         "folds for their fold rows; this page does not show those intervals, and the checks below compare only "
+         "their medians and p.) The endpoints are Monte Carlo estimates: another seed moves them by up to about a "
+         "fifth of the interval's width, so a fourth decimal is not stable. Tests are two-sided Wilcoxon signed-rank "
+         "tests on paired values (scipy's 'auto' method): p is exact, from the signed-rank distribution or, for up to "
+         "13 values with ties or zeros, from every sign flip, except where marked † (the normal approximation with "
+         "tie and continuity corrections, used for more than 50 values or for ties or zeros among 14–50). The test "
+         "drops differences of 0; where there are some, the counts show how many were above, below and at 0. "
+         "statistics.tsv lists every interval and test with n, the statistic, p, how p was computed (p_method) and "
+         "how many values were above and below 0."),
         ("Level 1", "compare_chrombpnet.py per fold: counts Pearson and Spearman and MSE of log counts, and the median "
          "JSD and normalized JSD of the profiles, on ChromBPNet's test peaks; ChromBPNet from its evaluation "
          "predictions (chrombpnet_predictions.h5, full model). Residuals: predicted minus observed log(1 + counts)."),
         ("Level 2", "compare_attributions.py: per peak, Pearson and Spearman of the projected scores, cosine of the "
          "4 × W hypothetical maps, Jaccard of the top 50 positions by |projected score|, and each map's sum and L2 "
-         "norm, within 250 and 500 bp of the summit. Each dataset is summarized by its median over peaks; A and C "
-         "are means over the 5 folds of those medians."),
+         "norm, in the 500-bp and 1,000-bp windows (summit ± 250 and ± 500 bp). ChromBPNet from its 05.0 h5 and "
+         "06.0 fold average, Cherimoya from its float32 per-fold npz and 06.0 fold average. Each dataset is "
+         "summarized by its median over peaks; A and C are means over the 5 folds of those medians. Strata: deciles "
+         "of signalValue and of the GC content of the 1,000-bp window, taken over each dataset's joined peaks, and "
+         "the chromosome's role in each fold."),
         ("Level 3", "compare_modisco.py: tomtom-lite on trimmed PPMs, q-values over the targets with the "
          "MotifCompendium database as decoys; matched by joint20 cluster (primary) or tomtom (secondary); seqlets "
          "overlap at ≥ 50% reciprocal. Bias flag: best motifs.meme match is a TN5_ or DNASE_ entry at q ≤ 0.05."),
@@ -3258,7 +3729,24 @@ def section_methods(rep: Report, R: dict, prov: dict, generated: str) -> str:
         ("Tables", "Under the output directory: statistics.tsv, tables/*.tsv (one per section and the inputs and "
          "checks below) and figures/*.pdf/.png."),
     ]  # fmt: skip
-    dl = "".join(f"<dt>{h(x)}</dt><dd>{h(y)}</dd>" for x, y in defs)
+    items = [(h(x), h(y)) for x, y in defs]
+    bc = R.get("bias")
+    if bc and bc.get("controls"):
+        used = [c for c in bc["controls"] if c["state"] == "done"]
+        refused = [c for c in bc["controls"] if c["state"] != "done"]
+        text = ("bias_control.sh runs 05.0's contribs_bw (DeepSHAP) on ChromBPNet's bias-included model "
+                "(chrombpnet.h5) over the fold's 30K-peak QC subsample, then TF-MoDISco as 04.5 does; "
+                "compare_modisco.py --bias compares the result: "
+                + "; ".join(f"{h(c['name'])}, the {h(c['head'])} head on {h(c.get('dataset'))} fold "
+                            f"{h(c.get('fold'))} ({h(c.get('reason') or c.get('note') or 'done')})" for c in used)
+                + ". Its patterns are annotated with level 3's rules, and Cherimoya's unmatched patterns (fold "
+                "averages of every dataset, and the QC patterns of the control's own dataset and fold) are matched to "
+                "them by tomtom-lite at q ≤ 0.05 with the database as decoys.")  # fmt: skip
+        for c in refused:
+            text += (f" Refused: {h(c['name'])}, the {h(c['head'])} head on {h(c.get('dataset'))} fold "
+                     f"{h(c.get('fold'))}: <code>{h(c.get('reason') or c.get('state'))}</code>")  # fmt: skip
+        items.insert(len(items) - 1, ("Bias control", text))  # before "Tables"
+    dl = "".join(f"<dt>{x}</dt><dd>{y}</dd>" for x, y in items)
     crow = []
     for c in prov["commits"]:
         crow.append(
@@ -3289,8 +3777,9 @@ def section_methods(rep: Report, R: dict, prov: dict, generated: str) -> str:
         )
     n = Numbering()
     n.tab = 900  # these tables are not numbered with the findings
-    commits = ('<div class="tbl compact"><table><thead><tr><th class="l">Code</th><th class="l">Commit</th>'
-               '<th class="l">Branch</th><th class="l">Subject or note</th><th class="l">Time</th></tr></thead><tbody>'
+    commits = ('<div class="tbl compact"><table><thead><tr><th scope="col" class="l">Code</th>'
+               '<th scope="col" class="l">Commit</th><th scope="col" class="l">Branch</th>'
+               '<th scope="col" class="l">Subject or note</th><th scope="col" class="l">Time</th></tr></thead><tbody>'
                + "".join("<tr>" + "".join(f'<td class="l">{c}</td>' for c in r) + "</tr>" for r in crow)
                + "</tbody></table></div>")  # fmt: skip
     mrows = []
@@ -3300,18 +3789,19 @@ def section_methods(rep: Report, R: dict, prov: dict, generated: str) -> str:
             continue
         mrows.append([f"{m['level']}", h(m["dir"]), str(m["units"]), h(et(m["first"])), h(et(m["last"])),
                       h(", ".join(m["commits"]))])  # fmt: skip
-    markers = ('<div class="tbl compact"><table><thead><tr><th class="l">Level</th><th class="l">Directory</th>'
-               "<th>Done units</th><th>First written</th><th>Last written</th><th>Code commits</th></tr></thead><tbody>"
-               + "".join("<tr>" + "".join(f'<td class="{"l" if i < 2 else ""}">{c}</td>' for i, c in enumerate(r))
+    markers = ('<div class="tbl compact"><table><thead><tr><th scope="col" class="l">Level</th>'
+               '<th scope="col" class="l">Directory</th><th scope="col">Done units</th><th scope="col">First written'
+               '</th><th scope="col">Last written</th><th scope="col">Code commits</th></tr></thead><tbody>'
+               + "".join("<tr>" + "".join(f'<td{" class=\"l\"" if i < 2 else ""}>{c}</td>' for i, c in enumerate(r))
                          + "</tr>" for r in mrows) + "</tbody></table></div>")  # fmt: skip
     inputs = R.get("inputs_table")
     irows = []
     if inputs is not None:
         for _, r in inputs.iterrows():
             irows.append([f"<code>{h(r['path'])}</code>", h(r["files"]), h(r["size"]), h(r["modified"])])
-    itab = ('<div class="tbl compact"><table><thead><tr><th class="l">Input</th><th>Files</th><th>Size</th>'
-            "<th>Modified (newest)</th></tr></thead><tbody>"
-            + "".join("<tr>" + "".join(f'<td class="{"l" if i == 0 else ""}">{c}</td>' for i, c in enumerate(r))
+    itab = ('<div class="tbl compact"><table><thead><tr><th scope="col" class="l">Input</th><th scope="col">Files</th>'
+            '<th scope="col">Size</th><th scope="col">Modified (newest)</th></tr></thead><tbody>'
+            + "".join("<tr>" + "".join(f'<td{" class=\"l\"" if i == 0 else ""}>{c}</td>' for i, c in enumerate(r))
                       + "</tr>" for r in irows) + "</tbody></table></div>")  # fmt: skip
     chk = "".join(
         f"<li>{h(c['what'])}: {c['values']} values, largest difference "
@@ -3319,7 +3809,8 @@ def section_methods(rep: Report, R: dict, prov: dict, generated: str) -> str:
         f"{f', {c["nan_mismatch"]} NA mismatches' if c['nan_mismatch'] else ''}.</li>"
         for c in rep.checks
     )
-    probs = "".join(f"<li>{h(p)}: {h(m)}</li>" for p, m in rep.problems) or "<li>None.</li>"
+    probs = "".join(f"<li>{h(p)}: {h(m)}</li>" for p, m in rep.problems)
+    probs_html = f'<h3>Not computed</h3>\n  <ul class="plain">{probs}</ul>' if probs else ""
     return f"""
 <section id="methods">
   <div class="head"><p class="eyebrow">Methods and provenance</p><h2>How the numbers were made</h2></div>
@@ -3333,11 +3824,11 @@ def section_methods(rep: Report, R: dict, prov: dict, generated: str) -> str:
   six hours ahead). Generated {h(generated)} into <code>{h(str(rep.out))}</code>.</p>
   {itab}
   <h3>Checks</h3>
-  <p class="tcap">The statistics the levels already computed were computed again here from their tables; the largest
-  absolute differences against the levels' own statistics.tsv (written to 6 significant digits):</p>
+  <p class="tcap">A consistency check, not an independent one: the statistics the levels already computed were
+  computed again here from their tables, with the same bootstrap and Wilcoxon code, and compared with the levels' own
+  statistics.tsv (written to 6 significant digits). The largest absolute differences:</p>
   <ul class="plain">{chk or "<li>None run.</li>"}</ul>
-  <h3>Not computed</h3>
-  <ul class="plain">{probs}</ul>
+  {probs_html}
 </section>"""
 
 
@@ -3386,7 +3877,7 @@ def render(rep: Report, R: dict, prov: dict, generated: str) -> str:
     body = [
         masthead(rep, R, generated), toc(), summary_section(rep, R),
         section_level1(rep, n, R.get("l1")), section_level2(rep, n, R.get("l2")), section_level3(rep, n, R.get("l3")),
-        section_level4(rep, n, R.get("l4")), section_level5(rep, n, R.get("l5")),
+        section_level4(rep, n, R.get("l4"), R.get("l5")), section_level5(rep, n, R.get("l5")),
         section_bias(rep, n, R.get("bias"), R.get("l3"), R.get("l4")), section_caveats(rep, R),
         section_methods(rep, R, prov, generated),
     ]  # fmt: skip
@@ -3433,7 +3924,7 @@ def run(args: argparse.Namespace) -> int:
     page = render(rep, R, prov, generated)
     outputs["index"] = common.write_text(rep.out / "index.html", page)
     size = (rep.out / "index.html").stat().st_size
-    pend = sorted({p["what"].split(" (")[0] for p in rep.pending})
+    pend = list(dict.fromkeys(p.get("short") or p["what"] for p in rep.pending))
     note = (f"index.html {size / 1e6:.1f} MB, {len(rep.figures)} figures, {len(rep.tables)} tables, "
             f"{len(rep.stats.rows)} statistics")  # fmt: skip
     if R.get("l1") and R["l1"].get("state") == "done":
@@ -3471,8 +3962,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cheri-tag", default="cheri10")
     ap.add_argument("--supplement-tag", default="cheri39")
     ap.add_argument("--sensitivity-tag", help="default <joint>_t090")
-    ap.add_argument("--pending-eta", help="when the pending parts are expected, shown with them (e.g. 'Saturday "
-                    "2026-10-10')")  # fmt: skip
+    ap.add_argument("--pending-eta", help="a sentence on when the pending parts are expected, shown as given with them "
+                    "(e.g. 'No date is set yet.')")  # fmt: skip
     ap.add_argument("--repo", action="append", metavar="NAME=PATH", help="a checkout whose commit the methods list "
                     "(repeatable; this code's checkout and --folds-dir's are always listed)")  # fmt: skip
     ap.add_argument("--n-boot", type=int, default=10000)

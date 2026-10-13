@@ -1,9 +1,10 @@
 #!/bin/bash
 # pilot_steps.sh
-# Purpose: the quick pilot of variant scoring in one whole-node box (8 GPUs): test the code, build the windows,
-#   measure throughput, run the checks V2-V5, predict every dataset x fold x model, then score and compare.
+# Purpose: a pilot of variant scoring in one whole-node box (8 GPUs): test the code, build the windows, measure
+#   throughput, run the checks V2-V5, predict every dataset x fold x model, then score, compare and analyse.
 #   Count scores only (logFC, |logFC|, AAQ, empirical p against the shuffled null and, when its windows are built,
-#   the genomic null), as scores.py computes them.
+#   the genomic null), as scores.py computes them. Sized for millions of variants: at 3.2M variants x 10 datasets
+#   x 5 folds, step 5 takes ~4.8-5.2 h on 8 H100s and the whole run ~6-6.5 h (estimates per step in pilot_box.sbatch).
 #
 # Steps, in order. Each logs to logs/<n>.<name>.log and adds a row to status.tsv (step, name, state, exit, seconds,
 # started ET, note). A step whose prerequisite failed or was skipped is skipped itself, so a failure stops only what
@@ -27,23 +28,49 @@
 #              V4  the noise floor on PILOT_V_N windows: each model run twice; reordered and re-batched; TF32
 #                  against strict fp32; Cherimoya's megakernel against its grad path, and bf16 autocast
 #              V2  OFF unless PILOT_V2=1, which needs the user's explicit OK: it executes VS main, downloaded code.
-#                  When on: in the background, VS main in the TF-Keras container on PILOT_V_N variants of the
-#                  bias-free model (the export capped at 15 min, VS at 45 min); skipped cleanly when the clone, the
-#                  container or apptainer is missing; a failed run gets its own row (4 v2 failed) in status.tsv
+#                  When on: in the background on the last GPU, VS main in the TF-Keras container on PILOT_V_N
+#                  variants of the bias-free model (the export capped at 15 min, VS at 45 min; TensorFlow with
+#                  TF_FORCE_GPU_ALLOW_GROWTH, so it takes GPU memory as it needs it, uncapped); skipped cleanly when
+#                  the clone, the container or apptainer is missing; a failed run gets its own row (4 v2 failed) in
+#                  status.tsv
 #                                                                                needs 2
 #   5 predict  every dataset x fold: Cherimoya, and ChromBPNet's bias-free and bias models in one process (the full
 #              model derived), on the variant, null and peak windows and, when built, the genomic null's;
-#              PILOT_SLOTS_PER_GPU processes per GPU, each pinned to its own CPUs. A failed task runs once more at
-#              half the batch (task <name>.retry), keeping the window sets it finished
+#              PILOT_SLOTS_PER_GPU processes per GPU, each pinned to its own CPUs. The tasks go longest first into one
+#              queue (every ChromBPNet task, ~33 min per fold at 3.2M variants on an idle H100, then every Cherimoya
+#              one, ~8 min), and each slot takes the next task when it is free, so the GPUs end within about one
+#              Cherimoya task of each other. A failed task runs once more at half the batch (task <name>.retry),
+#              keeping the window sets it finished. A task that runs past PILOT_TASK_MINUTES is stopped (timeout,
+#              exit 124) and counts as failed, so a hung process cannot keep its GPU until the job's time limit.
+#              While V2's VS run is still going, the last GPU's slots wait for it to end before they take a task:
+#              TensorFlow's memory there is uncapped, and a slot's cap (PILOT_GPU_FRACTION) is a ceiling, not a
+#              reservation, so the two could otherwise run each other out of GPU memory. V2 is a few minutes on
+#              PILOT_V_N variants, so that GPU starts that much later
 #                                                                                needs 2
-#   6 score    V5 (forward vs reverse strand, from the saved strands), scores.py and compare.py against the shuffled
-#              null (scores/, compare/) and, when its windows were built, the genomic null (scores_genomic_null/,
-#              compare_genomic_null/; a failure there gets its own row, score_genomic_null, in status.tsv), V2's
-#              comparison and the summary of every check. Runs when step 5 ran, even if some of its tasks failed:
-#              scores.py leaves out (and exits 1 for) a model without predictions, compare.py a model without scores
+#   6 score    V5 (forward vs reverse strand, from the saved strands; in the background), then scores.py once per
+#              dataset, all at once, each on its own CPUs, against the shuffled null (scores/) and, when its windows
+#              were built, the genomic null (scores_genomic_null/) at the same time; then compare.py per null
+#              (compare/, compare_genomic_null/; one worker process per dataset); then null_report.py over both
+#              nulls (analysis/), which gates nothing and gets its own row (analysis) in status.tsv; then V2's
+#              comparison and the summary of every check. A failure against the genomic null gets its own row,
+#              score_genomic_null. PILOT_FOLD_TSV=0 leaves out the per-fold TSVs (scores.py --no-fold-tsv; the
+#              .npz tables that compare.py and null_report.py read are always written). Runs when step 5 ran, even if
+#              some of its tasks failed: scores.py leaves out (and exits 1 for) a model without predictions,
+#              compare.py a model without scores
 #                                                                                needs 5 (to have run)
 #   Checks never gate the predictions: a check outside its tolerance is state `outside_tolerance` (exit 3; 2 is
 #   argparse's usage error, so it means failed).
+#   Hold: with PILOT_HOLD_MINUTES > 0, when a row that holds is `failed` after the last step, the job keeps its node
+#   for up to that many minutes, so the failed step can be fixed and run again inside it (srun --jobid <job>
+#   --overlap ...; the box log prints the command) instead of in a new box after the queue. A clean run, or one whose
+#   only failures hold nothing, ends at once. The rows that hold: those of the steps the later steps or the report
+#   need (windows, checks, predict, score; tests only when they gate step 2, PILOT_GATE_TESTS=1) and the genomic
+#   null's and the analysis's rows (windows_genomic_null, score_genomic_null, analysis), which are cheap to rerun
+#   inside the hold. v2 (VS main, downloaded code), tests_cherimoya and tests that gate nothing do not hold, and
+#   neither does `outside_tolerance`: it is a result to read, with nothing to rerun. The hold ends early when
+#   box/<job>.<step>/release exists (touch it; this ends the job and any step still running in it). At its deadline
+#   it lasts while a step started with srun --jobid <job> (a rerun) is still running, up to the job's time limit, so
+#   a rerun that outlasts the N minutes is not cut off; the exit status is still that of this run's rows.
 #
 # Every process is pinned to its own block of the CPUs this job may use (Cpus_allowed_list) and has its GPU memory
 # capped: torch by PYTORCH_CUDA_ALLOC_CONF=per_process_memory_fraction, JAX by XLA_CLIENT_MEM_FRACTION with
@@ -88,20 +115,28 @@
 #   PILOT_REPO_ROOT         the checkout whose workflows/variant_scoring/*.py run (default: the one holding this
 #                           script). pilot_box.sbatch runs a copy of this script from <PILOT_ROOT>/logs and sets
 #                           it to the submit directory.
+#   PILOT_FOLD_TSV          1 (default): scores.py writes every per-fold table as .tsv.gz too; 0: --no-fold-tsv, only
+#                           their .npz (at 3.2M variants each TSV is ~9 s of a scores.py process and ~150 MB, 20 per
+#                           dataset and null; the summary TSVs are written either way)
+#   PILOT_HOLD_MINUTES      0 (default): end when the steps end. N: after a failed row that holds, keep the node up to
+#                           N minutes for a rerun inside it (see Hold above); set sbatch --time to cover the steps plus
+#                           N and the rerun. Worth it only when someone will watch the box log
+#   PILOT_TASK_MINUTES      0 (default): no limit. N: a prediction task (step 5) is stopped after N minutes and counts
+#                           as failed (its retry has N minutes too); set it well above the longest task
 #
 # Output, under PILOT_ROOT: windows/, probe/, checks/ (v2/, v3/, v4/, the check JSONs, summary.tsv, v5.tsv), preds/
-#   (<dataset>/fold_<k>/<model>.<set>.npz), scores/, compare/; and box/<job>.<step>/: status.tsv, tasks.tsv (every
-#   GPU process: name, GPU, CPUs, exit, seconds, start ET), resources.tsv (RAM, load, GPU use every 30 s), logs/.
-#   With the genomic null: windows/genomic_null.npz, its predictions (<model>.genomic_null.npz) in preds/, and
-#   scores_genomic_null/ and compare_genomic_null/, scores.py's and compare.py's outputs against it (scores/ and
-#   compare/ stay against the shuffled null).
+#   (<dataset>/fold_<k>/<model>.<set>.npz), scores/, compare/, analysis/; and box/<job>.<step>/: status.tsv,
+#   tasks.tsv (every process the steps launch: name, GPU, CPUs, exit, seconds, start ET), resources.tsv (RAM, load,
+#   GPU use every 30 s), logs/. With the genomic null: windows/genomic_null.npz, its predictions
+#   (<model>.genomic_null.npz) in preds/, and scores_genomic_null/ and compare_genomic_null/, scores.py's and
+#   compare.py's outputs against it (scores/ and compare/ stay against the shuffled null).
 # Usage: mkdir -p <dir>/logs && PILOT_ROOT=<dir> sbatch --output=<dir>/logs/slurm_%j.out \
 #            workflows/variant_scoring/pilot_box.sbatch    (the whole box; submit from the repository root)
 #        or, inside a running allocation: PILOT_ROOT=<dir> srun --jobid <job> --overlap bash workflows/variant_scoring/pilot_steps.sh
 #        (bash reads a script as it runs it: never edit this file in place while a box runs it; pilot_box.sbatch
 #        runs a copy for that reason)
 # Prerequisites: `pixi install` and `pixi install -e cherimoya` in RVI_MAIN; the fork's cuda13 environment;
-#   make_manifest.py's manifest.json and gnomad_list.py's variant list in PILOT_ROOT.
+#   make_manifest.py's manifest.json and a variant list (gnomad_list.py's or table_list.py's) in PILOT_ROOT.
 
 set -uo pipefail
 
@@ -139,6 +174,17 @@ v_n="${PILOT_V_N:-2000}"
 v3_n="${PILOT_V3_N:-500}"
 v_fold="${PILOT_V_FOLD:-0}"
 probe_seconds="${PILOT_PROBE_SECONDS:-20}"
+fold_tsv="${PILOT_FOLD_TSV:-1}"
+hold_minutes="${PILOT_HOLD_MINUTES:-0}"
+task_minutes="${PILOT_TASK_MINUTES:-0}"
+[[ "${fold_tsv}" == [01] ]] || { echo "ERROR: PILOT_FOLD_TSV must be 0 or 1, got ${fold_tsv}" >&2; exit 1; }
+[[ "${hold_minutes}" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: PILOT_HOLD_MINUTES must be whole minutes, got ${hold_minutes}" >&2; exit 1; }
+[[ "${task_minutes}" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: PILOT_TASK_MINUTES must be whole minutes, got ${task_minutes}" >&2; exit 1; }
+# Base 10: bash arithmetic would read 08 as a bad octal number and 010 as 8.
+hold_minutes=$(( 10#${hold_minutes} ))
+task_minutes=$(( 10#${task_minutes} ))
 # The genomic null's list. `-`, not `:-`: an empty PILOT_GENOMIC_NULL turns the null off; only an unset one takes the
 # default. step_windows builds it when the file is there and not empty.
 genomic_null_list="${PILOT_GENOMIC_NULL-${PILOT_ROOT}/nulls/genomic_null.tsv}"
@@ -154,7 +200,7 @@ box_dir="${PILOT_ROOT}/box/${box_id}"
 logs="${box_dir}/logs"
 status="${box_dir}/status.tsv"
 tasks_tsv="${box_dir}/tasks.tsv"
-mkdir -p "${logs}/windows" "${logs}/checks" "${logs}/predict" "${windows}" "${preds}" "${checks}"
+mkdir -p "${logs}/windows" "${logs}/checks" "${logs}/predict" "${logs}/score" "${windows}" "${preds}" "${checks}"
 
 et() { TZ=America/New_York date '+%F %T %Z'; }
 say() { echo "[$(et)] $*"; }
@@ -162,7 +208,8 @@ say() { echo "[$(et)] $*"; }
 # ------------------------------------------------------------------------------------------------ CPUs and GPUs
 # The CPUs this process may use (an srun step can be given fewer than the node has).
 allowed=()
-IFS=, read -r -a ranges <<< "$(awk '/^Cpus_allowed_list:/ { print $2 }' /proc/self/status)"
+cpus_allowed_list="$(awk '/^Cpus_allowed_list:/ { print $2 }' /proc/self/status)"
+IFS=, read -r -a ranges <<< "${cpus_allowed_list}"
 for r in "${ranges[@]}"; do
     if [[ "${r}" == *-* ]]; then mapfile -t -O "${#allowed[@]}" allowed < <(seq "${r%-*}" "${r#*-}"); else allowed+=( "${r}" ); fi
 done
@@ -585,54 +632,87 @@ step_checks() {
 }
 
 # ------------------------------------------------------------------------------------------------ 5 predict
-# predict_worker <gpu> <cpus> <task>... -- one slot's tasks, in turn. A task is "<kind>\t<manifest row>". A task that
-# fails (say, out of GPU memory at the fixed batch) runs once more at half the batch, as task <name>.retry: the window
-# sets it finished are kept, since predict_common.run_window_sets skips a set whose outputs all exist.
+# v2_running -- V2's VS run (started by step 4 in the background on the last GPU) has not ended. Its subshell writes
+# logs/checks/v2.exit when it ends, skipped or not; the PID test keeps a subshell that died without writing it from
+# being waited for. A slot is a sibling of that subshell, not its parent, so it cannot `wait` for it.
+v2_running() { [[ -n "${v2_pid:-}" && ! -e "${logs}/checks/v2.exit" ]] && kill -0 "${v2_pid}" 2> /dev/null; }
+
+# claim <counter file> <n> -- the next task number (0-based) of the queue the slots share, under a lock; fails once
+# all n have been handed out.
+claim() {
+    (
+        flock -x 9
+        next="$(cat "$1")"
+        (( next < $2 )) || exit 1
+        echo $(( next + 1 )) > "$1"
+        echo "${next}"
+    ) 9> "$1.lock"
+}
+
+# predict_task <gpu> <cpus> <task> -- one task, "<kind>\t<manifest row>". A task that fails (say, out of GPU memory at
+# the fixed batch) runs once more at half the batch, as task <name>.retry: the window sets it finished are kept, since
+# predict_common.run_window_sets skips a set whose outputs all exist.
+predict_task() {
+    local gpu="$1" cpus="$2" kind ds fold cheri nobias bias out batch name
+    local cmd=() sets=() limit=()
+    # PILOT_TASK_MINUTES: TERM at the limit, KILL a minute later; timeout exits 124, and the task counts as failed.
+    if (( task_minutes > 0 )); then limit=( timeout -k 60 "${task_minutes}m" ); fi
+    IFS=$'\t' read -r kind ds fold cheri nobias bias _ _ <<< "$3"
+    out="${preds}/${ds}/fold_${fold}"
+    sets=( --windows "${windows}/${variants_name}.npz" --windows "${windows}/null.npz"
+           --windows "${windows}/peaks.${ds}.npz" )
+    # The genomic null set, when step 2 (of this box or an earlier one) built it and the knob is not set empty.
+    if use_genomic_null; then sets+=( --windows "${windows}/genomic_null.npz" ); fi
+    if [[ "${kind}" == cherimoya ]]; then
+        batch="${cheri_batch}"
+        cmd=( "${limit[@]}" "${CHERIMOYA_PY}" "${vs}/predict_cherimoya.py" --model "${cheri}" "${sets[@]}"
+              --out-dir "${out}" )
+    else
+        batch="${cbp_batch}"
+        cmd=( "${limit[@]}" "${CHROMBPNET_PY}" "${vs}/predict_chrombpnet.py" --nobias "${nobias}" --bias "${bias}"
+              "${sets[@]}" --out-dir "${out}" )
+    fi
+    name="predict/${ds}.fold_${fold}.${kind}"
+    run_logged "${name}" "${gpu}" "${cpus}" "${gpu_fraction}" "${cmd[@]}" --batch "${batch}" && return 0
+    run_logged "${name}.retry" "${gpu}" "${cpus}" "${gpu_fraction}" "${cmd[@]}" \
+        --batch "$(( batch > 1 ? batch / 2 : 1 ))"
+}
+
+# predict_worker <gpu> <cpus> -- one slot: the next task of the shared queue (step_predict's order and queue), until
+# none is left. On the last GPU it first waits for V2's VS run to end (see step 5 above).
 predict_worker() {
-    local gpu="$1" cpus="$2" item kind ds fold cheri nobias bias out batch name failed=0
-    local cmd=()
-    shift 2
-    for item in "$@"; do
-        IFS=$'\t' read -r kind ds fold cheri nobias bias _ _ <<< "${item}"
-        out="${preds}/${ds}/fold_${fold}"
-        local sets=( --windows "${windows}/${variants_name}.npz" --windows "${windows}/null.npz"
-                     --windows "${windows}/peaks.${ds}.npz" )
-        # The genomic null set, when step 2 (of this box or an earlier one) built it and the knob is not set empty.
-        if use_genomic_null; then sets+=( --windows "${windows}/genomic_null.npz" ); fi
-        if [[ "${kind}" == cherimoya ]]; then
-            batch="${cheri_batch}"
-            cmd=( "${CHERIMOYA_PY}" "${vs}/predict_cherimoya.py" --model "${cheri}" "${sets[@]}" --out-dir "${out}" )
-        else
-            batch="${cbp_batch}"
-            cmd=( "${CHROMBPNET_PY}" "${vs}/predict_chrombpnet.py" --nobias "${nobias}" --bias "${bias}" "${sets[@]}"
-                  --out-dir "${out}" )
-        fi
-        name="predict/${ds}.fold_${fold}.${kind}"
-        if ! run_logged "${name}" "${gpu}" "${cpus}" "${gpu_fraction}" "${cmd[@]}" --batch "${batch}"; then
-            run_logged "${name}.retry" "${gpu}" "${cpus}" "${gpu_fraction}" "${cmd[@]}" \
-                --batch "$(( batch > 1 ? batch / 2 : 1 ))" || failed=1
-        fi
+    local gpu="$1" cpus="$2" i failed=0
+    if [[ "${gpu}" == "${gpus[-1]}" ]] && v2_running; then
+        say "slot on GPU ${gpu}: waiting for V2's VS run (PID ${v2_pid}) to end before its first task"
+        while v2_running; do sleep 10; done
+        say "slot on GPU ${gpu}: V2's VS run has ended; taking tasks"
+    fi
+    while i="$(claim "${queue}" "${#order[@]}")"; do
+        predict_task "${gpu}" "${cpus}" "${order[i]}" || failed=1
     done
     return "${failed}"
 }
 
 step_predict() {
-    local rows=() order=() row kind n_slots per i pids=()
+    local rows=() order=() row kind n_slots per i pids=() queue="${box_dir}/predict.queue"
     mapfile -t rows < <(manifest_cmd tasks)
     (( ${#rows[@]} > 0 )) || { echo "ERROR: no tasks in ${manifest}" >&2; return 1; }
     n_slots=$(( ${#gpus[@]} * gpu_slots ))
     per=$(( ${#allowed[@]} / n_slots ))
     (( per > 0 )) || { echo "ERROR: ${n_slots} slots but only ${#allowed[@]} CPUs" >&2; return 1; }
-    # ChromBPNet's tasks first (the slower ones), so that dealt round robin over the slots, slot s on GPU s % n_gpus,
-    # every GPU gets a mix of both models.
+    # Longest first: every ChromBPNet task (both parts in one process, ~6,400 passes/s on an idle H100, so ~33 min a
+    # fold at 3.2M variants x 2 alleles x 2 strands), then every Cherimoya task (~26,000 passes/s, ~8 min). Each slot
+    # takes the next one when it is free (largest first, then whoever is free: the GPUs end within about one Cherimoya
+    # task of each other), slot s on GPU s % n_gpus.
     for kind in chrombpnet cherimoya; do
         for row in "${rows[@]}"; do order+=( "${kind}"$'\t'"${row}" ); done
     done
-    say "${#order[@]} prediction tasks over ${n_slots} slots (${#gpus[@]} GPUs x ${gpu_slots}), ${per} CPUs each"
-    for (( i = 0; i < n_slots && i < ${#order[@]}; i++ )); do
-        local mine=() j
-        for (( j = i; j < ${#order[@]}; j += n_slots )); do mine+=( "${order[j]}" ); done
-        predict_worker "${gpus[$(( i % ${#gpus[@]} ))]}" "$(cpu_block "${i}" "${per}")" "${mine[@]}" &
+    echo 0 > "${queue}"
+    say "${#order[@]} prediction tasks, ChromBPNet's first, over ${n_slots} slots (${#gpus[@]} GPUs x ${gpu_slots})," \
+        "${per} CPUs each; next task from ${queue}"
+    if v2_running; then say "V2's VS run is still on GPU ${gpus[-1]}: that GPU's slots start when it ends"; fi
+    for (( i = 0; i < n_slots; i++ )); do
+        predict_worker "${gpus[$(( i % ${#gpus[@]} ))]}" "$(cpu_block "${i}" "${per}")" &
         pids+=( "$!" )
     done
     wait_all "${pids[@]}"
@@ -660,38 +740,81 @@ v2_compare() {
         --preds "${preds}/${v_dataset}/fold_${v_fold}/cbp_nobias.${variants_name}.npz" --out "${checks}/V2.vs_main.json"
 }
 
+# scored_dir <null> <kind> -- where step 6 writes against a null: <kind>/ for the shuffled null (window set `null`),
+# <kind>_<null>/ for another (kind: scores or compare).
+scored_dir() { if [[ "$1" == null ]]; then echo "${PILOT_ROOT}/${2}"; else echo "${PILOT_ROOT}/${2}_${1}"; fi; }
+
 step_score() {
-    local list datasets=() st=() gn_rc=0 t0
+    local list datasets=() nulls=(null) null ds st=() gn_rc=0 t0 slot=0 v5_pid rc
+    local null_pids=() gn_pids=() compare_pids=() fold_args=()
     list="$(variant_list)" || return 1
     mapfile -t datasets < <(manifest_cmd peaks | cut -f1)
-    pinned "${DEFAULT_PY}" "${vs}/vchecks.py" strands --preds-root "${preds}" --out "${checks}/V5.strands.json"
+    # The genomic null, when step 2 built its windows and the knob is not set empty. --list stays the variant list (the
+    # variants' fold_test and strata); the shuffled null's outputs stay in scores/ and compare/. Like its windows, it
+    # gates nothing: a failure gets its own row (score_genomic_null) in status.tsv, and this step's state stays the
+    # shuffled null's.
+    if use_genomic_null; then nulls+=( genomic_null ); fi
+    (( fold_tsv == 1 )) || fold_args=( --no-fold-tsv )
+    t0=${SECONDS}
+    # V5 reads only the predictions: in the background, on CPUs the scores do not use.
+    launch score/v5 - "$(cpu_block 24 8)" 0 "${DEFAULT_PY}" "${vs}/vchecks.py" strands --preds-root "${preds}" \
+        --out "${checks}/V5.strands.json"
+    v5_pid=${launched_pid}
+    # scores.py once per dataset and null, all at once, each on its own 8 CPUs (it is single-threaded; 20 processes at
+    # 3.2M variants hold ~5 GB each). Each scores every model it has predictions for and exits 1 if any is missing or
+    # refused; compare.py then compares the models that have scores. So both run whatever the other's status.
+    for null in "${nulls[@]}"; do
+        for ds in "${datasets[@]}"; do
+            launch "score/scores.${null}.${ds}" - "$(cpu_block "${slot}" 8)" 0 "${DEFAULT_PY}" "${vs}/scores.py" \
+                --datasets "${ds}" --preds-root "${preds}" --windows-root "${windows}" --list "${list}" \
+                --variants "${variants_name}" --null "${null}" --peaks 'peaks.{dataset}' \
+                --out-root "$(scored_dir "${null}" scores)" "${fold_args[@]}"
+            if [[ "${null}" == null ]]; then null_pids+=( "${launched_pid}" ); else gn_pids+=( "${launched_pid}" ); fi
+            slot=$(( slot + 1 ))
+        done
+    done
+    wait_all "${null_pids[@]}"
     st+=( "$?" )
-    # scores.py scores every model it has predictions for and exits 1 if any is missing or refused; compare.py then
-    # compares the models that have scores. So both run whatever the other's status.
-    pinned "${DEFAULT_PY}" "${vs}/scores.py" --datasets "${datasets[@]}" --preds-root "${preds}" --windows-root "${windows}" \
-        --list "${list}" --variants "${variants_name}" --null null --peaks 'peaks.{dataset}' \
-        --out-root "${PILOT_ROOT}/scores"
+    wait_all "${gn_pids[@]}" || gn_rc=1
+    say "scores.py: done for ${#datasets[@]} dataset(s) x ${#nulls[@]} null(s) in $(( SECONDS - t0 )) s;" \
+        "logs ${logs}/score/scores.*.log"
+    # compare.py per null, both at once, each with one worker process per dataset on its own 32 CPUs. Single-threaded
+    # BLAS: the workers are the parallelism.
+    slot=0
+    for null in "${nulls[@]}"; do
+        launch "score/compare.${null}" - "$(cpu_block "${slot}" 32)" 0 env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+            MKL_NUM_THREADS=1 "${CHERIMOYA_PY}" "${vs}/compare.py" --scores-root "$(scored_dir "${null}" scores)" \
+            --datasets "${datasets[@]}" --list "${list}" --variants "${variants_name}" --null "${null}" \
+            --out-dir "$(scored_dir "${null}" compare)" --workers "${#datasets[@]}"
+        compare_pids+=( "${launched_pid}" )
+        slot=$(( slot + 1 ))
+    done
+    wait "${compare_pids[0]}"
     st+=( "$?" )
-    pinned "${CHERIMOYA_PY}" "${vs}/compare.py" --scores-root "${PILOT_ROOT}/scores" --datasets "${datasets[@]}" \
-        --list "${list}" --variants "${variants_name}" --null null --out-dir "${PILOT_ROOT}/compare"
-    st+=( "$?" )
-    # The same scores and report against the genomic null, when step 2 built its windows and the knob is not set empty.
-    # --list is still the variant list (the variants' fold_test and strata); the shuffled null's outputs stay in scores/
-    # and compare/. Like its windows, it gates nothing: a failure gets its own row (score_genomic_null) in status.tsv,
-    # and this step's state stays the shuffled null's.
-    if use_genomic_null; then
-        t0=${SECONDS}
-        pinned "${DEFAULT_PY}" "${vs}/scores.py" --datasets "${datasets[@]}" --preds-root "${preds}" \
-            --windows-root "${windows}" --list "${list}" --variants "${variants_name}" --null genomic_null \
-            --peaks 'peaks.{dataset}' --out-root "${PILOT_ROOT}/scores_genomic_null" || gn_rc=1
-        pinned "${CHERIMOYA_PY}" "${vs}/compare.py" --scores-root "${PILOT_ROOT}/scores_genomic_null" \
-            --datasets "${datasets[@]}" --list "${list}" --variants "${variants_name}" --null genomic_null \
-            --out-dir "${PILOT_ROOT}/compare_genomic_null" || gn_rc=1
-        if (( gn_rc != 0 )); then
-            say "genomic null: scores.py or compare.py failed; recorded as score_genomic_null"
-            record 6 score_genomic_null failed 1 "$(( SECONDS - t0 ))" "see ${logs}/6.score.log"
+    if (( ${#compare_pids[@]} > 1 )); then wait "${compare_pids[1]}" || gn_rc=1; fi
+    if (( gn_rc != 0 )); then
+        say "genomic null: scores.py or compare.py failed; recorded as score_genomic_null"
+        record 6 score_genomic_null failed 1 "$(( SECONDS - t0 ))" "see ${logs}/score/; gates nothing"
+    fi
+    # null_report.py over every null scored above; it gates nothing and gets its own row (analysis) in status.tsv.
+    t0=${SECONDS}
+    if [[ ! -f "${vs}/null_report.py" ]]; then
+        say "analysis: no ${vs}/null_report.py"
+        record 6 analysis failed 1 0 "no ${vs}/null_report.py; gates nothing"
+    else
+        run_logged score/analysis - "$(cpu_block 0 32)" 0 "${DEFAULT_PY}" "${vs}/null_report.py" \
+            --root "${PILOT_ROOT}" --list "${list}" --datasets "${datasets[@]}" --variants "${variants_name}" \
+            --nulls "${nulls[@]}" --out-dir "${PILOT_ROOT}/analysis"
+        rc=$?
+        if (( rc == 0 )); then
+            record 6 analysis "done" 0 "$(( SECONDS - t0 ))" "${PILOT_ROOT}/analysis; gates nothing"
+        else
+            say "analysis: null_report.py failed (exit ${rc}); recorded as analysis"
+            record 6 analysis failed "${rc}" "$(( SECONDS - t0 ))" "see ${logs}/score/analysis.log; gates nothing"
         fi
     fi
+    wait "${v5_pid}"
+    st+=( "$?" )
     # Last, so that a slow V2 never holds up the scores and the report.
     v2_compare
     st+=( "$?" )
@@ -712,6 +835,78 @@ preflight() {
     variant_list > /dev/null || return 1
     v_dataset="${PILOT_V_DATASET:-$(manifest_cmd peaks | awk 'NR == 1 { print $1 }')}"
     [[ -n "$(v_row)" ]] || { echo "ERROR: no fold ${v_fold} of ${v_dataset} in ${manifest}" >&2; return 1; }
+}
+
+# failed_rows -- the rows of status.tsv in state `failed`, as "<step> <name>" lines; exit 1 when there are none. This
+# script's exit status reads it.
+failed_rows() { awk -F'\t' 'NR > 1 && $3 == "failed" { print $1, $2; found = 1 } END { exit !found }' "${status}"; }
+
+# hold_rows -- the failed rows that hold the node (see Hold above), as failed_rows prints them; exit 1 when there are
+# none. step 1's tests hold only when they gate step 2 (gate, set in main).
+hold_rows() {
+    local holding='^(windows|windows_genomic_null|checks|predict|score|score_genomic_null|analysis)$'
+    awk -F'\t' -v gate="${gate:-}" -v holding="${holding}" '
+        NR > 1 && $3 == "failed" && ($2 ~ holding || ($2 == "tests" && gate == "1")) { print $1, $2; found = 1 }
+        END { exit !found }' "${status}"
+}
+
+# steps_running -- a step of this job other than its batch script and extern step is running: a rerun or a command
+# started with srun --jobid <job> --overlap. False outside Slurm, or when squeue cannot tell.
+steps_running() {
+    [[ -n "${SLURM_JOB_ID:-}" ]] || return 1
+    squeue -h -s -j "${SLURM_JOB_ID}" -o %i 2> /dev/null | grep -qvE '\.(batch|extern)$'
+}
+
+# hold <minutes> -- after a failed row that holds: keep this allocation for up to <minutes>, and past them while a
+# step started in it runs, so that the failed step can be fixed and run again inside it rather than in a new box;
+# ends early when box/<job>.<step>/release exists.
+hold() {
+    local minutes="$1" release="${box_dir}/release" deadline first rerun polls=0 over=""
+    local job="${SLURM_JOB_ID:-<job>}" script="${repo_root}/workflows/variant_scoring/pilot_steps.sh"
+    deadline=$(( SECONDS + minutes * 60 ))
+    first="$(hold_rows | sort -n | awk 'NR == 1 { print $1 }')"
+    # This run's own steps from the first failed one on (a step it left out stays out).
+    rerun="$(tr ',' '\n' <<< "${steps}" | awk -v first="${first:-6}" 'NF && $1 >= first' | paste -sd, -)"
+    say "HOLD: failed: $(failed_rows | paste -sd, - | sed 's/,/, /g'); holding for: $(hold_rows | paste -sd, - |
+        sed 's/,/, /g')"
+    say "HOLD: keeping job ${job} on $(hostname) for up to ${minutes} min, until" \
+        "$(TZ=America/New_York date -d "+${minutes} min" '+%F %T %Z') (longer while a step started in it runs) or its" \
+        "time limit if that comes first; waiting for ${release}, checked every 30 s"
+    say "HOLD: fix the step, then run it again inside this allocation (a rerun gets its own box/<job>.<step>/ and" \
+        "scratch, so nothing of this box is overwritten; steps 2 and 5 keep the outputs they find complete, though" \
+        "step 5 still loads each task's windows and model, ~10-15 min for all of them). From a copy of the" \
+        "checkout's script, never the checkout's own file, with this run's CPUs and no second hold, e.g.:"
+    say "HOLD:   f=${box_dir}/pilot_steps.rerun.\$(date +%s).sh; cp ${script} \"\$f\" &&" \
+        "PILOT_ROOT=${PILOT_ROOT} PILOT_REPO_ROOT=${repo_root} PILOT_STEPS=${rerun:-${first:-6}} PILOT_HOLD_MINUTES=0" \
+        "srun --jobid ${job} --overlap -N1 -n1 taskset -c ${cpus_allowed_list} bash \"\$f\""
+    say "HOLD: or any one command of ${logs} the same way (srun --jobid ${job} --overlap -N1 -n1 taskset -c" \
+        "${cpus_allowed_list} <command>)"
+    say "HOLD: when done, release the node (this job ends, and with it any step still running in it): touch ${release}"
+    while :; do
+        if [[ -e "${release}" ]]; then
+            say "HOLD: ${release} found; releasing the node"
+            return 0
+        fi
+        if (( SECONDS >= deadline )); then
+            if ! steps_running; then
+                say "HOLD: ${minutes} min are up${over:+, and the steps started in this job have ended}; releasing" \
+                    "the node"
+                return 0
+            fi
+            [[ -n "${over}" ]] || say "HOLD: ${minutes} min are up, but a step started in this job is still running" \
+                "(squeue -s -j ${job}); holding until it ends, ${release} exists or the time limit comes"
+            over=1
+        fi
+        sleep 30
+        polls=$(( polls + 1 ))
+        if (( polls % 30 == 0 )); then
+            if [[ -n "${over}" ]]; then
+                say "HOLD: still waiting for the steps started in this job, or ${release}"
+            else
+                say "HOLD: still waiting for ${release}; $(( (deadline - SECONDS + 59) / 60 )) min left"
+            fi
+        fi
+    done
 }
 
 sampler() {
@@ -759,4 +954,9 @@ fi
 
 column -t -s $'\t' "${status}" 2>/dev/null || cat "${status}"
 say "pilot box ${box_id} finished; status ${status}"
-awk -F'\t' 'NR > 1 && $3 == "failed" { bad = 1 } END { exit bad }' "${status}"
+if (( hold_minutes > 0 )) && hold_rows > /dev/null; then
+    hold "${hold_minutes}"
+elif (( hold_minutes > 0 )) && failed_rows > /dev/null; then
+    say "no hold: the failed rows ($(failed_rows | paste -sd, - | sed 's/,/, /g')) gate nothing and need no rerun"
+fi
+if failed_rows > /dev/null; then exit 1; fi

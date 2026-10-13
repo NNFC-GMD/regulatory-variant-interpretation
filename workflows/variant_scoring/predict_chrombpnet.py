@@ -120,8 +120,10 @@ class CountsFunction:
 
         self.names = list(models)
         self._models = list(models.values())
-        self.states = [([v.value for v in m.trainable_variables], [v.value for v in m.non_trainable_variables])
-                       for m in self._models]  # fmt: skip
+        # Copies, not the variables' own buffers: Keras's JAX predict donates those (keras/src/backend/jax/trainer.py,
+        # make_predict_function, donate_argnums=0), so a Keras predict on the same model would free arrays held here.
+        self.states = [([jnp.array(v.value) for v in m.trainable_variables],
+                        [jnp.array(v.value) for v in m.non_trainable_variables]) for m in self._models]  # fmt: skip
         keras_models = self._models
 
         def run(states, tokens):

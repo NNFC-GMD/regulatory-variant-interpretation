@@ -401,10 +401,16 @@ def _survival(values: np.ndarray, points: int = 400) -> tuple[np.ndarray, np.nda
     return v[idx], (len(v) - idx) / len(v)
 
 
-def fig_null(plt, out: Path, datasets, data) -> None:
+def null_phrase(null: str) -> str:
+    """How fig_null and its caption name the null: window set `null` is build_windows.py --null's shuffled one."""
+    return "the shuffled null" if null == "null" else f"the null ({null})"
+
+
+def fig_null(plt, out: Path, datasets, data, null: str = "null") -> None:
     models = [m for m in MODELS if all(m in data[ds] for ds in datasets)]
     if not models:
         return
+    null_legend = "null (shuffled windows)" if null == "null" else f"null ({null})"
     fig, axes = plt.subplots(len(datasets), len(models), figsize=(3.2 * len(models), 3.0 * len(datasets)),
                              squeeze=False)  # fmt: skip
     for i, ds in enumerate(datasets):
@@ -412,7 +418,7 @@ def fig_null(plt, out: Path, datasets, data) -> None:
             ax = axes[i][j]
             _style(ax)
             d = data[ds][m]
-            curves = ((np.concatenate(d.null_abs), CONTEXT, "null (shuffled windows)"),
+            curves = ((np.concatenate(d.null_abs), CONTEXT, null_legend),
                       (np.abs(d.logfc).ravel(), COLOURS.get(m, INK), "variants"))  # fmt: skip
             for values, colour, legend in curves:
                 x, y = _survival(values)
@@ -423,7 +429,7 @@ def fig_null(plt, out: Path, datasets, data) -> None:
             ax.set_xlabel("|logFC|, per fold", fontsize=7.5, color=INK)
             ax.set_ylabel("share of rows at or above", fontsize=7.5, color=INK)
             ax.legend(fontsize=6, frameon=False, loc="lower left")
-    fig.suptitle("Effect sizes of the variants against the shuffled null, all folds pooled", fontsize=9, color=INK)
+    fig.suptitle(f"Effect sizes of the variants against {null_phrase(null)}, all folds pooled", fontsize=9, color=INK)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(out, dpi=200)
     plt.close(fig)
@@ -620,11 +626,11 @@ def main(argv=None) -> int:
         fig_scatter(plt, args.out_dir / "fig_scatter.png", args.datasets, means, pairs, rows_by_ds)
         fig_agreement(plt, args.out_dir / "fig_agreement.png", args.datasets, pairs, rows_by_ds)
         fig_strand(plt, args.out_dir / "fig_strand.png", args.datasets, data, args.folds)
-        fig_null(plt, args.out_dir / "fig_null.png", args.datasets, data)
+        fig_null(plt, args.out_dir / "fig_null.png", args.datasets, data, args.null)
         figures = [("fig_scatter.png", "Fold-mean logFC, model against model"),
                    ("fig_agreement.png", "Agreement by subset against the leave-one-fold-out ceilings"),
                    ("fig_strand.png", "Forward against reverse-complement logFC"),
-                   ("fig_null.png", "Variants against the shuffled null")]  # fmt: skip
+                   ("fig_null.png", f"Variants against {null_phrase(args.null)}")]  # fmt: skip
         figures = [f for f in figures if (args.out_dir / f[0]).exists()]
     report(args.out_dir, args, args.datasets, pairs, models, rows, sizes, figures)
     logger.info("wrote %s: %d datasets, pairs %s", args.out_dir / "report.md", len(args.datasets),

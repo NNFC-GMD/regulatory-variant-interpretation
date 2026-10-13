@@ -36,6 +36,9 @@ The null
   the same model scores them, and their logFC is log2(c2 / c1) in the shuffled background (variant_generator.py:43-47,
   62-72; variant_scoring.py:77-89, 150-163). So the null's predictions need allele2 as well as allele1. A null file
   without a2 stops the run. The null's quantiles use the same peak predictions as the variants', as in VS (:150-155).
+  --null may also name another window set built in variant mode (a1 and a2), such as the genomic null that
+  build_windows.py --list builds from genomic_null.py's list (random substitutions away from peaks, in real sequence);
+  a set without src_ids, as that one, gives null tables without the src_id column.
 
 Across folds (VS's variant_summary_across_folds.py, plus the held-out fold)
   <score>.mean            the arithmetic mean over folds of each per-fold score (:37-43)

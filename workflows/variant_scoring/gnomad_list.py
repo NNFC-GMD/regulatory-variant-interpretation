@@ -911,13 +911,15 @@ def variant_type(ref: str, alt: str) -> str:
 
 
 class Checker:
-    """The per-record checks of `sample`, against one FASTA."""
+    """The per-record checks of `sample`, against one FASTA. keep_mnv passes MNVs on to the other checks instead of
+    dropping them as `mnv` (table_list.py keeps them; build_windows.py builds their windows as VS does)."""
 
-    def __init__(self, fasta: Fasta, chroms: list[str], input_len: int):
+    def __init__(self, fasta: Fasta, chroms: list[str], input_len: int, keep_mnv: bool = False):
         self.fasta = fasta
         self.chroms = set(chroms)
         self.flank = input_len // 2
         self.input_len = input_len
+        self.keep_mnv = keep_mnv
 
     def reason(self, chrom: str, pos: int, ref: str, alt: str) -> str | None:
         """Why a record is dropped, or None to keep it."""
@@ -927,7 +929,7 @@ class Checker:
             return "multiallelic"
         if NON_ACGT.search(ref) or NON_ACGT.search(alt) or not ref or not alt:
             return "non_acgt_allele"
-        if len(ref) == len(alt) and len(ref) > 1:
+        if len(ref) == len(alt) and len(ref) > 1 and not self.keep_mnv:
             return "mnv"
         pos0, extra = pos - 1, max(0, len(ref) - len(alt))
         length = self.fasta.length(chrom)

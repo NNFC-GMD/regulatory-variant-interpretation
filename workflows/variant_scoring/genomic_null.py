@@ -349,9 +349,9 @@ def file_info(path: Path, md5: bool = True) -> dict:
     return info
 
 
-def code_info() -> dict:
-    """This script's md5, and the commit of the checkout it ran from, when git can tell."""
-    script = Path(__file__).resolve()
+def code_info(script: Path | None = None) -> dict:
+    """A script's md5 (this one's by default), and the commit of the checkout it ran from, when git can tell."""
+    script = Path(script or __file__).resolve()
     info: dict = {"script": str(script), "md5": md5_file(script), "commit": None, "script_differs_from_commit": None}
     git = ["git", "-C", str(script.parent)]
     try:

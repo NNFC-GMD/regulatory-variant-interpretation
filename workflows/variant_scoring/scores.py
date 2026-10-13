@@ -73,13 +73,25 @@ Outputs, under <out-root>/<dataset>/
   fold_<k>/<model>.<null>.tsv.gz            the null rows' scores
   <model>.<variants>.summary.tsv.gz         across folds
   <model>.<variants>.json                   inputs, sizes, the strand-average check, the cbp_full derivation
+  Every table also goes to <name>.npz beside its <name>.tsv.gz: the same columns, one array each, float32 for floats,
+  int64 for integers, numpy unicode for text. The TSV is written from those same float32 values, with 7 significant
+  digits, so the two agree digit for digit. --no-fold-tsv leaves out the per-fold TSVs (and deletes one left by an
+  earlier run); the .npz files and the summary TSVs are always written. read_table() reads a table's .npz when there is
+  one, which at millions of rows takes seconds where parsing the TSV takes minutes, whatever the two files' ages: a TSV
+  rewritten later by a scores.py that writes no .npz is not read while an older .npz sits beside it. Both files are
+  written under a temporary name, then renamed.
+  float32 rounds exact fractions: an AAQ of 45000/50000 is stored as 0.89999998, and a p-value k / (n + 1) equal to
+  0.01 in float64 can be stored a hair below it. A threshold on a stored value is compared with a margin of a float32
+  step (or at the null's own resolution, 1 / (n + 1)), not exactly.
 
     python workflows/variant_scoring/scores.py --datasets <ds> [<ds> ...] --preds-root <root>/preds \\
         --windows-root <root>/windows --list <root>/lists/<variants>.tsv --variants <variants> --null null \\
-        --peaks 'peaks.{dataset}' --out-root <root>/scores [--folds 0 1 2 3 4] [--models ...]
+        --peaks 'peaks.{dataset}' --out-root <root>/scores [--folds 0 1 2 3 4] [--models ...] [--no-fold-tsv]
 
 numpy only, so it imports in the Cherimoya and the ChromBPNet environments alike (and in the repository's default
-environment). Holds one model's predictions for one fold at a time.
+environment). Holds one model's predictions for one fold at a time. Single-threaded: run one process per dataset to
+score several at once. At 3.2M variants, a 100k-row null and 50k peaks, a dataset's four models take about 2-3 min with
+--no-fold-tsv and about 5-6 min with the per-fold TSVs (each 3.2M-row TSV about 9 s to format and gzip).
 """
 
 from __future__ import annotations
@@ -89,9 +101,11 @@ import csv
 import gzip
 import json
 import logging
+import operator
 import os
 import sys
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -110,6 +124,10 @@ PVALS = {"logfc": "both", "abs_logfc": "right", "quantile_change": "both"}
 TEXT_COLUMNS = ("variant_id", "id", "src_id")
 # How far a predictor's stored strand average may sit from a recomputation (float32 storage of log counts).
 STRAND_TOL = 1e-5
+# gzip level of the TSVs. On a 3.2M-row table, level 6 compresses at ~17 MB/s and level 1 at ~130 MB/s (measured, one
+# core), for a file only ~10 % larger; rows are formatted a chunk at a time.
+TSV_LEVEL = 1
+TSV_CHUNK = 1 << 16
 
 
 def strand_mean(fwd, rev) -> np.ndarray:
@@ -266,30 +284,103 @@ def load_npz(path: Path) -> dict[str, np.ndarray]:
 
 def write_table(path: Path, columns: dict[str, np.ndarray]) -> None:
     """A gzipped TSV, one column per key: floats with 7 significant digits (NaN as nan), integers as integers,
-    text as it is. Written under a temporary name, then renamed."""
-    formatted = []
-    for values in columns.values():
-        v = np.asarray(values)
+    text as it is. Written under a temporary name, then renamed. Rows are formatted TSV_CHUNK at a time with one
+    %-format per row, which writes each float as format(x, '.7g') does."""
+    values, formats = [], []
+    for v in columns.values():
+        v = np.asarray(v)
         if v.dtype.kind == "f":
-            formatted.append([f"{x:.7g}" for x in v.tolist()])
+            formats.append("%.7g")
+        elif v.dtype.kind in "biu":
+            v = v.astype(np.int64)
+            formats.append("%d")
         else:
-            formatted.append([str(x) for x in (v.astype(np.int64) if v.dtype.kind == "b" else v).tolist()])
+            formats.append("%s")
+        values.append(v)
+    row = "\t".join(formats) + "\n"
+    n = len(values[0]) if values else 0
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(path.name + ".partial")
-    with gzip.open(partial, "wt", compresslevel=6) as fh:
-        fh.write("\t".join(columns) + "\n")
-        fh.writelines("\t".join(row) + "\n" for row in zip(*formatted))
+    with gzip.open(partial, "wb", compresslevel=TSV_LEVEL) as fh:
+        fh.write(("\t".join(columns) + "\n").encode())
+        for start in range(0, n, TSV_CHUNK):
+            chunk = [v[start : start + TSV_CHUNK].tolist() for v in values]
+            fh.write("".join([row % r for r in zip(*chunk)]).encode())
     os.replace(partial, path)
 
 
-def read_table(path: Path) -> dict[str, np.ndarray]:
-    """A write_table file (or any TSV with a header): TEXT_COLUMNS and non-numeric columns as str, others float64."""
-    with gzip.open(path, "rt", newline="") if path.suffix == ".gz" else open(path, newline="") as fh:
+def npz_path(path: Path) -> Path:
+    """Where a table's .npz goes: <name>.tsv.gz (or <name>.tsv) -> <name>.npz, in the same directory."""
+    path = Path(path)
+    for suffix in (".tsv.gz", ".tsv"):
+        if path.name.endswith(suffix):
+            return path.with_name(path.name.removesuffix(suffix) + ".npz")
+    return path.with_name(path.name + ".npz")
+
+
+def table_arrays(columns: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """The columns as a table stores them: floats float32, integers and booleans int64, anything else numpy unicode."""
+    out = {}
+    for name, values in columns.items():
+        v = np.asarray(values)
+        if v.dtype.kind == "f":
+            v = v.astype(np.float32, copy=False)
+        elif v.dtype.kind in "biu":
+            v = v.astype(np.int64, copy=False)
+        elif v.dtype.kind != "U":
+            v = v.astype(str)
+        out[name] = v
+    return out
+
+
+def write_npz_table(path: Path, columns: dict[str, np.ndarray]) -> None:
+    """The columns, as table_arrays stores them, to npz_path(path): one array per column, in column order. Written
+    under a temporary name, then renamed."""
+    out = npz_path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    partial = out.with_name(out.name + ".partial")
+    with open(partial, "wb") as fh:
+        np.savez(fh, **table_arrays(columns))
+    os.replace(partial, out)
+
+
+def save_table(path: Path, columns: dict[str, np.ndarray], tsv: bool = True) -> None:
+    """A table of scores: its .npz always, then its TSV from the same float32 values, so that the two agree digit for
+    digit. tsv=False leaves the TSV out and deletes one an earlier run left at `path`, which would no longer match."""
+    arrays = table_arrays(columns)
+    write_npz_table(path, arrays)
+    if tsv:
+        write_table(path, arrays)
+    else:
+        Path(path).unlink(missing_ok=True)
+
+
+def _number_column(values: np.ndarray) -> np.ndarray:
+    """An .npz column as read_table returns it: float64, or str for text."""
+    if values.dtype.kind in "fbiu":
+        return values.astype(np.float64)
+    return values if values.dtype.kind == "U" else values.astype(str)
+
+
+def read_table(path: Path, columns: Iterable[str] | None = None) -> dict[str, np.ndarray]:
+    """A scores table, from its .npz (npz_path) when there is one, else from the TSV at `path` (a write_table file or
+    any TSV with a header); FileNotFoundError for `path` when there is neither. Either way, text columns come back as
+    str and every other column as float64 (TEXT_COLUMNS are always text; a TSV column that does not parse as numbers
+    is text too). `columns`: only these, those that the table has; the .npz then reads nothing else."""
+    wanted = None if columns is None else list(columns)
+    npz = npz_path(path)
+    if npz.is_file():
+        with np.load(npz, allow_pickle=False) as z:
+            names = z.files if wanted is None else [c for c in wanted if c in z.files]
+            return {name: _number_column(z[name]) for name in names}
+    with gzip.open(path, "rt", newline="") if Path(path).suffix == ".gz" else open(path, newline="") as fh:
         reader = csv.reader(fh, delimiter="\t")
         header = next(reader)
-        columns = list(zip(*reader)) or [()] * len(header)
+        table = list(zip(*reader)) or [()] * len(header)
     out: dict[str, np.ndarray] = {}
-    for name, values in zip(header, columns):
+    for name, values in zip(header, table):
+        if wanted is not None and name not in wanted:
+            continue
         if name in TEXT_COLUMNS:
             out[name] = np.array(values, dtype=str)
             continue
@@ -300,18 +391,64 @@ def read_table(path: Path) -> dict[str, np.ndarray]:
     return out
 
 
+def read_list_columns(path: Path, names: Iterable[str], optional: Iterable[str] = ()) -> dict[str, tuple[str, ...]]:
+    """Columns of a TSV with a header (the variant list), as tuples of text in file order: every one of `names`, which
+    must be there, and those of `optional` that are. One C-level pass per row, so millions of rows take seconds."""
+    names, optional = list(names), list(optional)
+    with gzip.open(path, "rt", newline="") if Path(path).suffix == ".gz" else open(path, newline="") as fh:
+        reader = csv.reader(fh, delimiter="\t")
+        header = next(reader, [])
+        missing = [c for c in names if c not in header]
+        if missing:
+            raise ValueError(f"{path}: no column(s) {', '.join(missing)} in its header")
+        found = [c for c in names + optional if c in header]
+        index = [header.index(c) for c in found]
+        rows = filter(None, reader)  # a blank line is an empty row
+        if len(index) == 1:
+            return {found[0]: tuple(row[index[0]] for row in rows)}
+        table = list(zip(*map(operator.itemgetter(*index), rows))) or [()] * len(found)
+    return dict(zip(found, table))
+
+
+def fold_numbers(values: Iterable[str]) -> np.ndarray:
+    """fold_test texts -> int64, -1 where one is empty or not an integer."""
+    values = list(values)
+    return np.fromiter((int(v) if v.strip().lstrip("-").isdigit() else -1 for v in values), dtype=np.int64,
+                       count=len(values))  # fmt: skip
+
+
+def align(ids: np.ndarray, wanted: np.ndarray) -> np.ndarray:
+    """The position in `ids` of each of `wanted` (ids unique): arange when they are the same, else one sort of ids.
+    ValueError naming the first of `wanted` that ids lack."""
+    ids, wanted = np.asarray(ids), np.asarray(wanted)
+    if len(ids) == len(wanted) and np.array_equal(ids, wanted):
+        return np.arange(len(ids))
+    if not len(wanted):
+        return np.zeros(0, dtype=np.int64)
+    if not len(ids):
+        raise ValueError(f"{len(wanted)} id(s) are not there, e.g. {wanted[0]}")
+    order = np.argsort(ids, kind="stable")
+    rows = order[np.minimum(np.searchsorted(ids, wanted, sorter=order), len(ids) - 1)]
+    absent = np.flatnonzero(ids[rows] != wanted)
+    if len(absent):
+        raise ValueError(f"{len(absent)} id(s) are not there, e.g. {wanted[absent[0]]}")
+    return rows
+
+
 def read_fold_test(path: Path) -> dict[str, int]:
     """variant_id -> fold_test from the variant list; -1 where the column is empty or not an integer."""
-    out = {}
-    with gzip.open(path, "rt", newline="") if path.suffix == ".gz" else open(path, newline="") as fh:
-        for row in csv.DictReader(fh, delimiter="\t"):
-            value = (row.get("fold_test") or "").strip()
-            out[row["variant_id"]] = int(value) if value.lstrip("-").isdigit() else -1
-    return out
+    cols = read_list_columns(path, ("variant_id",), optional=("fold_test",))
+    folds = fold_numbers(cols["fold_test"]) if "fold_test" in cols else np.full(len(cols["variant_id"]), -1)
+    return dict(zip(cols["variant_id"], folds.tolist()))
 
 
 def pred_path(root: Path, dataset: str, fold: int, model: str, name: str) -> Path:
     return root / dataset / f"fold_{fold}" / f"{model}.{name}.npz"
+
+
+def _text(values) -> np.ndarray:
+    values = np.asarray(values)
+    return values if values.dtype.kind == "U" else values.astype(str)
 
 
 def _check_rows(path: Path, preds: dict, ids: np.ndarray) -> None:
@@ -319,7 +456,7 @@ def _check_rows(path: Path, preds: dict, ids: np.ndarray) -> None:
     for key, values in preds.items():
         if key in PRED_KEYS and len(values) != len(ids):
             raise ValueError(f"{path}: {key} has {len(values)} rows, its windows {len(ids)}")
-    if "ids" in preds and not np.array_equal(np.asarray(preds["ids"]).astype(str), np.asarray(ids).astype(str)):
+    if "ids" in preds and not np.array_equal(_text(preds["ids"]), _text(ids)):
         raise ValueError(f"{path}: its ids are not its windows' ids, row for row")
 
 
@@ -391,19 +528,23 @@ def run_model(args, dataset: str, model: str, names: dict[str, str], fold_test: 
         null = load_preds(args.preds_root, dataset, k, model, names["null"], ids["null"], notes)
         peaks = load_preds(args.preds_root, dataset, k, model, names["peaks"], ids["peaks"], notes)
         var_scores, null_scores = score_fold(variants, null, peaks)
-        write_table(out_dir / f"fold_{k}" / f"{model}.{names['variants']}.tsv.gz",
-                    {"variant_id": ids["variants"], **var_scores})  # fmt: skip
+        del variants, null, peaks
+        save_table(out_dir / f"fold_{k}" / f"{model}.{names['variants']}.tsv.gz",
+                   {"variant_id": ids["variants"], **var_scores}, tsv=args.fold_tsv)  # fmt: skip
         null_cols = {"id": ids["null"]} | ({"src_id": ids["null_src"]} if ids["null_src"] is not None else {})
-        write_table(out_dir / f"fold_{k}" / f"{model}.{names['null']}.tsv.gz", null_cols | null_scores)
+        save_table(out_dir / f"fold_{k}" / f"{model}.{names['null']}.tsv.gz", null_cols | null_scores,
+                   tsv=args.fold_tsv)  # fmt: skip
         notes.update(n_variants=len(ids["variants"]), n_null=len(ids["null"]), n_peaks=len(ids["peaks"]),
                      min_p_right=1 / (len(ids["null"]) + 1), min_p_two_tailed=2 / (len(ids["null"]) + 1),
                      null_abs_logfc_q95=float(np.quantile(null_scores["abs_logfc"], 0.95)),
                      null_abs_logfc_q99=float(np.quantile(null_scores["abs_logfc"], 0.99)))  # fmt: skip
         meta["folds"][str(k)] = notes
-        per_fold[k] = var_scores
+        # Only what the summary needs is kept across folds (at 3.2M rows each score is 26 MB).
+        per_fold[k] = {key: v for key, v in var_scores.items() if key in SCORES or key.endswith(".pval")}
     summary = aggregate_folds(per_fold, fold_test)
-    write_table(out_dir / f"{model}.{names['variants']}.summary.tsv.gz", {"variant_id": ids["variants"], **summary})
+    save_table(out_dir / f"{model}.{names['variants']}.summary.tsv.gz", {"variant_id": ids["variants"], **summary})
     meta["n_heldout"] = int(np.isin(fold_test, args.folds).sum())
+    meta["fold_tsv"] = args.fold_tsv
     (out_dir / f"{model}.{names['variants']}.json").write_text(json.dumps(meta, indent=2) + "\n")
     return meta
 
@@ -420,12 +561,17 @@ def main(argv=None) -> int:
     ap.add_argument("--out-root", type=Path, required=True)
     ap.add_argument("--folds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     ap.add_argument("--models", nargs="+", default=list(MODELS))
+    ap.add_argument("--no-fold-tsv", dest="fold_tsv", action="store_false",
+                    help="no per-fold .tsv.gz tables (their .npz and the summary TSVs are written)")  # fmt: skip
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="[%(asctime)s] %(levelname)s %(message)s", datefmt="%F %T")  # fmt: skip
 
-    fold_of = read_fold_test(args.list)
+    listed = read_list_columns(args.list, ("variant_id",), optional=("fold_test",))
+    list_ids = np.array(listed["variant_id"], dtype=str)
+    list_folds = fold_numbers(listed["fold_test"]) if "fold_test" in listed else np.full(len(list_ids), -1)
+    del listed
     status = 0
     for dataset in args.datasets:
         names = {"variants": args.variants, "null": args.null, "peaks": args.peaks.replace("{dataset}", dataset)}
@@ -433,11 +579,11 @@ def main(argv=None) -> int:
         ids["variants"], _ = window_ids(args.windows_root, names["variants"])
         ids["null"], ids["null_src"] = window_ids(args.windows_root, names["null"])
         ids["peaks"], _ = window_ids(args.windows_root, names["peaks"])
-        unknown = [v for v in ids["variants"].tolist() if v not in fold_of]
-        if unknown:
-            logger.error("%d window id(s) are not in %s, e.g. %s", len(unknown), args.list, unknown[0])
+        try:
+            fold_test = list_folds[align(list_ids, ids["variants"])]
+        except ValueError as err:
+            logger.error("window ids of %s are not in %s: %s", names["variants"], args.list, err)
             return 1
-        fold_test = np.array([fold_of[v] for v in ids["variants"].tolist()], dtype=np.int64)
         for model in args.models:
             started = time.time()
             try:

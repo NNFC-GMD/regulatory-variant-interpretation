@@ -16,7 +16,11 @@ VS is kundajelab/variant-scorer, main @0e1e341; "VS file:line" refers to that co
   strands     V5: every prediction file under --preds-root, forward against reverse complement: Pearson and Spearman
               of the per-strand log counts and their |difference|; for files with allele 2, the logFC from each strand
               alone, against the other strand and against the strand-averaged logFC (what forward-only scoring would
-              change).
+              change). Every statistic uses all of a file's rows except Spearman's rho, which takes two sorts per
+              pair: on a file of more than --rank-rows rows (default 200,000) it uses a seeded sample of that many
+              (--rank-seed; the same rows in every file of a window set), and the TSV's n_spearman says how many. The
+              summary (median and worst Pearson, median and largest p99 per model) is over all rows. Files are read
+              without their ids (0.5 GB in a 3.2M-row file), so 200 such files take a few minutes, not an hour.
   vs-list     V2's inputs for VS main: --n rows of the variant list, among those build_windows.py kept, in VS's
               headerless `chrombpnet` schema (chr, pos, allele1, allele2, variant_id: VS src/utils/io.py:12, 42-48),
               plus chrom sizes from the FASTA's .fai.
@@ -32,7 +36,8 @@ Exit status: 0 = ran and passed (or had nothing to pass), 3 = ran but outside it
 (argparse's own usage errors exit 2, so 2 never means a tolerance).
 
     python workflows/variant_scoring/vchecks.py pair --a A.npz --b B.npz --label rerun --out pair.json [--tol 1e-4]
-    python workflows/variant_scoring/vchecks.py strands --preds-root <root>/preds --out <root>/checks/v5.json
+    python workflows/variant_scoring/vchecks.py strands --preds-root <root>/preds --out <root>/checks/v5.json \\
+        [--rank-rows 200000]
     python workflows/variant_scoring/vchecks.py vs-list --list <list.tsv> --windows <root>/windows/variants.npz \\
         --fai <genome.fasta>.fai --n 2000 --out-dir <root>/checks/v2
     python workflows/variant_scoring/vchecks.py vs-compare --vs-scores <prefix>.variant_scores.tsv \\
@@ -64,6 +69,11 @@ logger = logging.getLogger("vchecks")
 ARRAYS = ("a1_logcounts", "a2_logcounts", "a1_fwd", "a1_rev", "a2_fwd", "a2_rev")
 VS_SCORE_COLUMNS = ("variant_id", "allele1_pred_counts", "allele2_pred_counts", "logfc")
 SUMMARY_COLUMNS = ("check", "label", "quantity", "n", "p50", "p99", "max", "pearson", "tol", "pass")
+STRAND_COLUMNS = ("dataset", "fold", "model", "set", "quantity", "n", "pearson", "spearman", "n_spearman", "p50", "p99",
+                  "max")  # fmt: skip
+# V5's Spearman: at most this many rows per file, a sample drawn with default_rng(RANK_SEED).
+RANK_ROWS = 200_000
+RANK_SEED = 0
 # The exit status of a check that ran but is outside its tolerance (pilot_steps.sh reads it). Not 2, which is
 # argparse's exit status for a usage error.
 OUTSIDE_TOLERANCE = 3
@@ -154,9 +164,31 @@ def parse_pred_path(path: Path) -> dict:
             "set": name}  # fmt: skip
 
 
-def strand_rows(path: Path) -> list[dict]:
-    preds = pc.read_predictions(path)
+def read_arrays(path: Path) -> dict[str, np.ndarray]:
+    """A predictions file's log-count arrays (ARRAYS), without its ids, which V5 does not use."""
+    with np.load(path, allow_pickle=False) as z:
+        return {k: z[k] for k in z.files if k in ARRAYS}
+
+
+def rank_sample(n: int, k: int, seed: int = RANK_SEED) -> np.ndarray | None:
+    """The rows Spearman's rho is computed on: None (all) when n <= k or k < 1, else k rows drawn without replacement
+    with default_rng(seed), in row order; so every file of n rows gets the same rows."""
+    if k < 1 or n <= k:
+        return None
+    return np.sort(np.random.default_rng(seed).choice(n, size=k, replace=False))
+
+
+def strand_rows(path: Path, rank_rows: int = RANK_ROWS, rank_seed: int = RANK_SEED) -> list[dict]:
+    """V5's rows for one predictions file: per allele and for the logFC, the module docstring's statistics."""
+    preds = read_arrays(path)
     where = parse_pred_path(path)
+    n = len(next(iter(preds.values()))) if preds else 0
+    sample = rank_sample(n, rank_rows, rank_seed)
+    n_rank = n if sample is None else len(sample)
+
+    def rho(x, y) -> float:
+        return spearman(x, y) if sample is None else spearman(np.asarray(x)[sample], np.asarray(y)[sample])
+
     out = []
     for allele in pc.ALLELES:
         fwd, rev = preds.get(f"{allele}_fwd"), preds.get(f"{allele}_rev")
@@ -164,17 +196,18 @@ def strand_rows(path: Path) -> list[dict]:
             continue
         s = diff_stats(fwd, rev)
         out.append({**where, "quantity": f"{allele}_fwd_vs_rev", "n": s["n"], "pearson": s["pearson"],
-                    "spearman": spearman(fwd, rev), "p50": s["p50"], "p99": s["p99"], "max": s["max"]})  # fmt: skip
+                    "spearman": rho(fwd, rev), "n_spearman": n_rank, "p50": s["p50"], "p99": s["p99"],
+                    "max": s["max"]})  # fmt: skip
     if all(f"{a}_{s}" in preds for a in pc.ALLELES for s in pc.STRANDS):
         lf = (preds["a2_fwd"].astype(np.float64) - preds["a1_fwd"]) / pc.LN2
         lr = (preds["a2_rev"].astype(np.float64) - preds["a1_rev"]) / pc.LN2
         la = logfc(preds)
         for quantity, x, y in (("logfc_fwd_vs_rev", lf, lr), ("logfc_fwd_vs_average", lf, la)):
             s = diff_stats(x, y)
-            out.append({**where, "quantity": quantity, "n": s["n"], "pearson": s["pearson"],
-                        "spearman": spearman(x, y), "p50": s["p50"], "p99": s["p99"], "max": s["max"]})  # fmt: skip
+            out.append({**where, "quantity": quantity, "n": s["n"], "pearson": s["pearson"], "spearman": rho(x, y),
+                        "n_spearman": n_rank, "p50": s["p50"], "p99": s["p99"], "max": s["max"]})  # fmt: skip
         out.append({**where, "quantity": "abs_logfc_average", "n": len(la), "pearson": float("nan"),
-                    "spearman": float("nan"), "p50": float(np.quantile(np.abs(la), 0.5)),
+                    "spearman": float("nan"), "n_spearman": None, "p50": float(np.quantile(np.abs(la), 0.5)),
                     "p99": float(np.quantile(np.abs(la), 0.99)), "max": float(np.abs(la).max(initial=0.0))})  # fmt: skip
     return out
 
@@ -306,6 +339,10 @@ def main(argv=None) -> int:
     s = sub.add_parser("strands", help="V5: forward vs reverse strand of every prediction file")
     s.add_argument("--preds-root", type=Path, required=True, help="holds <dataset>/fold_<k>/<model>.<set>.npz")
     s.add_argument("--out", type=Path, required=True, help="JSON; a .tsv with one row per file goes beside it")
+    s.add_argument("--rank-rows", type=int, default=RANK_ROWS,
+                   help="Spearman on at most this many rows per file, a seeded sample (default %(default)s; 0: all); "
+                        "every other statistic uses all rows")  # fmt: skip
+    s.add_argument("--rank-seed", type=int, default=RANK_SEED, help="seed of that sample (default %(default)s)")
     v = sub.add_parser("vs-list", help="V2: VS main's input files")
     v.add_argument("--list", type=Path, required=True, help="the variant list TSV (header row)")
     v.add_argument("--windows", type=Path, required=True, help="build_windows.py's variant npz (rows it kept)")
@@ -341,12 +378,11 @@ def main(argv=None) -> int:
             files = sorted(args.preds_root.glob("*/fold_*/*.npz"))
             if not files:
                 raise ValueError(f"no prediction files under {args.preds_root}")
-            rows = [r for f in files for r in strand_rows(f)]
-            write_rows(args.out.with_suffix(".tsv"),
-                       ("dataset", "fold", "model", "set", "quantity", "n", "pearson", "spearman", "p50", "p99", "max"),
-                       rows)  # fmt: skip
+            rows = [r for f in files for r in strand_rows(f, args.rank_rows, args.rank_seed)]
+            write_rows(args.out.with_suffix(".tsv"), STRAND_COLUMNS, rows)
             pc.write_json(args.out, {"check": "strands", "label": "V5", "preds_root": str(args.preds_root),
-                                     "files": len(files), "by_model": summarise_strands(rows)})  # fmt: skip
+                                     "files": len(files), "spearman_rows": args.rank_rows,
+                                     "spearman_seed": args.rank_seed, "by_model": summarise_strands(rows)})  # fmt: skip
             logger.info("V5: %d files, %d rows -> %s", len(files), len(rows), args.out.with_suffix(".tsv"))
             return 0
         if args.command == "vs-list":

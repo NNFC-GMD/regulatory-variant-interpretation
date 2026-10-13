@@ -315,6 +315,45 @@ def test_strands_v5(tmp_path):
     assert summary["files"] == 2 and "a1_fwd_vs_rev" in summary["by_model"]["m1"]
 
 
+def test_strands_v5_ranks_a_seeded_sample(tmp_path):
+    """V5 at scale: Spearman on a seeded sample of at most --rank-rows rows (n_spearman); the differences, Pearson and
+    the summary over every row."""
+    fold = tmp_path / "preds" / "dsA" / "fold_0"
+    fold.mkdir(parents=True)
+    n, k = 300, 100
+    sample = vc.rank_sample(n, k)
+    assert len(sample) == k and np.array_equal(sample, vc.rank_sample(n, k)) and (np.diff(sample) > 0).all()
+    assert vc.rank_sample(n, n) is None and vc.rank_sample(n, 0) is None
+    p = _preds(n=n)
+    left_out = np.setdiff1d(np.arange(n), sample)
+    outlier = int(left_out[np.argmin(p["a1_fwd"][left_out])])  # outside the sample, and far from its rank
+    rev = p["a1_fwd"] + np.float32(0.01)
+    rev[outlier] += np.float32(5.0)
+    strands = {"a1": {"fwd": p["a1_fwd"], "rev": rev}, "a2": {"fwd": p["a2_fwd"], "rev": p["a2_rev"]}}
+    p.update(pc.prediction_arrays(strands))
+    np.savez(fold / "m1.variants.npz", **p)
+
+    def run(rank_rows: int) -> dict:
+        out = tmp_path / f"v5_{rank_rows}.json"
+        assert vc.main(["strands", "--preds-root", str(tmp_path / "preds"), "--out", str(out),
+                        "--rank-rows", str(rank_rows)]) == 0  # fmt: skip
+        lines = out.with_suffix(".tsv").read_text().splitlines()
+        rows = {r["quantity"]: r for r in (dict(zip(lines[0].split("\t"), ln.split("\t"))) for ln in lines[1:])}
+        return {"rows": rows, "json": json.loads(out.read_text())}
+
+    sampled, every = run(k), run(0)
+    a1 = sampled["rows"]["a1_fwd_vs_rev"]
+    assert int(a1["n"]) == n and int(a1["n_spearman"]) == k and int(every["rows"]["a1_fwd_vs_rev"]["n_spearman"]) == n
+    assert float(a1["max"]) == pytest.approx(5.01, rel=1e-4)  # the outlier, which the sample leaves out
+    assert float(a1["pearson"]) == pytest.approx(vc.pearson(p["a1_fwd"], p["a1_rev"]), rel=1e-5)
+    assert float(a1["spearman"]) == pytest.approx(1.0, abs=1e-9)  # the sample is in order on both strands
+    assert float(every["rows"]["a1_fwd_vs_rev"]["spearman"]) < 0.999  # all rows: the outlier moves
+    assert sampled["rows"]["abs_logfc_average"]["n_spearman"] == ""
+    m1 = sampled["json"]["by_model"]["m1"]["a1_fwd_vs_rev"]
+    assert sampled["json"]["spearman_rows"] == k and m1 == every["json"]["by_model"]["m1"]["a1_fwd_vs_rev"]
+    assert m1["pearson_min"] == pytest.approx(float(a1["pearson"]), rel=1e-5)
+
+
 def test_vs_list_and_vs_compare(tmp_path):
     header = "variant_id\tchrom\tpos\tref\talt\tsource\tstratum\taf\tdist_to_summit\tfold_test\n"
     lines = [f"chr1:{1100 + i}:A:{'C' if i % 3 else 'CT'}\tchr1\t{1100 + i}\tA\t{'C' if i % 3 else 'CT'}\tgenome"

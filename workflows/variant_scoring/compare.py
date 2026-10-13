@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Compare the models' variant scores, for the pilot report: agreement, ceilings, strands and the null.
 
-Reads scores.py's per-fold tables for each dataset and model, joined by variant_id (every model and fold must hold the
-same variants in the same order), and the variant list for each variant's stratum, type and callset. Every number is
-on logFC (log2), the count score; abs_logfc.pval is the p-value read.
+Reads scores.py's per-fold tables for each dataset and model through scores.read_table (their .npz when there is one,
+and only the columns used), joined by variant_id (every model and fold must hold the same variants in the same order),
+and the variant list for each variant's stratum, type and callset. Every number is on logFC (log2), the count score;
+abs_logfc.pval is the p-value read. Each dataset is compared on the models it has scores for: a model or pair that one
+dataset lacks (scores.py refused a fold, say) is a dash in that dataset's tables and a blank panel in its figures, not
+a gap in every dataset's. A dataset with no scores, or whose tables do not fit together, is left out and the others are
+written; the exit status is then 1.
 
 Per dataset, in every subset of the variants (all; each stratum; SNV, MNV and indel; each callset as the list gives
-it, i.e. exome, genome or both):
+it, e.g. exome, genome or both; a subset that holds every variant, such as the one source of a list from one callset,
+repeats `all` and is left out):
   agreement between two models (--pairs; default Cherimoya against each ChromBPNet model)
     fold_mean   Pearson and Spearman of the two models' fold-mean logFC (B in the attribution comparison)
     same_fold   the same per fold, model A fold k against model B fold k, then the mean over folds (A)
@@ -37,10 +42,20 @@ Outputs, in --out-dir:
   fig_agreement.png    cross-model Pearson by subset next to both models' leave-one-out ceilings
   fig_strand.png       forward-strand against reverse-strand logFC, per model (first fold)
   fig_null.png         how often |logFC| exceeds a value, the variants against the null, per model
+  Every statistic, the r in a panel's title and the curves of fig_null use all variants. The scatter panels draw at
+  most --figure-points of them (default 200,000), the same seeded random sample (--figure-seed) in every panel of a
+  dataset; the captions say so.
+
+Scale: each dataset is loaded, compared and reduced to its figure inputs on its own (in --workers processes, one per
+dataset at a time), and only rows and figure inputs come back, so memory holds one dataset per worker. At 3.2M
+variants, 4 models and 5 folds that is ~2 GB of scores (float64), ~1 GB of variant ids (0.5 GB each; read from each
+model's first fold only), ~1 GB of the list's columns and ~1 GB of temporaries per worker, ~4.5-5 GB in all, and
+~3-4 min of statistics per dataset (most of it Spearman's ranks); with a worker per dataset, 10 datasets take ~5 min
+and ~50 GB, then ~2-3 min of figures in this process.
 
     python workflows/variant_scoring/compare.py --scores-root <root>/scores --datasets <ds> [<ds> ...] \\
         --list <root>/lists/<variants>.tsv --variants <variants> --out-dir <root>/compare [--null null] \\
-        [--folds 0 1 2 3 4] [--pairs cherimoya:cbp_full ...] [--top 0.01]
+        [--folds 0 1 2 3 4] [--pairs cherimoya:cbp_full ...] [--top 0.01] [--workers 10]
 
 Runs in the pixi `cherimoya` environment (numpy, scipy, matplotlib); the statistics alone need numpy and scipy.
 """
@@ -49,11 +64,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-import gzip
+import functools
 import json
 import logging
 import math
+import multiprocessing
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -80,6 +97,10 @@ SOURCES = ("exome", "genome", "both")
 COLOURS = {"cherimoya": "#D55E00", "cbp_full": "#0072B2", "cbp_nobias": "#009E73", "cbp_bias": "#CC79A7"}
 CONTEXT = "#8C8C8C"  # the null, ceilings and reference lines
 INK, MUTED, GRID = "#222222", "#666666", "#E6E6E6"
+# Points per scatter panel at most (a seeded sample of the variants), and the sample's seed.
+FIGURE_POINTS = 200_000
+FIGURE_SEED = 0
+LOG_FORMAT = {"format": "[%(asctime)s] %(levelname)s %(message)s", "datefmt": "%F %T"}
 
 
 def label(model: str) -> str:
@@ -89,16 +110,25 @@ def label(model: str) -> str:
 # --- statistics ------------------------------------------------------------------------------------------------
 
 
-def correlations(x, y) -> dict:
-    """Pearson and Spearman (average ranks) over the rows finite in both; NaN with fewer than 3 or no spread."""
+def correlations(x, y, spearman: bool = True) -> dict:
+    """Pearson and Spearman (average ranks) over the rows finite in both; NaN with fewer than 3 or no spread.
+    spearman=False skips the ranks (two sorts, most of the cost at millions of rows) and reports NaN for it."""
     x, y = np.asarray(x, np.float64), np.asarray(y, np.float64)
     ok = np.isfinite(x) & np.isfinite(y)
     n = int(ok.sum())
     if n < 3 or np.ptp(x[ok]) == 0 or np.ptp(y[ok]) == 0:
         return {"n": n, "pearson": math.nan, "spearman": math.nan}
     xs, ys = x[ok], y[ok]
-    return {"n": n, "pearson": float(np.corrcoef(xs, ys)[0, 1]),
-            "spearman": float(np.corrcoef(rankdata(xs), rankdata(ys))[0, 1])}  # fmt: skip
+    rho = float(np.corrcoef(rankdata(xs), rankdata(ys))[0, 1]) if spearman else math.nan
+    return {"n": n, "pearson": float(np.corrcoef(xs, ys)[0, 1]), "spearman": rho}
+
+
+def subsample(n: int, k: int, seed: int) -> np.ndarray:
+    """The rows a scatter panel draws: all n of them when n <= k (or k < 1), else k drawn without replacement with
+    default_rng(seed), in row order. The same arguments give the same rows."""
+    if k < 1 or n <= k:
+        return np.arange(n)
+    return np.sort(np.random.default_rng(seed).choice(n, size=k, replace=False))
 
 
 def top_overlap(x, y, frac: float) -> float:
@@ -160,32 +190,62 @@ class ModelScores:
     null_abs: list[np.ndarray]  # per fold, the null rows' |logFC|
 
 
-def read_variant_list(path: Path) -> dict[str, dict]:
-    """variant_id -> stratum, source, type (SNV, MNV or indel) and fold_test (-1 for none)."""
-    out = {}
-    with gzip.open(path, "rt", newline="") if path.suffix == ".gz" else open(path, newline="") as fh:
-        for row in csv.DictReader(fh, delimiter="\t"):
-            ref, alt = row["ref"], row["alt"]
-            vtype = "SNV" if len(ref) == len(alt) == 1 else "MNV" if len(ref) == len(alt) else "indel"
-            fold = (row.get("fold_test") or "").strip()
-            out[row["variant_id"]] = {"stratum": row.get("stratum", ""), "source": row.get("source", ""),
-                                      "type": vtype, "fold_test": int(fold) if fold.lstrip("-").isdigit() else -1}  # fmt: skip
-    return out
+def read_variant_list(path: Path) -> dict[str, np.ndarray]:
+    """The variant list's columns the comparison uses, one array each, in list order: variant_id, stratum, source,
+    type (SNV, MNV or indel, from the allele lengths) and fold_test (-1 for none). Read once per process (again if the
+    file changes); the arrays are shared, so callers index them and never write to them."""
+    stat = Path(path).stat()
+    return _read_variant_list(Path(path), stat.st_mtime_ns, stat.st_size)
+
+
+@functools.lru_cache(maxsize=1)
+def _read_variant_list(path: Path, mtime_ns: int, size: int) -> dict[str, np.ndarray]:
+    cols = sc.read_list_columns(path, ("variant_id", "ref", "alt"), optional=("stratum", "source", "fold_test"))
+    n = len(cols["variant_id"])
+    # Allele lengths only: an array of the alleles themselves would be as wide as the longest insertion.
+    ref = np.fromiter(map(len, cols["ref"]), dtype=np.int64, count=n)
+    alt = np.fromiter(map(len, cols["alt"]), dtype=np.int64, count=n)
+
+    def text(name: str) -> np.ndarray:
+        return np.array(cols[name], dtype=str) if name in cols and n else np.full(n, "", dtype=str)
+
+    return {"variant_id": text("variant_id"), "stratum": text("stratum"), "source": text("source"),
+            "type": np.where((ref == 1) & (alt == 1), "SNV", np.where(ref == alt, "MNV", "indel")),
+            "fold_test": sc.fold_numbers(cols["fold_test"]) if "fold_test" in cols else np.full(n, -1)}  # fmt: skip
+
+
+def table_path(root: Path, dataset: str, fold: int, model: str, name: str) -> Path:
+    """scores.py's per-fold table; read_table reads its .npz when there is one (always, with --no-fold-tsv)."""
+    return root / dataset / f"fold_{fold}" / f"{model}.{name}.tsv.gz"
+
+
+def first_missing(root: Path, dataset: str, model: str, variants: str, null: str, folds: list[int]) -> Path | None:
+    """The first per-fold table of a model that is not there (neither its TSV nor its .npz), or None."""
+    for k in folds:
+        for name in (variants, null):
+            path = table_path(root, dataset, k, model, name)
+            if not (sc.npz_path(path).is_file() or path.is_file()):
+                return path
+    return None
 
 
 def load_model(root: Path, dataset: str, model: str, variants: str, null: str, folds: list[int]) -> tuple:
-    """(variant ids, ModelScores) from scores.py's per-fold tables; raises FileNotFoundError if a fold is missing."""
+    """(variant ids, ModelScores) from scores.py's per-fold tables; raises FileNotFoundError if a fold is missing. The
+    ids are read from the first fold's table only (0.5 GB at 3.2M variants): scores.py writes every fold of a model
+    from the same window ids, so a later fold is checked by its row count."""
     ids, cols = None, {"logfc": [], "logfc_fwd": [], "logfc_rev": [], "abs_logfc.pval": []}
     null_abs = []
     for k in folds:
-        table = sc.read_table(root / dataset / f"fold_{k}" / f"{model}.{variants}.tsv.gz")
+        columns = (*cols,) if ids is not None else ("variant_id", *cols)
+        table = sc.read_table(table_path(root, dataset, k, model, variants), columns=columns)
         if ids is None:
             ids = table["variant_id"]
-        elif not np.array_equal(ids, table["variant_id"]):
-            raise ValueError(f"{dataset} {model}: fold {k} holds other variants than fold {folds[0]}")
+        elif len(table["logfc"]) != len(ids):
+            raise ValueError(f"{dataset} {model}: fold {k} holds {len(table['logfc'])} variants, fold {folds[0]} "
+                             f"{len(ids)}")  # fmt: skip
         for c in cols:
             cols[c].append(table.get(c))
-        null_abs.append(sc.read_table(root / dataset / f"fold_{k}" / f"{model}.{null}.tsv.gz")["abs_logfc"])
+        null_abs.append(sc.read_table(table_path(root, dataset, k, model, null), columns=("abs_logfc",))["abs_logfc"])
     stranded = all(v is not None for v in cols["logfc_fwd"] + cols["logfc_rev"])
 
     def stack(column):
@@ -194,14 +254,16 @@ def load_model(root: Path, dataset: str, model: str, variants: str, null: str, f
     return ids, ModelScores(stack("logfc"), stack("logfc_fwd"), stack("logfc_rev"), stack("abs_logfc.pval"), null_abs)
 
 
-def subsets(meta: list[dict]) -> list[tuple[str, str, np.ndarray]]:
-    """(kind, name, mask) for every non-empty subset: all, strata, variant types, callsets."""
-    out = [("all", "all", np.ones(len(meta), dtype=bool))]
+def subsets(meta: dict[str, np.ndarray]) -> list[tuple[str, str, np.ndarray]]:
+    """(kind, name, mask) for all, the strata, the variant types and the callsets. A subset that is empty or holds
+    every variant (it would repeat all) is left out."""
+    n = len(meta["fold_test"])
+    out = [("all", "all", np.ones(n, dtype=bool))]
     for kind, field, names in (("stratum", "stratum", STRATA), ("type", "type", TYPES), ("source", "source", SOURCES)):
-        values = np.array([m[field] for m in meta])
+        values = meta[field]
         for name in names + tuple(sorted(set(values.tolist()) - set(names) - {""})):
             mask = values == name
-            if mask.any():
+            if mask.any() and not mask.all():
                 out.append((kind, name, mask))
     return out
 
@@ -209,9 +271,10 @@ def subsets(meta: list[dict]) -> list[tuple[str, str, np.ndarray]]:
 # --- the comparison --------------------------------------------------------------------------------------------
 
 
-def compare_dataset(dataset: str, data: dict[str, ModelScores], meta: list[dict], folds: list[int],
+def compare_dataset(dataset: str, data: dict[str, ModelScores], meta: dict[str, np.ndarray], folds: list[int],
                     pairs: list[tuple[str, str]], frac: float) -> dict[str, list[dict]]:  # fmt: skip
-    fold_test = np.array([m["fold_test"] for m in meta])
+    """Every statistic of one dataset, on all of its variants (meta: read_variant_list's columns, row for row)."""
+    fold_test = meta["fold_test"]
     means = {m: d.logfc.mean(axis=1) for m, d in data.items()}
     held = {m: heldout(d.logfc, fold_test, folds) for m, d in data.items()}
     rows: dict[str, list[dict]] = {"agreement": [], "strand": [], "null": []}
@@ -248,7 +311,7 @@ def strand_rows(base: dict, model: str, both: np.ndarray, fwd: np.ndarray, rev: 
         r = correlations(fwd[:, j], rev[:, j])
         per["pearson_fwd_rev"].append(r["pearson"])
         per["spearman_fwd_rev"].append(r["spearman"])
-        per["pearson_fwd_both"].append(correlations(fwd[:, j], both[:, j])["pearson"])
+        per["pearson_fwd_both"].append(correlations(fwd[:, j], both[:, j], spearman=False)["pearson"])
         per["top_overlap_fwd_both"].append(top_overlap(fwd[:, j], both[:, j], frac))
     return [{**base, "model": model, "measure": k, "mean": _mean(v), "worst_fold": _min(v)} for k, v in per.items()]
 
@@ -284,6 +347,77 @@ def write_rows(path: Path, rows: list[dict]) -> None:
             writer.writerow({k: (f"{v:.6g}" if isinstance(v, float) else v) for k, v in row.items()})
 
 
+# --- one dataset, in a worker ----------------------------------------------------------------------------------
+
+
+def figure_data(data: dict[str, ModelScores], points: int, seed: int) -> dict:
+    """What the figures draw of one dataset, small enough to send back from a worker: per model, the fold-mean logFC
+    and fold 0's logFC of each strand at the rows subsample(n, points, seed) gives (the same rows for every model),
+    fold 0's forward-reverse r over all rows, and fig_null's curves over all rows."""
+    n = len(next(iter(data.values())).logfc)
+    rows = subsample(n, points, seed)
+    out: dict = {"n": n, "shown": len(rows), "means": {}, "strand": {}, "survival": {}}
+    for m, d in data.items():
+        out["means"][m] = d.logfc.mean(axis=1)[rows]
+        if d.logfc_fwd is not None:
+            fwd, rev = d.logfc_fwd[:, 0], d.logfc_rev[:, 0]
+            out["strand"][m] = {"fwd": fwd[rows], "rev": rev[rows],
+                                "pearson": correlations(fwd, rev, spearman=False)["pearson"]}  # fmt: skip
+        out["survival"][m] = {"null": _survival(np.concatenate(d.null_abs)),
+                              "variants": _survival(np.abs(d.logfc).ravel())}  # fmt: skip
+    return out
+
+
+def dataset_job(job: dict) -> dict:
+    """One dataset from start to end: load its models' scores, place them in the variant list, compute every statistic
+    and, unless job['figures'] is false, the figure inputs. Returns dataset and error (a message when the inputs do
+    not fit together or cannot be read, else None), and with no error rows (compare_dataset's), n and figure
+    (figure_data's, or None). An exception becomes the error, with its traceback in the log, so that one dataset's
+    tables cannot stop the others'."""
+    try:
+        return _dataset_job(job)
+    except Exception as err:  # a missing or truncated table, a column it lacks: this dataset only
+        logger.exception("%s: comparing its scores", job["dataset"])
+        return {"dataset": job["dataset"], "error": f"{job['dataset']}: {type(err).__name__}: {err}"}
+
+
+def _dataset_job(job: dict) -> dict:
+    ds = job["dataset"]
+    data: dict[str, ModelScores] = {}
+    ids = None
+    for m in job["models"]:
+        m_ids, scores = load_model(job["scores_root"], ds, m, job["variants"], job["null"], job["folds"])
+        if ids is not None and not np.array_equal(ids, m_ids):
+            return {"dataset": ds, "error": f"{ds}: {m} holds other variants than the other models"}
+        ids, data[m] = m_ids, scores
+    listed = read_variant_list(job["list"])
+    try:
+        at = sc.align(listed["variant_id"], ids)
+    except ValueError as err:
+        return {"dataset": ds, "error": f"{ds}: scored variants are not in {job['list']}: {err}"}
+    meta = {key: listed[key][at] for key in ("stratum", "type", "source", "fold_test")}
+    rows = compare_dataset(ds, data, meta, job["folds"], job["pairs"], job["top"])
+    figure = figure_data(data, job["figure_points"], job["figure_seed"]) if job["figures"] else None
+    logger.info("%s: %d variants, models %s", ds, len(ids), ", ".join(data))
+    return {"dataset": ds, "error": None, "rows": rows, "n": len(ids), "figure": figure}
+
+
+def _init_worker(level: int) -> None:
+    logging.basicConfig(level=level, **LOG_FORMAT)
+
+
+def run_jobs(jobs: list[dict], workers: int, level: int = logging.INFO) -> list[dict]:
+    """dataset_job for every job, results in job order: in this process with one worker, else in up to `workers`
+    processes. They are spawned, not forked, so none inherits this process's threads or memory; each reads the
+    variant list once."""
+    if workers <= 1 or len(jobs) <= 1:
+        return [dataset_job(job) for job in jobs]
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=min(workers, len(jobs)), mp_context=context, initializer=_init_worker,
+                             initargs=(level,)) as pool:  # fmt: skip
+        return list(pool.map(dataset_job, jobs))
+
+
 # --- figures ---------------------------------------------------------------------------------------------------
 
 
@@ -306,13 +440,38 @@ def _square_limits(ax, *arrays) -> None:
     ax.set_aspect("equal")
 
 
-def fig_scatter(plt, out: Path, datasets, means, pairs, rows_by_ds) -> None:
+def _blank(ax, title: str, why: str = "no scores") -> None:
+    """A panel for a model or pair this dataset has no scores for."""
+    ax.axis("off")
+    ax.set_title(f"{title}\n{why}", fontsize=7.5, color=MUTED)
+
+
+def sample_note(figs: dict, seed: int) -> str:
+    """How the scatter panels sample the variants, for their titles and captions; empty when every dataset is drawn
+    whole."""
+    sampled = [f for f in figs.values() if f["shown"] < f["n"]]
+    if not sampled:
+        return ""
+    return (f"points: a random sample of {max(f['shown'] for f in sampled):,} variants per dataset (seed {seed}), the "
+            "same in every panel of a dataset; r, Spearman and every table use all variants")  # fmt: skip
+
+
+def _title(fig, text: str, note: str = "") -> None:
+    """The figure's title, a sampling note on a second line when there is one, and the layout that leaves room."""
+    fig.suptitle(text + (f"\n{note}" if note else ""), fontsize=9, color=INK)
+    fig.tight_layout(rect=(0, 0, 1, min(0.96, 1 - 0.5 / fig.get_figheight()) if note else 0.96))
+
+
+def fig_scatter(plt, out: Path, datasets, figs, pairs, rows_by_ds, note: str = "") -> None:
     fig, axes = plt.subplots(len(datasets), len(pairs), figsize=(3.3 * len(pairs), 3.4 * len(datasets)), squeeze=False)
     for i, ds in enumerate(datasets):
         for j, (a, b) in enumerate(pairs):
             ax = axes[i][j]
+            if a not in figs[ds]["means"] or b not in figs[ds]["means"]:
+                _blank(ax, f"{ds}\n{label(a)} vs {label(b)}")
+                continue
             _style(ax)
-            x, y = means[ds][b], means[ds][a]
+            x, y = figs[ds]["means"][b], figs[ds]["means"][a]
             ax.scatter(x, y, s=2, color=COLOURS.get(b, INK), alpha=0.3, linewidths=0, rasterized=True, zorder=2)
             _square_limits(ax, x, y)
             r = _lookup(rows_by_ds[ds], a, b, "pearson_fold_mean")
@@ -321,9 +480,8 @@ def fig_scatter(plt, out: Path, datasets, means, pairs, rows_by_ds) -> None:
                          fontsize=7.5, color=INK)  # fmt: skip
             ax.set_xlabel(f"{label(b)} logFC, fold mean", fontsize=7.5, color=INK)
             ax.set_ylabel(f"{label(a)} logFC, fold mean", fontsize=7.5, color=INK)
-    fig.suptitle("Fold-mean logFC (log2) per variant; axes cut at the 99.9th percentile of |logFC|; grey: y = x",
-                 fontsize=9, color=INK)  # fmt: skip
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    _title(fig, "Fold-mean logFC (log2) per variant; axes cut at the 99.9th percentile of the drawn |logFC|; "
+           "grey: y = x", note)  # fmt: skip
     fig.savefig(out, dpi=200)
     plt.close(fig)
 
@@ -335,7 +493,8 @@ def _lookup(rows, a, b, measure, kind="all", subset="all") -> float:
     return math.nan
 
 
-def fig_agreement(plt, out: Path, datasets, pairs, rows_by_ds) -> None:
+def fig_agreement(plt, out: Path, datasets, pairs, rows_by_ds, pairs_of: dict | None = None) -> None:
+    """pairs_of: each dataset's own pairs (default: every one of pairs); a pair a dataset lacks is a blank panel."""
     fig, axes = plt.subplots(len(datasets), len(pairs), figsize=(4.0 * len(pairs), 3.3 * len(datasets)), squeeze=False)
     for i, ds in enumerate(datasets):
         rows = rows_by_ds[ds]
@@ -346,6 +505,9 @@ def fig_agreement(plt, out: Path, datasets, pairs, rows_by_ds) -> None:
         x = np.arange(len(keys))
         for j, (a, b) in enumerate(pairs):
             ax = axes[i][j]
+            if pairs_of is not None and (a, b) not in pairs_of[ds]:
+                _blank(ax, f"{ds}\n{label(a)} vs {label(b)}")
+                continue
             _style(ax)
             cross = [_lookup(rows, a, b, "pearson_fold_mean", *key) for key in keys]
             loo_a = [_lookup(rows, a, a, "pearson_loo", *key) for key in keys]
@@ -369,8 +531,8 @@ def fig_agreement(plt, out: Path, datasets, pairs, rows_by_ds) -> None:
     plt.close(fig)
 
 
-def fig_strand(plt, out: Path, datasets, data, folds) -> None:
-    models = [m for m in MODELS if all(m in data[ds] and data[ds][m].logfc_fwd is not None for ds in datasets)]
+def fig_strand(plt, out: Path, datasets, figs, folds, note: str = "") -> None:
+    models = [m for m in MODELS if any(m in figs[ds]["strand"] for ds in datasets)]
     if not models:
         return
     fig, axes = plt.subplots(len(datasets), len(models), figsize=(3.2 * len(models), 3.4 * len(datasets)),
@@ -378,16 +540,18 @@ def fig_strand(plt, out: Path, datasets, data, folds) -> None:
     for i, ds in enumerate(datasets):
         for j, m in enumerate(models):
             ax = axes[i][j]
+            if m not in figs[ds]["strand"]:
+                _blank(ax, f"{ds}\n{label(m)}", "no strand scores")
+                continue
             _style(ax)
-            fwd, rev = data[ds][m].logfc_fwd[:, 0], data[ds][m].logfc_rev[:, 0]
+            strand = figs[ds]["strand"][m]
+            fwd, rev = strand["fwd"], strand["rev"]
             ax.scatter(fwd, rev, s=2, color=COLOURS.get(m, INK), alpha=0.3, linewidths=0, rasterized=True, zorder=2)
             _square_limits(ax, fwd, rev)
-            r = correlations(fwd, rev)
-            ax.set_title(f"{ds}\n{label(m)}, fold {folds[0]}: r {r['pearson']:.3f}", fontsize=7.5, color=INK)
+            ax.set_title(f"{ds}\n{label(m)}, fold {folds[0]}: r {strand['pearson']:.3f}", fontsize=7.5, color=INK)
             ax.set_xlabel("logFC, forward strand", fontsize=7.5, color=INK)
             ax.set_ylabel("logFC, reverse-complement strand", fontsize=7.5, color=INK)
-    fig.suptitle("Strand agreement: each strand's logFC alone; grey: y = x", fontsize=9, color=INK)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    _title(fig, "Strand agreement: each strand's logFC alone; grey: y = x", note)
     fig.savefig(out, dpi=200)
     plt.close(fig)
 
@@ -406,8 +570,8 @@ def null_phrase(null: str) -> str:
     return "the shuffled null" if null == "null" else f"the null ({null})"
 
 
-def fig_null(plt, out: Path, datasets, data, null: str = "null") -> None:
-    models = [m for m in MODELS if all(m in data[ds] for ds in datasets)]
+def fig_null(plt, out: Path, datasets, figs, null: str = "null") -> None:
+    models = [m for m in MODELS if any(m in figs[ds]["survival"] for ds in datasets)]
     if not models:
         return
     null_legend = "null (shuffled windows)" if null == "null" else f"null ({null})"
@@ -416,12 +580,13 @@ def fig_null(plt, out: Path, datasets, data, null: str = "null") -> None:
     for i, ds in enumerate(datasets):
         for j, m in enumerate(models):
             ax = axes[i][j]
+            if m not in figs[ds]["survival"]:
+                _blank(ax, f"{ds}\n{label(m)}")
+                continue
             _style(ax)
-            d = data[ds][m]
-            curves = ((np.concatenate(d.null_abs), CONTEXT, null_legend),
-                      (np.abs(d.logfc).ravel(), COLOURS.get(m, INK), "variants"))  # fmt: skip
-            for values, colour, legend in curves:
-                x, y = _survival(values)
+            survival = figs[ds]["survival"][m]
+            curves = ((survival["null"], CONTEXT, null_legend), (survival["variants"], COLOURS.get(m, INK), "variants"))
+            for (x, y), colour, legend in curves:
                 ax.plot(x, y, color=colour, lw=2, solid_capstyle="round", label=legend)
             ax.set_xscale("log")
             ax.set_yscale("log")
@@ -503,8 +668,11 @@ def _null_table(null: list[dict]) -> list[str]:
     return _table(header, body)
 
 
-def report(out_dir: Path, args, datasets, pairs, models, rows, sizes, figures) -> str:
-    """Write report.md: per dataset the agreement, strand and null tables, then the figures."""
+def report(out_dir: Path, args, datasets, pairs, models, rows, sizes, figures, missing: dict | None = None,
+           left_out: dict | None = None) -> str:  # fmt: skip
+    """Write report.md: per dataset the agreement, strand and null tables, then the figures. missing: the models of
+    `models` each dataset has no scores for; left_out: the datasets not compared, with why."""
+    missing, left_out = missing or {}, left_out or {}
     top = f"{args.top:.0%}"
     n_folds = len(args.folds)
     lines = [
@@ -523,12 +691,16 @@ def report(out_dir: Path, args, datasets, pairs, models, rows, sizes, figures) -
         "attribution comparison's definitions.",
         f"- Top share: of model A's top {top} of variants by |fold-mean logFC|, the share also among model B's; "
         f"independent rankings would share about {top}.",
+        *(f"- **Left out:** {ds} ({why})." for ds, why in left_out.items()),
         "",
     ]
     for ds in datasets:
         agree = [r for r in rows["agreement"] if r["dataset"] == ds]
         keys = _subset_keys(agree)
         lines += [f"## {ds}", ""] + ([sizes[ds], ""] if ds in sizes else [])
+        if missing.get(ds):
+            lines += [f"Not scored for {ds}: {', '.join(label(m) for m in missing[ds])}; its columns show a dash "
+                      "(compare.py's log names the missing table).", ""]  # fmt: skip
         lines += ["**Pearson r of logFC: fold means (B) and leave-one-fold-out ceilings (C)**", ""]
         lines += _agreement_table(agree, keys, pairs, models, "pearson_fold_mean", "pearson_loo")
         lines += ["**Spearman rho of logFC: fold means (B) and ceilings (C)**", ""]
@@ -563,54 +735,70 @@ def main(argv=None) -> int:
     ap.add_argument("--pairs", nargs="+", default=list(PAIRS), help="model_a:model_b (default %(default)s)")
     ap.add_argument("--top", type=float, default=0.01, help="top share for the overlaps (default 0.01)")
     ap.add_argument("--no-figures", action="store_true")
+    ap.add_argument("--figure-points", type=int, default=FIGURE_POINTS,
+                    help="variants per scatter panel at most, a seeded sample (default %(default)s)")  # fmt: skip
+    ap.add_argument("--figure-seed", type=int, default=FIGURE_SEED, help="seed of that sample (default %(default)s)")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="datasets compared at once, each in its own process (default 1: here)")  # fmt: skip
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="[%(asctime)s] %(levelname)s %(message)s", datefmt="%F %T")  # fmt: skip
+    level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=level, **LOG_FORMAT)
 
-    variant_meta = read_variant_list(args.list)
     wanted = [tuple(p.split(":", 1)) for p in args.pairs]
-    data: dict[str, dict[str, ModelScores]] = {}
-    metas: dict[str, list[dict]] = {}
-    sizes: dict[str, str] = {}
+    named = {m for pair in wanted for m in pair}
+    present: dict[str, list[str]] = {}
+    left_out: dict[str, str] = {}
     for ds in args.datasets:
-        data[ds], ids = {}, None
-        named = {m for pair in wanted for m in pair}
+        present[ds] = []
         for m in [m for m in MODELS if m in named] + sorted(named - set(MODELS)):
-            try:
-                m_ids, scores = load_model(args.scores_root, ds, m, args.variants, args.null, args.folds)
-            except FileNotFoundError as err:
-                logger.warning("%s %s: no scores (%s); left out", ds, m, err.filename)
+            missing = first_missing(args.scores_root, ds, m, args.variants, args.null, args.folds)
+            if missing is not None:
+                logger.warning("%s %s: no scores (%s); left out of this dataset", ds, m, missing)
                 continue
-            if ids is not None and not np.array_equal(ids, m_ids):
-                logger.error("%s: %s holds other variants than the other models", ds, m)
-                return 1
-            ids, data[ds][m] = m_ids, scores
-        if ids is None:
-            logger.error("%s: no model has scores", ds)
-            return 1
-        missing = [v for v in ids.tolist() if v not in variant_meta]
-        if missing:
-            logger.error("%s: %d scored variant(s) are not in %s, e.g. %s", ds, len(missing), args.list, missing[0])
-            return 1
-        metas[ds] = [variant_meta[v] for v in ids.tolist()]
-        meta_json = args.scores_root / ds / f"{next(iter(data[ds]))}.{args.variants}.json"
-        if meta_json.exists():
-            fold0 = json.loads(meta_json.read_text())["folds"].get(str(args.folds[0]), {})
-            sizes[ds] = (f"{len(ids):,} variants scored; null {fold0.get('n_null', '?')} rows; AAQ reference "
-                         f"{fold0.get('n_peaks', '?')} peak windows; smallest p {_f(fold0.get('min_p_right'), 6)} "
-                         f"(abs_logfc), {_f(fold0.get('min_p_two_tailed'), 6)} (logfc).")  # fmt: skip
-    pairs = [(a, b) for a, b in wanted if all(a in data[ds] and b in data[ds] for ds in args.datasets)]
-    models = [m for m in MODELS if all(m in data[ds] for ds in args.datasets)]
-    if not pairs:
-        logger.error("no pair of models has scores for every dataset")
+            present[ds].append(m)
+        if not present[ds]:
+            logger.error("%s: no model has scores; left out", ds)
+            left_out[ds] = "no model has scores"
+    # Each dataset on the models and pairs it has (module docstring).
+    pairs_of = {ds: [(a, b) for a, b in wanted if a in present[ds] and b in present[ds]] for ds in args.datasets}
+    jobs = [{"dataset": ds, "models": present[ds], "scores_root": args.scores_root, "list": args.list,
+             "variants": args.variants, "null": args.null, "folds": args.folds, "pairs": pairs_of[ds],
+             "top": args.top, "figures": not args.no_figures, "figure_points": args.figure_points,
+             "figure_seed": args.figure_seed}
+            for ds in args.datasets if ds not in left_out]  # fmt: skip
+    if not jobs:
+        logger.error("no dataset has scores")
         return 1
+    results = {}
+    for result in run_jobs(jobs, args.workers, level):
+        if result["error"]:
+            logger.error("%s; left out", result["error"])
+            left_out[result["dataset"]] = result["error"]
+        else:
+            results[result["dataset"]] = result
+    datasets = [ds for ds in args.datasets if ds in results]
+    if not datasets:
+        logger.error("no dataset could be compared")
+        return 1
+    pairs = [p for p in wanted if any(p in pairs_of[ds] for ds in datasets)]
+    models = [m for m in MODELS if any(m in present[ds] for ds in datasets)]
+    if not pairs:
+        logger.error("no dataset has both models of any pair; only each model's own rows are written")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     rows: dict[str, list[dict]] = {"agreement": [], "strand": [], "null": []}
-    for ds in args.datasets:
-        for key, values in compare_dataset(ds, data[ds], metas[ds], args.folds, pairs, args.top).items():
+    sizes: dict[str, str] = {}
+    for ds in datasets:
+        result = results[ds]
+        for key, values in result["rows"].items():
             rows[key] += values
+        meta_json = args.scores_root / ds / f"{present[ds][0]}.{args.variants}.json"
+        if meta_json.exists():
+            fold0 = json.loads(meta_json.read_text())["folds"].get(str(args.folds[0]), {})
+            sizes[ds] = (f"{result['n']:,} variants scored; null {fold0.get('n_null', '?')} rows; AAQ reference "
+                         f"{fold0.get('n_peaks', '?')} peak windows; smallest p {_f(fold0.get('min_p_right'), 6)} "
+                         f"(abs_logfc), {_f(fold0.get('min_p_two_tailed'), 6)} (logfc).")  # fmt: skip
     for key, values in rows.items():
         write_rows(args.out_dir / f"{key}.tsv", values)
 
@@ -621,21 +809,25 @@ def main(argv=None) -> int:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        rows_by_ds = {ds: [r for r in rows["agreement"] if r["dataset"] == ds] for ds in args.datasets}
-        means = {ds: {m: d.logfc.mean(axis=1) for m, d in data[ds].items()} for ds in args.datasets}
-        fig_scatter(plt, args.out_dir / "fig_scatter.png", args.datasets, means, pairs, rows_by_ds)
-        fig_agreement(plt, args.out_dir / "fig_agreement.png", args.datasets, pairs, rows_by_ds)
-        fig_strand(plt, args.out_dir / "fig_strand.png", args.datasets, data, args.folds)
-        fig_null(plt, args.out_dir / "fig_null.png", args.datasets, data, args.null)
-        figures = [("fig_scatter.png", "Fold-mean logFC, model against model"),
+        figs = {ds: results[ds]["figure"] for ds in datasets}
+        note = sample_note(figs, args.figure_seed)
+        rows_by_ds = {ds: [r for r in rows["agreement"] if r["dataset"] == ds] for ds in datasets}
+        if pairs:
+            fig_scatter(plt, args.out_dir / "fig_scatter.png", datasets, figs, pairs, rows_by_ds, note)
+            fig_agreement(plt, args.out_dir / "fig_agreement.png", datasets, pairs, rows_by_ds, pairs_of)
+        fig_strand(plt, args.out_dir / "fig_strand.png", datasets, figs, args.folds, note)
+        fig_null(plt, args.out_dir / "fig_null.png", datasets, figs, args.null)
+        sampled = f" ({note})" if note else ""
+        figures = [("fig_scatter.png", f"Fold-mean logFC, model against model{sampled}"),
                    ("fig_agreement.png", "Agreement by subset against the leave-one-fold-out ceilings"),
-                   ("fig_strand.png", "Forward against reverse-complement logFC"),
+                   ("fig_strand.png", f"Forward against reverse-complement logFC{sampled}"),
                    ("fig_null.png", f"Variants against {null_phrase(args.null)}")]  # fmt: skip
         figures = [f for f in figures if (args.out_dir / f[0]).exists()]
-    report(args.out_dir, args, args.datasets, pairs, models, rows, sizes, figures)
-    logger.info("wrote %s: %d datasets, pairs %s", args.out_dir / "report.md", len(args.datasets),
-                ", ".join(f"{a}:{b}" for a, b in pairs))  # fmt: skip
-    return 0
+    missing = {ds: [m for m in models if m not in present[ds]] for ds in datasets}
+    report(args.out_dir, args, datasets, pairs, models, rows, sizes, figures, missing, left_out)
+    logger.info("wrote %s: %d of %d datasets, pairs %s", args.out_dir / "report.md", len(datasets),
+                len(args.datasets), ", ".join(f"{a}:{b}" for a, b in pairs))  # fmt: skip
+    return 1 if left_out or not pairs else 0
 
 
 if __name__ == "__main__":

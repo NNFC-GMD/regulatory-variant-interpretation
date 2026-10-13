@@ -7,8 +7,10 @@ The references are line-by-line transcriptions of VS (main @0e1e341): the strand
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -232,6 +234,84 @@ def test_tables_round_trip(tmp_path):
     assert back["heldout_fold"].tolist() == [3.0, -1.0] and back["flag"].tolist() == [1.0, 0.0]
 
 
+def test_npz_table_matches_its_tsv_digit_for_digit(tmp_path):
+    """save_table writes the .npz (float32, int64, unicode) and the TSV from the same values: every TSV cell is the
+    .npz value written with 7 significant digits, so the two agree to 7 significant digits."""
+    rng = np.random.default_rng(13)
+    n = 2000
+    cols = {"variant_id": np.array([f"chr1:{1000 + i}:A:G" for i in range(n)]),
+            "logfc": rng.normal(size=n) * 10.0 ** rng.integers(-9, 9, size=n), "pval": rng.uniform(1e-6, 1, size=n),
+            "heldout_fold": rng.integers(-1, 5, size=n), "flag": rng.random(n) < 0.5}  # fmt: skip
+    cols["logfc"][[3, 7, 11]] = [np.nan, -0.0, np.inf]
+    path = tmp_path / "t.tsv.gz"
+    sc.save_table(path, cols)
+    with np.load(tmp_path / "t.npz", allow_pickle=False) as z:
+        stored = {k: z[k] for k in z.files}
+    assert list(stored) == list(cols)
+    assert stored["logfc"].dtype == np.float32 and stored["pval"].dtype == np.float32
+    assert stored["heldout_fold"].dtype == np.int64 and stored["flag"].dtype == np.int64
+    assert stored["variant_id"].dtype.kind == "U" and stored["variant_id"].tolist() == cols["variant_id"].tolist()
+    with gzip.open(path, "rt") as fh:
+        header, *lines = fh.read().splitlines()
+    assert header.split("\t") == list(cols) and len(lines) == n
+    cells = list(zip(*(line.split("\t") for line in lines)))
+    for j, (name, values) in enumerate(stored.items()):
+        as_text = (lambda v: format(v, ".7g")) if values.dtype.kind == "f" else str
+        written = [as_text(v) for v in values.tolist()]  # format(x, ".7g") writes what "%.7g" % x does
+        assert list(cells[j]) == written, name
+        if values.dtype.kind == "f":  # 7 significant digits: within 5e-7 of the value, relatively
+            np.testing.assert_allclose(np.array(cells[j], dtype=np.float64), values, rtol=6e-7)
+    assert cells[1][3] == "nan" and cells[1][7] == "-0" and cells[1][11] == "inf"
+    # read_table reads the .npz: floats as float64, integers too, text as str
+    back = sc.read_table(path)
+    assert list(back) == list(cols) and all(back[k].dtype == np.float64 for k in ("logfc", "heldout_fold", "flag"))
+    np.testing.assert_array_equal(back["logfc"], stored["logfc"].astype(np.float64))
+    assert back["heldout_fold"].tolist() == cols["heldout_fold"].tolist()
+    assert back["variant_id"].tolist() == cols["variant_id"].tolist()
+
+
+def test_read_table_prefers_the_npz(tmp_path):
+    path = tmp_path / "t.tsv.gz"
+    sc.save_table(path, {"variant_id": np.array(["a", "b"]), "logfc": np.array([1.0, 2.0])})
+    sc.write_table(path, {"variant_id": np.array(["a", "b"]), "logfc": np.array([5.0, 6.0])})  # a TSV unlike its npz
+    assert sc.read_table(path)["logfc"].tolist() == [1.0, 2.0]
+    assert set(sc.read_table(path, columns=["logfc", "absent"])) == {"logfc"}
+    (tmp_path / "t.npz").unlink()
+    assert sc.read_table(path)["logfc"].tolist() == [5.0, 6.0]  # no .npz: the TSV
+    assert set(sc.read_table(path, columns=["logfc"])) == {"logfc"}
+    path.unlink()
+    with pytest.raises(FileNotFoundError):
+        sc.read_table(path)
+    # tsv=False (scores.py --no-fold-tsv): the .npz alone, read through the TSV's path; a stale TSV is deleted
+    path.write_bytes(b"stale")
+    sc.save_table(path, {"variant_id": np.array(["a"]), "logfc": np.array([3.0])}, tsv=False)
+    assert not path.exists() and sc.read_table(path)["logfc"].tolist() == [3.0]
+    assert sc.npz_path(tmp_path / "x.summary.tsv.gz") == tmp_path / "x.summary.npz"
+    assert sc.npz_path(tmp_path / "agreement.tsv") == tmp_path / "agreement.npz"
+
+
+def test_list_columns_fold_numbers_and_align(tmp_path):
+    lines = ["variant_id\tchrom\tpos\tref\talt\tsource\tstratum\taf\tdist_to_summit\tfold_test",
+             "chr1:5:A:G\tchr1\t5\tA\tG\tsrc\tsummit100\t0.1\t3\t0",
+             "chr1:9:AC:GT\tchr1\t9\tAC\tGT\tsrc\tflank500\t\t150\t",
+             "chr2:7:C:CTTT\tchr2\t7\tC\tCTTT\tsrc\tsummit100\tnan\t10\t3"]  # fmt: skip
+    (tmp_path / "l.tsv").write_text("\n".join(lines) + "\n\n")  # a blank last line, skipped
+    cols = sc.read_list_columns(tmp_path / "l.tsv", ("variant_id",), optional=("fold_test", "absent"))
+    assert set(cols) == {"variant_id", "fold_test"} and cols["fold_test"] == ("0", "", "3")
+    assert sc.fold_numbers(cols["fold_test"]).tolist() == [0, -1, 3]
+    assert sc.read_fold_test(tmp_path / "l.tsv") == {"chr1:5:A:G": 0, "chr1:9:AC:GT": -1, "chr2:7:C:CTTT": 3}
+    with pytest.raises(ValueError, match="absent"):
+        sc.read_list_columns(tmp_path / "l.tsv", ("absent",))
+    listed = cmp.read_variant_list(tmp_path / "l.tsv")
+    assert listed["type"].tolist() == ["SNV", "MNV", "indel"] and listed["fold_test"].tolist() == [0, -1, 3]
+    assert listed["stratum"].tolist() == ["summit100", "flank500", "summit100"]
+    ids = listed["variant_id"]
+    assert sc.align(ids, ids).tolist() == [0, 1, 2]
+    assert sc.align(ids, ids[[2, 0]]).tolist() == [2, 0]
+    with pytest.raises(ValueError, match="chr9:1:A:C"):
+        sc.align(ids, np.array(["chr1:5:A:G", "chr9:1:A:C"]))
+
+
 # --- the command line, end to end ------------------------------------------------------------------------------
 
 
@@ -290,6 +370,35 @@ def test_cli_end_to_end(tmp_path):
         source = meta["folds"]["0"]["variants.source"]
         assert source.startswith("derived") == (model == "cbp_full")
         assert meta["folds"]["0"]["variants.a1_logcounts"]["holds"] == "counts"
+
+
+def test_cli_no_fold_tsv(tmp_path):
+    """--no-fold-tsv: per-fold tables as .npz only (a stale per-fold TSV is deleted), summaries in both; compare.py
+    reads the same tables through read_table."""
+    ids = _write_inputs(tmp_path)
+    out = tmp_path / "scores" / "dsA"
+    stale = out / "fold_0" / "cherimoya.variants.tsv.gz"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"from an earlier run")
+    args = ["--datasets", "dsA", "--preds-root", str(tmp_path / "preds"), "--windows-root", str(tmp_path / "windows"),
+            "--list", str(tmp_path / "list.tsv"), "--variants", "variants", "--out-root", str(tmp_path / "scores"),
+            "--folds", "0", "1", "--no-fold-tsv"]  # fmt: skip
+    assert sc.main(args) == 0
+    for k in (0, 1):
+        assert not list((out / f"fold_{k}").glob("*.tsv.gz"))
+        assert {p.name for p in (out / f"fold_{k}").glob("*.npz")} == {
+            f"{m}.{name}.npz" for m in sc.MODELS for name in ("variants", "null")}  # fmt: skip
+    for model in sc.MODELS:
+        for suffix in (".tsv.gz", ".npz"):
+            assert (out / f"{model}.variants.summary{suffix}").is_file()
+        assert sc.read_table(out / "fold_1" / f"{model}.variants.tsv.gz")["variant_id"].tolist() == ids.tolist()
+        assert json.loads((out / f"{model}.variants.json").read_text())["fold_tsv"] is False
+    compared = ["--scores-root", str(tmp_path / "scores"), "--datasets", "dsA", "--list", str(tmp_path / "list.tsv"),
+                "--variants", "variants", "--out-dir", str(tmp_path / "compare"), "--folds", "0", "1",
+                "--no-figures"]  # fmt: skip
+    assert cmp.main(compared) == 0
+    agreement = sc.read_table(tmp_path / "compare" / "agreement.tsv")
+    assert (agreement["n"][agreement["subset"] == "all"] == len(ids)).all()
 
 
 def test_cli_reports_missing_predictions(tmp_path):
@@ -391,3 +500,96 @@ def test_leave_one_fold_out_ceiling():
     # Fold k against the mean of the other four: var(truth) = 1, noise 0.25 and 0.0625.
     expected = 1 / np.sqrt(1.25 * 1.0625)
     assert ceiling["pearson"] == pytest.approx(expected, abs=0.02) and len(ceiling["per_fold_pearson"]) == 5
+
+
+def test_figure_sample_is_seeded_and_statistics_use_every_row():
+    """The scatter panels draw a seeded sample of at most --figure-points variants; the statistics, a panel's r and the
+    null figure's curves use every variant."""
+    sample = cmp.subsample(1000, 100, 7)
+    assert len(sample) == 100 and np.array_equal(sample, cmp.subsample(1000, 100, 7)) and (np.diff(sample) > 0).all()
+    assert not np.array_equal(sample, cmp.subsample(1000, 100, 8))
+    assert np.array_equal(cmp.subsample(50, 100, 7), np.arange(50)) and np.array_equal(cmp.subsample(50, 0, 7),
+                                                                                        np.arange(50))  # fmt: skip
+    rng = np.random.default_rng(14)
+    n, k = 600, 3
+    truth = rng.normal(size=n)
+
+    def model(noise: float) -> cmp.ModelScores:
+        logfc = truth[:, None] + noise * rng.normal(size=(n, k))
+        fwd, rev = logfc + 0.1 * rng.normal(size=(n, k)), logfc + 0.1 * rng.normal(size=(n, k))
+        null_abs = [np.abs(rng.normal(size=200)) for _ in range(k)]
+        return cmp.ModelScores(logfc, fwd, rev, rng.uniform(size=(n, k)), null_abs)
+
+    data = {"cherimoya": model(0.3), "cbp_full": model(0.5)}
+    fig = cmp.figure_data(data, points=50, seed=3)
+    drawn = cmp.subsample(n, 50, 3)
+    assert fig["n"] == n and fig["shown"] == 50
+    np.testing.assert_array_equal(fig["means"]["cherimoya"], data["cherimoya"].logfc.mean(axis=1)[drawn])
+    strand, full = fig["strand"]["cbp_full"], data["cbp_full"]
+    assert len(strand["fwd"]) == len(strand["rev"]) == 50
+    assert strand["pearson"] == pytest.approx(np.corrcoef(full.logfc_fwd[:, 0], full.logfc_rev[:, 0])[0, 1])
+    x, y = fig["survival"]["cherimoya"]["variants"]
+    assert y[0] == 1.0 and x[-1] == np.abs(data["cherimoya"].logfc).max()  # every (variant, fold), the largest too
+    assert cmp.sample_note({"dsA": fig}, 3).startswith("points: a random sample of 50 variants")
+    assert cmp.sample_note({"dsA": {**fig, "shown": n}}, 3) == ""
+    # The statistics: every row, whatever the figures draw. One type and one source hold every variant: left out.
+    meta = {"stratum": np.array(["summit100", "flank500"] * (n // 2)), "type": np.full(n, "SNV"),
+            "source": np.full(n, "both"), "fold_test": np.arange(n) % k}  # fmt: skip
+    rows = cmp.compare_dataset("dsA", data, meta, list(range(k)), [("cherimoya", "cbp_full")], 0.01)
+    assert {r["subset"] for r in rows["agreement"]} == {"all", "summit100", "flank500"}
+    b = next(r for r in rows["agreement"] if r["subset"] == "all" and r["measure"] == "pearson_fold_mean")
+    assert b["n"] == n
+    means = [data[m].logfc.mean(axis=1) for m in ("cherimoya", "cbp_full")]
+    assert b["value"] == pytest.approx(np.corrcoef(*means)[0, 1])
+    fwd_both = next(r for r in rows["strand"] if r["subset"] == "all" and r["measure"] == "pearson_fwd_both")
+    assert np.isfinite(fwd_both["mean"])
+
+
+def test_compare_workers_match_one_process(tmp_path):
+    """--workers N compares the datasets in spawned processes and writes what one process writes."""
+    _write_inputs(tmp_path)
+    scored = ["--datasets", "dsA", "--preds-root", str(tmp_path / "preds"), "--windows-root", str(tmp_path / "windows"),
+              "--list", str(tmp_path / "list.tsv"), "--variants", "variants", "--out-root", str(tmp_path / "scores"),
+              "--folds", "0", "1"]  # fmt: skip
+    assert sc.main(scored) == 0
+    shutil.copytree(tmp_path / "scores" / "dsA", tmp_path / "scores" / "dsB")  # a second dataset, the same scores
+    figures = importlib.util.find_spec("matplotlib") is not None
+    common = ["--scores-root", str(tmp_path / "scores"), "--datasets", "dsA", "dsB", "--list",
+              str(tmp_path / "list.tsv"), "--variants", "variants", "--folds", "0", "1", "--figure-points",
+              "50"]  # fmt: skip
+    common += [] if figures else ["--no-figures"]
+    assert cmp.main([*common, "--out-dir", str(tmp_path / "one")]) == 0
+    assert cmp.main([*common, "--out-dir", str(tmp_path / "two"), "--workers", "2"]) == 0
+    for name in ("agreement.tsv", "strand.tsv", "null.tsv"):
+        assert (tmp_path / "one" / name).read_text() == (tmp_path / "two" / name).read_text()
+    one = (tmp_path / "one" / "agreement.tsv").read_text()
+    assert "\ndsA\tall\t" in one and "\ndsB\tall\t" in one
+    if figures:
+        assert "random sample of 50 variants" in (tmp_path / "two" / "report.md").read_text()
+
+
+def test_compare_keeps_each_dataset_on_its_own_models(tmp_path):
+    """A model one dataset has no scores for is left out of that dataset only; a dataset without scores is left out,
+    the others are written, and the exit status is 1."""
+    _write_inputs(tmp_path)
+    scored = ["--datasets", "dsA", "--preds-root", str(tmp_path / "preds"), "--windows-root", str(tmp_path / "windows"),
+              "--list", str(tmp_path / "list.tsv"), "--variants", "variants", "--out-root", str(tmp_path / "scores"),
+              "--folds", "0", "1"]  # fmt: skip
+    assert sc.main(scored) == 0
+    shutil.copytree(tmp_path / "scores" / "dsA", tmp_path / "scores" / "dsB")
+    for path in (tmp_path / "scores" / "dsB").glob("fold_*/cbp_full.*"):  # as when scores.py refuses a fold
+        path.unlink()
+    common = ["--scores-root", str(tmp_path / "scores"), "--list", str(tmp_path / "list.tsv"), "--variants",
+              "variants", "--folds", "0", "1", "--no-figures"]  # fmt: skip
+    assert cmp.main([*common, "--datasets", "dsA", "dsB", "--out-dir", str(tmp_path / "two")]) == 0
+    agreement = sc.read_table(tmp_path / "two" / "agreement.tsv")
+    full = (agreement["model_a"] == "cherimoya") & (agreement["model_b"] == "cbp_full")
+    nobias = (agreement["model_a"] == "cherimoya") & (agreement["model_b"] == "cbp_nobias")
+    assert set(agreement["dataset"][full].tolist()) == {"dsA"}
+    assert set(agreement["dataset"][nobias].tolist()) == {"dsA", "dsB"}
+    report = (tmp_path / "two" / "report.md").read_text()
+    assert "Cherimoya vs ChromBPNet full" in report and "Not scored for dsB: ChromBPNet full" in report
+    assert cmp.main([*common, "--datasets", "dsA", "dsB", "dsC", "--out-dir", str(tmp_path / "three")]) == 1
+    three = sc.read_table(tmp_path / "three" / "agreement.tsv")
+    assert set(three["dataset"].tolist()) == {"dsA", "dsB"}
+    assert "**Left out:** dsC (no model has scores)" in (tmp_path / "three" / "report.md").read_text()

@@ -2,7 +2,8 @@
 # pilot_steps.sh
 # Purpose: the quick pilot of variant scoring in one whole-node box (8 GPUs): test the code, build the windows,
 #   measure throughput, run the checks V2-V5, predict every dataset x fold x model, then score and compare.
-#   Count scores only (logFC, |logFC|, AAQ, empirical p against the shuffled null), as scores.py computes them.
+#   Count scores only (logFC, |logFC|, AAQ, empirical p against the shuffled null and, when its windows are built,
+#   the genomic null), as scores.py computes them.
 #
 # Steps, in order. Each logs to logs/<n>.<name>.log and adds a row to status.tsv (step, name, state, exit, seconds,
 # started ET, note). A step whose prerequisite failed or was skipped is skipped itself, so a failure stops only what
@@ -14,7 +15,9 @@
 #              Only the first run gates step 2. The second adds the tangermeme shuffle tests, whose property
 #              build_windows.py checks on every null row anyway; it gets its own row (tests_cherimoya) in status.tsv
 #   2 windows  build_windows.py: the variant windows, the null (in the cherimoya interpreter: it needs tangermeme)
-#              and each dataset's peak windows                                   needs 1 (unless PILOT_GATE_TESTS=0)
+#              and each dataset's peak windows; then, when the genomic null's list is there (PILOT_GENOMIC_NULL),
+#              its variant windows (windows/genomic_null.npz). That build gates nothing: a failure gets its own row
+#              (windows_genomic_null) in status.tsv                              needs 1 (unless PILOT_GATE_TESTS=0)
 #   3 probe    probe_throughput.py: passes/s per model at batch 64-1024 (Cherimoya also 2048), with 1 and 2
 #              processes per GPU                                                 needs 2
 #   4 checks   on one dataset and fold (PILOT_V_DATASET, PILOT_V_FOLD):
@@ -29,12 +32,15 @@
 #                  container or apptainer is missing; a failed run gets its own row (4 v2 failed) in status.tsv
 #                                                                                needs 2
 #   5 predict  every dataset x fold: Cherimoya, and ChromBPNet's bias-free and bias models in one process (the full
-#              model derived), on the variant, null and peak windows; PILOT_SLOTS_PER_GPU processes per GPU, each
-#              pinned to its own CPUs. A failed task runs once more at half the batch (task <name>.retry), keeping
-#              the window sets it finished                                       needs 2
-#   6 score    V5 (forward vs reverse strand, from the saved strands), scores.py, compare.py, V2's comparison and
-#              the summary of every check. Runs when step 5 ran, even if some of its tasks failed: scores.py
-#              leaves out (and exits 1 for) a model without predictions, compare.py a model without scores
+#              model derived), on the variant, null and peak windows and, when built, the genomic null's;
+#              PILOT_SLOTS_PER_GPU processes per GPU, each pinned to its own CPUs. A failed task runs once more at
+#              half the batch (task <name>.retry), keeping the window sets it finished
+#                                                                                needs 2
+#   6 score    V5 (forward vs reverse strand, from the saved strands), scores.py and compare.py against the shuffled
+#              null (scores/, compare/) and, when its windows were built, the genomic null (scores_genomic_null/,
+#              compare_genomic_null/; a failure there gets its own row, score_genomic_null, in status.tsv), V2's
+#              comparison and the summary of every check. Runs when step 5 ran, even if some of its tasks failed:
+#              scores.py leaves out (and exits 1 for) a model without predictions, compare.py a model without scores
 #                                                                                needs 5 (to have run)
 #   Checks never gate the predictions: a check outside its tolerance is state `outside_tolerance` (exit 3; 2 is
 #   argparse's usage error, so it means failed).
@@ -52,6 +58,13 @@
 #   PILOT_LIST              the variant list TSV (default: the one lists/*.tsv, not counting *.callsets.tsv and
 #                           *.dropped.tsv)
 #   PILOT_VARIANTS_NAME     window-set name of the variants (default variants)
+#   PILOT_GENOMIC_NULL      the genomic null's list, a TSV in the variant list's columns (default
+#                           ${PILOT_ROOT}/nulls/genomic_null.tsv). Set empty, the genomic null is off in every step.
+#                           Not under lists/, where the variant list is the one TSV. Step 2 builds its windows when
+#                           the list is there and not empty (window set genomic_null; kept once built, as are its
+#                           predictions, so a changed list needs windows/genomic_null.* and
+#                           preds/*/fold_*/*.genomic_null.* deleted first); steps 5 and 6 predict and score against
+#                           windows/genomic_null.npz whenever it exists and the knob is not empty
 #   RVI_MAIN                the checkout whose .pixi/envs hold `default` and `cherimoya` (default: this
 #                           repository's main worktree)
 #   CHROMBPNET_REPO         the chrombpnet fork checkout whose .pixi/envs/cuda13 is used
@@ -79,6 +92,9 @@
 # Output, under PILOT_ROOT: windows/, probe/, checks/ (v2/, v3/, v4/, the check JSONs, summary.tsv, v5.tsv), preds/
 #   (<dataset>/fold_<k>/<model>.<set>.npz), scores/, compare/; and box/<job>.<step>/: status.tsv, tasks.tsv (every
 #   GPU process: name, GPU, CPUs, exit, seconds, start ET), resources.tsv (RAM, load, GPU use every 30 s), logs/.
+#   With the genomic null: windows/genomic_null.npz, its predictions (<model>.genomic_null.npz) in preds/, and
+#   scores_genomic_null/ and compare_genomic_null/, scores.py's and compare.py's outputs against it (scores/ and
+#   compare/ stay against the shuffled null).
 # Usage: mkdir -p <dir>/logs && PILOT_ROOT=<dir> sbatch --output=<dir>/logs/slurm_%j.out \
 #            workflows/variant_scoring/pilot_box.sbatch    (the whole box; submit from the repository root)
 #        or, inside a running allocation: PILOT_ROOT=<dir> srun --jobid <job> --overlap bash workflows/variant_scoring/pilot_steps.sh
@@ -123,10 +139,16 @@ v_n="${PILOT_V_N:-2000}"
 v3_n="${PILOT_V3_N:-500}"
 v_fold="${PILOT_V_FOLD:-0}"
 probe_seconds="${PILOT_PROBE_SECONDS:-20}"
+# The genomic null's list. `-`, not `:-`: an empty PILOT_GENOMIC_NULL turns the null off; only an unset one takes the
+# default. step_windows builds it when the file is there and not empty.
+genomic_null_list="${PILOT_GENOMIC_NULL-${PILOT_ROOT}/nulls/genomic_null.tsv}"
 
 windows="${PILOT_ROOT}/windows"
 preds="${PILOT_ROOT}/preds"
 checks="${PILOT_ROOT}/checks"
+# use_genomic_null -- steps 5 and 6 predict and score the genomic null: PILOT_GENOMIC_NULL is not set empty and step 2
+# (of this box or an earlier one) built windows/genomic_null.npz.
+use_genomic_null() { [[ -n "${genomic_null_list}" && -s "${windows}/genomic_null.npz" ]]; }
 box_id="${SLURM_JOB_ID:-local}.${SLURM_STEP_ID:-$$}"
 box_dir="${PILOT_ROOT}/box/${box_id}"
 logs="${box_dir}/logs"
@@ -347,7 +369,7 @@ build_set() {
 }
 
 step_windows() {
-    local fasta list ds peaks slot=0 pids=()
+    local fasta list ds peaks slot=0 pids=() rc=0 t0
     fasta="$(manifest_cmd genome)" || return 1
     list="$(variant_list)" || return 1
     say "variant list ${list}; genome ${fasta}"
@@ -356,7 +378,32 @@ step_windows() {
     while IFS=$'\t' read -r ds peaks; do
         build_set "peaks.${ds}" "${DEFAULT_PY}" --peaks "${peaks}" --n "${peaks_n}" --seed "${seed}"
     done < <(manifest_cmd peaks)
-    wait_all "${pids[@]}"
+    wait_all "${pids[@]}" || rc=1
+    # The genomic null: its list's variant windows, built as the variants' are (no shuffle, so the default
+    # interpreter), after the sets the later steps need. It gates nothing: a failed build gets its own row
+    # (windows_genomic_null) in status.tsv, and leaves no npz (build_windows.py writes it last), so steps 5 and 6
+    # leave the genomic null out.
+    if [[ -s "${genomic_null_list}" ]]; then
+        say "genomic null list ${genomic_null_list}"
+        if [[ -s "${windows}/genomic_null.npz" && "${PILOT_REBUILD:-0}" != 1 ]] \
+                && [[ "${genomic_null_list}" -nt "${windows}/genomic_null.npz" ]]; then
+            say "WARNING: genomic null: the list is newer than windows/genomic_null.npz, which is kept, as are its" \
+                "predictions; if the list changed, delete windows/genomic_null.* and preds/*/fold_*/*.genomic_null.*"
+        fi
+        pids=()
+        t0=${SECONDS}
+        build_set genomic_null "${DEFAULT_PY}" --list "${genomic_null_list}"
+        if ! wait_all "${pids[@]}"; then
+            say "genomic null: the build failed; recorded as windows_genomic_null; it gates nothing"
+            record 2 windows_genomic_null failed 1 "$(( SECONDS - t0 ))" \
+                "see ${logs}/windows/genomic_null.log; gates nothing"
+        fi
+    elif [[ -n "${genomic_null_list}" ]]; then
+        say "genomic null: no list (${genomic_null_list} is missing or empty)"
+    else
+        say "genomic null: no list (PILOT_GENOMIC_NULL is empty)"
+    fi
+    return "${rc}"
 }
 
 # ------------------------------------------------------------------------------------------------ 3 probe
@@ -550,6 +597,8 @@ predict_worker() {
         out="${preds}/${ds}/fold_${fold}"
         local sets=( --windows "${windows}/${variants_name}.npz" --windows "${windows}/null.npz"
                      --windows "${windows}/peaks.${ds}.npz" )
+        # The genomic null set, when step 2 (of this box or an earlier one) built it and the knob is not set empty.
+        if use_genomic_null; then sets+=( --windows "${windows}/genomic_null.npz" ); fi
         if [[ "${kind}" == cherimoya ]]; then
             batch="${cheri_batch}"
             cmd=( "${CHERIMOYA_PY}" "${vs}/predict_cherimoya.py" --model "${cheri}" "${sets[@]}" --out-dir "${out}" )
@@ -612,7 +661,7 @@ v2_compare() {
 }
 
 step_score() {
-    local list datasets=() st=()
+    local list datasets=() st=() gn_rc=0 t0
     list="$(variant_list)" || return 1
     mapfile -t datasets < <(manifest_cmd peaks | cut -f1)
     pinned "${DEFAULT_PY}" "${vs}/vchecks.py" strands --preds-root "${preds}" --out "${checks}/V5.strands.json"
@@ -626,6 +675,23 @@ step_score() {
     pinned "${CHERIMOYA_PY}" "${vs}/compare.py" --scores-root "${PILOT_ROOT}/scores" --datasets "${datasets[@]}" \
         --list "${list}" --variants "${variants_name}" --null null --out-dir "${PILOT_ROOT}/compare"
     st+=( "$?" )
+    # The same scores and report against the genomic null, when step 2 built its windows and the knob is not set empty.
+    # --list is still the variant list (the variants' fold_test and strata); the shuffled null's outputs stay in scores/
+    # and compare/. Like its windows, it gates nothing: a failure gets its own row (score_genomic_null) in status.tsv,
+    # and this step's state stays the shuffled null's.
+    if use_genomic_null; then
+        t0=${SECONDS}
+        pinned "${DEFAULT_PY}" "${vs}/scores.py" --datasets "${datasets[@]}" --preds-root "${preds}" \
+            --windows-root "${windows}" --list "${list}" --variants "${variants_name}" --null genomic_null \
+            --peaks 'peaks.{dataset}' --out-root "${PILOT_ROOT}/scores_genomic_null" || gn_rc=1
+        pinned "${CHERIMOYA_PY}" "${vs}/compare.py" --scores-root "${PILOT_ROOT}/scores_genomic_null" \
+            --datasets "${datasets[@]}" --list "${list}" --variants "${variants_name}" --null genomic_null \
+            --out-dir "${PILOT_ROOT}/compare_genomic_null" || gn_rc=1
+        if (( gn_rc != 0 )); then
+            say "genomic null: scores.py or compare.py failed; recorded as score_genomic_null"
+            record 6 score_genomic_null failed 1 "$(( SECONDS - t0 ))" "see ${logs}/6.score.log"
+        fi
+    fi
     # Last, so that a slow V2 never holds up the scores and the report.
     v2_compare
     st+=( "$?" )

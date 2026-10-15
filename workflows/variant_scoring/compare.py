@@ -86,14 +86,19 @@ import scores as sc  # noqa: E402
 logger = logging.getLogger("compare")
 
 MODELS = ("cherimoya", "cbp_full", "cbp_nobias", "cbp_bias")
-LABELS = {"cherimoya": "Cherimoya", "cbp_full": "ChromBPNet full", "cbp_nobias": "ChromBPNet bias-free",
-          "cbp_bias": "ChromBPNet bias"}  # fmt: skip
+LABELS = {"cherimoya": "Cherimoya", "cbp_full": "ChromBPNet uncorrected", "cbp_nobias": "ChromBPNet corrected",
+          "cbp_bias": "ChromBPNet bias model"}  # fmt: skip
+# report.md's glossary of the ChromBPNet labels, corrected first: uncorrected is defined by it.
+GLOSSARY = {"cbp_nobias": "chrombpnet_nobias.h5, the model with Tn5 bias removed, which variant scoring normally uses",
+            "cbp_full": "chrombpnet.h5, the corrected model plus the bias model; it predicts the raw signal, Tn5 "
+                        "bias included",
+            "cbp_bias": "the Tn5 bias model alone"}  # fmt: skip
 PAIRS = ("cherimoya:cbp_full", "cherimoya:cbp_nobias", "cherimoya:cbp_bias")
 STRATA = ("summit100", "flank500", "outside")
 TYPES = ("SNV", "MNV", "indel")
 SOURCES = ("exome", "genome", "both")
 # Okabe & Ito (2008): one colour per model, the same in every figure. Checked with the dataviz validator (light
-# mode, all pairs): bias-free and bias are 7.6 apart under deuteranopia, so every panel names its models.
+# mode, all pairs): the corrected and the bias model are 7.6 apart under deuteranopia, so every panel names its models.
 COLOURS = {"cherimoya": "#D55E00", "cbp_full": "#0072B2", "cbp_nobias": "#009E73", "cbp_bias": "#CC79A7"}
 CONTEXT = "#8C8C8C"  # the null, ceilings and reference lines
 INK, MUTED, GRID = "#222222", "#666666", "#E6E6E6"
@@ -623,6 +628,20 @@ def _now_et() -> str:
         return datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def glossary(models) -> list[str]:
+    """report.md's header bullet on what the ChromBPNet labels mean, for the ChromBPNet models among `models` only
+    (none without one)."""
+    named = [m for m in GLOSSARY if m in models]
+    if not named:
+        return []
+    text = " ".join(f"{label(m)}: {GLOSSARY[m]}." for m in named)
+    if "cherimoya" in models and "cbp_full" in models:
+        text += " Cherimoya has no bias model and, like the uncorrected model, predicts the raw signal."
+    elif "cherimoya" in models:
+        text += " Cherimoya has no bias model and predicts the raw signal, Tn5 bias included."
+    return [f"- {text}"]
+
+
 def _subset_keys(agree: list[dict]) -> list[tuple[str, str, int]]:
     """(kind, name, n) of every subset, in the order compare_dataset made them."""
     keys = []
@@ -681,6 +700,7 @@ def report(out_dir: Path, args, datasets, pairs, models, rows, sizes, figures, m
         f"- Generated {_now_et()} by `workflows/variant_scoring/compare.py`.",
         f"- Scores `{args.scores_root}`: variants `{args.variants}`, null `{args.null}`, folds "
         f"{', '.join(map(str, args.folds))}; variant list `{args.list}`.",
+        *glossary(models),
         "- Every number is on logFC, the log2 ratio of ALT to REF strand-averaged predicted counts.",
         "- B (between the models): the two models' fold-mean logFC. C (a model's ceiling): fold k against the mean of "
         "the model's other folds, averaged over k. A cross-model number near both ceilings means the two models agree "

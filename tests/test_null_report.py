@@ -5,8 +5,8 @@ genomic null of 6 SNVs, scored by the four models. The list holds one more varia
 when build_windows.py drops a row), and the genomic null's windows are stored in reverse order: both are joined on
 their ids. The shuffled null's per-fold tables are .npz only (scores.py --no-fold-tsv) and its summaries both; the
 genomic null's tables are TSVs only, so both ways of reading a table are taken. |logFC| lies on a grid of 1/64, exact
-in float32 and in the tables' 7 digits. Cherimoya's shuffled null is twice as wide as ChromBPNet full's; its genomic
-null and its variants are as wide as ChromBPNet full's, so the rule's branch is the null artefact.
+in float32 and in the tables' 7 digits. Cherimoya's shuffled null is twice as wide as that of ChromBPNet uncorrected;
+its genomic null and its variants are as wide as the uncorrected model's, so the rule's branch is the null artefact.
 """
 
 from __future__ import annotations
@@ -227,7 +227,7 @@ def test_pair_overlap():
     p_a = np.array([0.001, 0.002, 0.5, 0.004, 0.5])
     p_b = np.array([0.001, 0.5, 0.003, 0.5, 0.5])
     out = nr.pair_overlap(p_a, p_b, np.array([0.1, 0.2, 0.9, 0.3, 0.4]))
-    # Cherimoya calls 0, 1 and 3, ChromBPNet full 0 and 2; at two calls Cherimoya's are 0 and 1.
+    # Cherimoya calls 0, 1 and 3, ChromBPNet uncorrected 0 and 2; at two calls Cherimoya's are 0 and 1.
     assert (out["both"], out["cherimoya_only"], out["cbp_full_only"]) == (1, 2, 1)
     assert out["share_of_cherimoya"] == pytest.approx(1 / 3) and out["share_of_cbp_full"] == 0.5
     assert out["equal_count_shared"] == 0.5 and out["equal_count_p"] == 0.002
@@ -340,8 +340,8 @@ def test_end_to_end(tmp_path, monkeypatch):
     assert freq(**pair, group="cbp_full_only", maf_bin="all", measure="mean_maf") == pytest.approx(0.05)  # 7, 9
 
     r = table(tmp_path, "R_rule_bootstrap.tsv")
-    # Cherimoya's |logFC| is exactly twice ChromBPNet full's on the shuffled null and equal on the genomic one, so every
-    # replicate gives the point ratio; the variants' ratio is 1, so the genomic null removes all of the excess.
+    # Cherimoya's |logFC| is exactly twice the uncorrected model's on the shuffled null and equal on the genomic one,
+    # so every replicate gives the point ratio; the variants' ratio is 1, so the genomic null removes all of the excess.
     for null, point in (("null", 2.0), ("genomic_null", 1.0)):
         row = pick(r, measure="q99_ratio", null=null, subset="SNV")
         assert close(row["point"], point) and close(row["lo"], point) and close(row["hi"], point)
@@ -357,6 +357,13 @@ def test_end_to_end(tmp_path, monkeypatch):
     assert "**null artefact** (bootstrap: 100 % null artefact)" in report and "Bootstrap intervals" in report
     assert "Purifying selection" in report and "CpG transitions" in report
     assert "1 of 6 rows lie on chromosomes without a fold" in report
+    # The rule as written (its ChromBPNet-full), then which label that is; the glossary names all four models read.
+    assert all(f"> {text}" in report for text in nr.RULE)
+    assert "> Decision rule, written before the genomic null's numbers were seen (2026-10-13 15:37 ET)." in report
+    assert "Cherimoya / ChromBPNet-full q99 ratio on like-for-like rows" in report
+    assert "In this report's labels, the rule's ChromBPNet full is ChromBPNet uncorrected." in report
+    assert "- ChromBPNet corrected: chrombpnet_nobias.h5" in report and "ChromBPNet bias model: the Tn5" in report
+    assert "per-fold share Cherimoya / uncorrected / corrected" in report and report.count("ChromBPNet full") == 1
 
 
 def test_two_datasets(tmp_path):

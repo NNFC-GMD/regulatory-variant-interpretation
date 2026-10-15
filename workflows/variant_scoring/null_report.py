@@ -14,21 +14,21 @@ Rows and models
   MNV or indel and an SNV a transition (Ti: A<>G, C<>T) or a transversion (Tv). A row of a null without src_id (the
   genomic null) is typed from its own id, chrom:pos:ref:alt, or by the lengths in the list's compact form for long
   ids, chrom:pos:<len ref>><len alt>:<hash>. The genomic null holds SNVs only, so the like-for-like rows are each
-  null's SNV rows. Models: Cherimoya (cherimoya), ChromBPNet full (cbp_full) and bias-free (cbp_nobias); the bias
-  model (cbp_bias) in A only. The pair compared is Cherimoya and ChromBPNet full.
+  null's SNV rows. Models: Cherimoya (cherimoya), ChromBPNet uncorrected (cbp_full) and corrected (cbp_nobias); the
+  bias model (cbp_bias) in A only. The pair compared is Cherimoya and ChromBPNet uncorrected.
 
 Per dataset
   A  widths: per model, null and subset of its rows (all; SNV, and its Ti and Tv rows; MNV and indel when there are
      any), the |logFC| q50, q90 and q99.9 with the folds pooled, and q99 as the mean of the per-fold q99s (each fold's
      p-values come from its own null) with their range. The variants the same way (all, SNV, summit100, summit100
-     SNV). q99_vs_cbp_full is the row's q99 over ChromBPNet full's on the same rows.
+     SNV). q99_vs_cbp_full is the row's q99 over that of ChromBPNet uncorrected on the same rows.
   B  calls under each null: the per-fold share (the mean over folds, and its range) and the fold-mean calls (the
      summary's abs_logfc.mean.pval, VS's geometric mean of the per-fold p), for all variants (view all) and for the
      SNVs (SNV); when the null holds rows other than SNVs, also the SNVs against its SNV rows only (SNV_vs_SNV_rows:
-     p recomputed per fold with scores.get_pvals, then scores.geo_mean). Cherimoya against ChromBPNet full: the calls
-     of both and of one only, the shares, and the share in common when Cherimoya calls as many variants as
-     ChromBPNet full (its smallest p first, ties by the larger |fold-mean logFC|). Each model across two nulls: its
-     calls under each and under both.
+     p recomputed per fold with scores.get_pvals, then scores.geo_mean). Cherimoya against ChromBPNet uncorrected: the
+     calls of both and of one only, the shares, and the share in common when Cherimoya calls as many variants as
+     ChromBPNet uncorrected (its smallest p first, ties by the larger |fold-mean logFC|). Each model across two nulls:
+     its calls under each and under both.
   C  the p of a |logFC| of 0.25, 0.5, 0.75 and 1 (fold change 1.19, 1.41, 1.68 and 2) against each model's null,
      folds pooled; all rows and SNV rows.
   D  CpG: the CpG count of each null row's allele-1 window, a C (code 1) followed by a G (code 2) in
@@ -36,9 +36,9 @@ Per dataset
      in CpG bins 0-14, 15-29, 30-49, 50-79, 80-119 and 120+, folds pooled; and each null without src_id (the genomic
      one) reweighted to the CpG-bin mix of the SNV rows of the first null with src_id (the shuffled one). The weighted
      q99 is the smallest |logFC| whose cumulative weight reaches 99 % of the total.
-  E  Cherimoya against ChromBPNet full on the same rows, per fold: Pearson r of logFC and the share of Cherimoya's
-     top 1 % rows by |logFC| that are among ChromBPNet full's top 1 % (compare.py's top_overlap); each null (all
-     rows, SNV rows) and the variants (all, SNVs).
+  E  Cherimoya against ChromBPNet uncorrected on the same rows, per fold: Pearson r of logFC and the share of
+     Cherimoya's top 1 % rows by |logFC| that are among the top 1 % of ChromBPNet uncorrected (compare.py's
+     top_overlap); each null (all rows, SNV rows) and the variants (all, SNVs).
   F  held-out rows only: per fold k, the SNV rows on fold k's test chromosomes and their |logFC| q99 in fold k. A
      null row's chromosome is that of its src_id, or of its id without one; the list's fold_test, a function of the
      chromosome, maps it to a fold, and a row on a chromosome the list does not hold is left out. The mean over
@@ -50,7 +50,7 @@ Per dataset
      non-numeric AF_nfe as `empty`. Per model, within mut_class and stratum (each, and all): n, the q50, q90 and q99
      of |logfc.mean| (the absolute fold-mean logFC; not abs_logfc.mean, the fold mean of |logFC|) and the share
      called under each null. Per null and mut_class, the MAF bins of the variants called by both models, by
-     Cherimoya only and by ChromBPNet full only, against all variants.
+     Cherimoya only and by ChromBPNet uncorrected only, against all variants.
   R  the decision numbers' sampling noise from the null rows alone, a bootstrap: --bootstrap replicates (default
      200), each drawing a null's SNV rows again with replacement, once for both models and every fold
      (default_rng(--bootstrap-seed)); its Ti and Tv rows are the drawn rows of each. The two nulls are drawn
@@ -62,9 +62,9 @@ Per dataset
 
 The decision rule
   Written before the genomic null's numbers were seen; RULE below, quoted in report.md. It reads A's Cherimoya /
-  ChromBPNet-full q99 ratio on the genomic null's rows: at most 1.15, the shuffled null's extra width for Cherimoya
-  is an artefact of shuffled sequence; at least 1.40, a model property; in between, partly both. How much: the share
-  of the shuffled null's excess over the variants' ratio (summit100 SNVs) that the genomic null removes,
+  ChromBPNet uncorrected q99 ratio on the genomic null's rows: at most 1.15, the shuffled null's extra width for
+  Cherimoya is an artefact of shuffled sequence; at least 1.40, a model property; in between, partly both. How much:
+  the share of the shuffled null's excess over the variants' ratio (summit100 SNVs) that the genomic null removes,
   (shuffled - genomic) / (shuffled - variants). R gives each of these numbers an interval and the branch a share of
   bootstrap replicates.
 
@@ -146,8 +146,13 @@ MODELS = ("cherimoya", "cbp_full", "cbp_nobias")
 WIDTH_MODELS = (*MODELS, "cbp_bias")  # A also shows the bias model's null
 PAIR = ("cherimoya", "cbp_full")
 PAIR_NAME = "+".join(PAIR)
-LABELS = {"cherimoya": "Cherimoya", "cbp_full": "ChromBPNet full", "cbp_nobias": "ChromBPNet bias-free",
-          "cbp_bias": "ChromBPNet bias"}  # fmt: skip
+LABELS = {"cherimoya": "Cherimoya", "cbp_full": "ChromBPNet uncorrected", "cbp_nobias": "ChromBPNet corrected",
+          "cbp_bias": "ChromBPNet bias model"}  # fmt: skip
+# report.md's glossary of the ChromBPNet labels, as compare.py's (corrected first: uncorrected is defined by it).
+GLOSSARY = {"cbp_nobias": "chrombpnet_nobias.h5, the model with Tn5 bias removed, which variant scoring normally uses",
+            "cbp_full": "chrombpnet.h5, the corrected model plus the bias model; it predicts the raw signal, Tn5 "
+                        "bias included",
+            "cbp_bias": "the Tn5 bias model alone"}  # fmt: skip
 NULL_LABELS = {"null": "shuffled", "genomic_null": "genomic"}
 ALPHA = 0.01  # a call: p < ALPHA
 FIXED = (0.25, 0.5, 0.75, 1.0)  # C: the |logFC| values whose p is read off each null
@@ -161,13 +166,14 @@ TRANSITIONS = frozenset({("A", "G"), ("G", "A"), ("C", "T"), ("T", "C")})
 MUT_CLASSES = ("CpG_ti", "CpG_tv", "ti", "tv", "mnv", "indel")  # table_list.py's
 STRATA = ("summit100", "flank500")
 MAF_BINS = ("0.00", "0.01-0.04", ">=0.05", "empty")
-# The decision rule's thresholds on the genomic null's Cherimoya / ChromBPNet-full q99 ratio, and its branches.
+# The decision rule's thresholds on the genomic null's Cherimoya / ChromBPNet uncorrected q99 ratio, and its branches.
 ARTEFACT_MAX = 1.15
 PROPERTY_MIN = 1.40
 BRANCHES = ("null artefact", "partly both", "model property")
 BOOTSTRAP = 200  # R: replicates of the null rows
 BOOTSTRAP_SEED = 0
 BASES = re.compile(r"[ACGTN]+")  # an allele of an id
+# The rule as written, quoted verbatim in report.md; build_report then says which label its ChromBPNet-full is.
 RULE = (
     "Decision rule, written before the genomic null's numbers were seen (2026-10-13 15:37 ET). The observable is the "
     "Cherimoya / ChromBPNet-full q99 ratio on like-for-like rows: the genomic null against the shuffled null's "
@@ -206,6 +212,11 @@ COLUMNS = {
 
 def label(model: str) -> str:
     return LABELS.get(model, model)
+
+
+def short(model: str) -> str:
+    """The label without "ChromBPNet ", for a header that names several models: Cherimoya / uncorrected / corrected."""
+    return label(model).removeprefix("ChromBPNet ")
 
 
 def null_label(null: str) -> str:
@@ -261,9 +272,9 @@ def maf_bin(text: str) -> tuple[int, float]:
 
 
 def decide(shuffled: float, genomic: float, variants: float) -> tuple[str, float]:
-    """The rule's branch from the Cherimoya / ChromBPNet-full q99 ratios of the shuffled null's SNV rows, the genomic
-    null and the variants (summit100 SNVs), and how much of the shuffled null's excess over the variants' ratio the
-    genomic null removes: (shuffled - genomic) / (shuffled - variants), NaN unless the shuffled ratio is the larger."""
+    """The rule's branch from the Cherimoya / ChromBPNet uncorrected q99 ratios of the shuffled null's SNV rows, the
+    genomic null and the variants (summit100 SNVs), and how much of the shuffled null's excess over the variants' ratio
+    the genomic null removes: (shuffled - genomic) / (shuffled - variants), NaN unless the shuffled ratio is larger."""
     if math.isnan(genomic):
         return "not evaluable", math.nan
     removed = (shuffled - genomic) / (shuffled - variants) if shuffled > variants else math.nan
@@ -1225,6 +1236,20 @@ def _q99(row: dict | None, n_key: str = "n", folds: int = 1) -> float:
     return row["q99"]
 
 
+def glossary(models) -> list[str]:
+    """report.md's header bullet on what the ChromBPNet labels mean, for the ChromBPNet models among `models` only
+    (none without one), as compare.py's."""
+    named = [m for m in GLOSSARY if m in models]
+    if not named:
+        return []
+    text = " ".join(f"{label(m)}: {GLOSSARY[m]}." for m in named)
+    if "cherimoya" in models and "cbp_full" in models:
+        text += " Cherimoya has no bias model and, like the uncorrected model, predicts the raw signal."
+    elif "cherimoya" in models:
+        text += " Cherimoya has no bias model and predicts the raw signal, Tn5 bias included."
+    return [f"- {text}"]
+
+
 def build_report(args, vl: VariantList, nulls: list[str], cache: dict, done: list[str], rows: dict,
                  notes: Notes) -> str:  # fmt: skip
     """report.md: the rule's outcome per dataset first, then compact tables of A to H."""
@@ -1243,6 +1268,7 @@ def build_report(args, vl: VariantList, nulls: list[str], cache: dict, done: lis
           r["measure"]): r["value"] for r in rows["H"]}  # fmt: skip
     R = {(r["dataset"], r["measure"], r["null"], r["subset"]): r for r in rows["R"]}
     both = f"{shuffled}+{genomic}"
+    pair_names = " / ".join(label(m) for m in PAIR)  # Cherimoya / ChromBPNet uncorrected, in headers
 
     def ratio(ds, null, subset):
         r = A.get((ds, null, subset, "cherimoya"))
@@ -1276,6 +1302,7 @@ def build_report(args, vl: VariantList, nulls: list[str], cache: dict, done: lis
         f"{n_kind[INDEL]:,} indels, {n_kind[MNV]:,} MNVs); window set `{args.variants}`; folds "
         f"{', '.join(map(str, args.folds))}.",
         f"- Nulls: {sizes or 'none read'}.",
+        *glossary({r["model"] for r in rows["A"]}),
         f"- logFC is the log2 ratio of ALT to REF strand-averaged predicted counts. A call is p < {ALPHA:g}, VS's "
         "right-tailed empirical p of |logFC| against the fold's null rows, (rank + 1) / (n + 1); fold-mean calls use "
         "the summary's geometric mean of the per-fold p. q99 is the mean of the per-fold 99th percentiles of |logFC| "
@@ -1292,14 +1319,15 @@ def build_report(args, vl: VariantList, nulls: list[str], cache: dict, done: lis
 
     # --- the decision
     lines += ["## Decision rule (pre-registered)", ""] + [f"> {text}" for text in RULE] + [""]
+    lines += [f"In this report's labels, the rule's ChromBPNet full is {label('cbp_full')}.", ""]
     lines += [
-        f"Ratios: Cherimoya's |logFC| q99 over ChromBPNet full's on the same rows (A). The branch follows the genomic "
-        f"null's ratio: at most {ARTEFACT_MAX}, null artefact; at least {PROPERTY_MIN}, model property; in between, "
-        "partly both. Excess removed: (shuffled - genomic) / (shuffled - variants), the share of the shuffled null's "
-        "extra Cherimoya width over the variants' ratio (summit100 SNVs) that real sequence takes away. Calls: "
-        "fold-mean calls of all variants, Cherimoya / ChromBPNet full (their ratio). In brackets, the bootstrap's 95 % "
-        f"interval ({args.bootstrap} replicates of each null's SNV rows, R_rule_bootstrap.tsv), and after the branch "
-        "the share of replicates in each branch.",
+        "Ratios: Cherimoya's |logFC| q99 over that of ChromBPNet uncorrected on the same rows (A). The branch follows "
+        f"the genomic null's ratio: at most {ARTEFACT_MAX}, null artefact; at least {PROPERTY_MIN}, model property; "
+        "in between, partly both. Excess removed: (shuffled - genomic) / (shuffled - variants), the share of the "
+        "shuffled null's extra Cherimoya width over the variants' ratio (summit100 SNVs) that real sequence takes "
+        "away. Calls: fold-mean calls of all variants, Cherimoya / ChromBPNet uncorrected (their ratio). In brackets, "
+        f"the bootstrap's 95 % interval ({args.bootstrap} replicates of each null's SNV rows, R_rule_bootstrap.tsv), "
+        "and after the branch the share of replicates in each branch.",
         "",
     ]
     body, branches, high_anchor = [], Counter(), []
@@ -1358,7 +1386,7 @@ def build_report(args, vl: VariantList, nulls: list[str], cache: dict, done: lis
             n = next(r["n"] for r in got if r)
             body.append([ds, name, _int(n), *(_f(r["q99"]) if r else "–" for r in got),
                          _f(ratio(ds, null, subset))])  # fmt: skip
-    lines += _table(["dataset", "rows", "n", *(label(m) for m in WIDTH_MODELS), "Cherimoya / full"], body)
+    lines += _table(["dataset", "rows", "n", *(label(m) for m in WIDTH_MODELS), pair_names], body)
 
     # --- B
     lines += [
@@ -1367,12 +1395,12 @@ def build_report(args, vl: VariantList, nulls: list[str], cache: dict, done: lis
         f"Per-fold share: the mean over folds of the share of variants with p < {ALPHA:g} in that fold. Fold-mean "
         f"calls: the summary's p < {ALPHA:g}. View SNV_vs_SNV_rows: the SNVs against the null's SNV rows only (p "
         "recomputed). "
-        "Both: called by Cherimoya and ChromBPNet full. Equal count: the share in common when Cherimoya calls as many "
-        "as ChromBPNet full.",
+        "Both: called by Cherimoya and ChromBPNet uncorrected. Equal count: the share in common when Cherimoya calls "
+        "as many as ChromBPNet uncorrected.",
         "",
     ]
     body = []
-    trio = " / ".join(("C", "F", "BF"))
+    trio = " / ".join(short(m) for m in MODELS)
     for ds in done:
         for null in nulls:
             for view in ("all", "SNV", "SNV_vs_SNV_rows"):
@@ -1388,9 +1416,9 @@ def build_report(args, vl: VariantList, nulls: list[str], cache: dict, done: lis
                              _pct(pair["share_of_cherimoya"], 0), _pct(pair["share_of_cbp_full"], 0),
                              _pct(pair["equal_count_shared"], 0)])  # fmt: skip
     lines += _table(["dataset", "null", "view", "variants", f"per-fold share {trio}", f"fold-mean calls {trio}",
-                     "both", "of Cherimoya's, also full's", "of full's, also Cherimoya's", "equal count"],
-                    body)  # fmt: skip
-    lines += ["C: Cherimoya, F: ChromBPNet full, BF: ChromBPNet bias-free.", ""]
+                     "both", "of Cherimoya's, also the uncorrected model's",
+                     "of the uncorrected model's, also Cherimoya's", "equal count"], body)  # fmt: skip
+    lines += ["Uncorrected and corrected: ChromBPNet uncorrected and ChromBPNet corrected.", ""]
 
     # --- C
     lines += [f"## C. p of a fixed |logFC| ({' / '.join(f'{x:g}' for x in FIXED)}; fold change "
@@ -1418,10 +1446,10 @@ def build_report(args, vl: VariantList, nulls: list[str], cache: dict, done: lis
                      *(_pct(b["share"], 0) if b else "–" for b in bins)])  # fmt: skip
     lines += _table(["null", "SNV rows", "mean", "median", *names], body)
     if genomic and shuffled:
-        lines += ["|logFC| q99 of the SNV rows, folds pooled, Cherimoya / ChromBPNet full (ratio); the genomic null "
-                  "reweighted to the shuffled null's CpG-bin mix. The reweighted q99 is the smallest |logFC| whose "
-                  "weight reaches 99 %, the others numpy's interpolated quantile: the two rules can differ by one "
-                  "order statistic (about 0.1 % of q99 at these sizes).", ""]  # fmt: skip
+        lines += ["|logFC| q99 of the SNV rows, folds pooled, Cherimoya / ChromBPNet uncorrected (ratio); the genomic "
+                  "null reweighted to the shuffled null's CpG-bin mix. The reweighted q99 is the smallest |logFC| "
+                  "whose weight reaches 99 %, the others numpy's interpolated quantile: the two rules can differ by "
+                  "one order statistic (about 0.1 % of q99 at these sizes).", ""]  # fmt: skip
         body = []
         for ds in done:
             cells = []
@@ -1440,7 +1468,7 @@ def build_report(args, vl: VariantList, nulls: list[str], cache: dict, done: lis
         sets += [(null, "all")] + ([(null, "SNV")] if kinds.get(null) else [])
     set_names = [("variants" if s == "variants" else null_label(s)) + ("" if sub == "all" else f" {sub}")
                  for s, sub in sets]  # fmt: skip
-    lines += ["## E. Cherimoya against ChromBPNet full on the same rows (mean over folds)", ""]
+    lines += ["## E. Cherimoya against ChromBPNet uncorrected on the same rows (mean over folds)", ""]
     body = []
     for ds in done:
         got = [E.get((ds, s, sub)) for s, sub in sets]
@@ -1517,7 +1545,7 @@ def build_report(args, vl: VariantList, nulls: list[str], cache: dict, done: lis
                                         for m in PAIR))  # fmt: skip
             body.append(cells)
     lines += _table(["mut_class", "MAF", "n", *(f"{label(m)} q50 / q99" for m in PAIR),
-                     *(f"called C / F, {null_label(null)}" for null in nulls)], body)  # fmt: skip
+                     *(f"called {pair_names}, {null_label(null)}" for null in nulls)], body)  # fmt: skip
     groups = ("all", "both", f"{PAIR[0]}_only", f"{PAIR[1]}_only")
     lines += [f"The calls' MAF: mean MAF · share in {' / '.join(MAF_BINS[:3])} · n (median over datasets):", ""]
     body = []
@@ -1532,8 +1560,7 @@ def build_report(args, vl: VariantList, nulls: list[str], cache: dict, done: lis
                              f"{_f(mean_maf)} · {'/'.join(_f(100 * s, 0) for s in shares)} % · {_int(n)}")  # fmt: skip
             if any(cell != "–" for cell in cells):
                 body.append([null_label(null), c, *cells])
-    lines += _table(["null", "mut_class", "all variants", "called by both", "Cherimoya only", "ChromBPNet full only"],
-                    body)  # fmt: skip
+    lines += _table(["null", "mut_class", "all variants", "called by both", *(f"{label(m)} only" for m in PAIR)], body)
     return "\n".join(lines) + "\n"
 
 

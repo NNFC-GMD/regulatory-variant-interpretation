@@ -468,9 +468,22 @@ def test_compare_end_to_end(tmp_path):
     assert set(strand["measure"].tolist()) == {"pearson_fwd_rev", "spearman_fwd_rev", "pearson_fwd_both",
                                                "top_overlap_fwd_both"}  # fmt: skip
     report = (out / "report.md").read_text()
-    assert "Cherimoya vs ChromBPNet full" in report and "ceiling Cherimoya" in report
+    assert "Cherimoya vs ChromBPNet uncorrected" in report and "ceiling Cherimoya" in report
+    assert "- ChromBPNet corrected: chrombpnet_nobias.h5" in report and "ChromBPNet full" not in report
     for name in ("fig_scatter.png", "fig_agreement.png", "fig_strand.png", "fig_null.png"):
         assert (out / name).exists() == figures
+
+
+def test_report_glossary_names_only_the_models_run():
+    """report.md's header says what each ChromBPNet label means, for the ChromBPNet models of the run only."""
+    every = cmp.glossary(cmp.MODELS)
+    assert len(every) == 1 and every[0].startswith("- ChromBPNet corrected: chrombpnet_nobias.h5, the model with Tn5")
+    assert "ChromBPNet uncorrected: chrombpnet.h5" in every[0] and "ChromBPNet bias model: the Tn5" in every[0]
+    assert every[0].endswith("Cherimoya has no bias model and, like the uncorrected model, predicts the raw signal.")
+    some = cmp.glossary(["cherimoya", "cbp_nobias"])[0]
+    assert "ChromBPNet uncorrected" not in some and "ChromBPNet bias model" not in some
+    assert some.endswith("Cherimoya has no bias model and predicts the raw signal, Tn5 bias included.")
+    assert cmp.glossary(["cherimoya"]) == []
 
 
 # --- compare.py's statistics -----------------------------------------------------------------------------------
@@ -588,7 +601,7 @@ def test_compare_keeps_each_dataset_on_its_own_models(tmp_path):
     assert set(agreement["dataset"][full].tolist()) == {"dsA"}
     assert set(agreement["dataset"][nobias].tolist()) == {"dsA", "dsB"}
     report = (tmp_path / "two" / "report.md").read_text()
-    assert "Cherimoya vs ChromBPNet full" in report and "Not scored for dsB: ChromBPNet full" in report
+    assert "Cherimoya vs ChromBPNet uncorrected" in report and "Not scored for dsB: ChromBPNet uncorrected" in report
     assert cmp.main([*common, "--datasets", "dsA", "dsB", "dsC", "--out-dir", str(tmp_path / "three")]) == 1
     three = sc.read_table(tmp_path / "three" / "agreement.tsv")
     assert set(three["dataset"].tolist()) == {"dsA", "dsB"}

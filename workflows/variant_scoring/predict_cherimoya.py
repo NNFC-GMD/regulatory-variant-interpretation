@@ -8,12 +8,28 @@ workflows/cherimoya/compare_chrombpnet.py loads it. eval() builds the blocks' bf
 megakernel reads (cheri.py:1063-1086); without it every call recasts the weights.
 
 Only the count head is used: what cherimoya.wrappers.LogCountWrapper returns, model(X)[1] (wrappers.py:168-204), on
-the scale the head is trained on, log(count + 1) (losses.py:158). The model must have one signal group and no control
-tracks. Inputs are one-hot (N, 4, 2114) built on the GPU from the uint8 codes, code 4 as an all-zero column. The
-reverse complement is the flip of the length and channel axes, tensor.flip(dims=(1, 2)), which for codes A, C, G, T
-= 0..3 is the complement and the reversal (done here on the codes, before the one-hot). Every batch has the same
-shape: a short last batch is padded with all-zero rows whose outputs are dropped; Cherimoya has no cross-row op, so
-padding cannot change the other rows.
+the scale the head is trained on, log(count + 1) (losses.py:158). The model must have one signal group. Inputs are
+one-hot (N, 4, 2114) built on the GPU from the uint8 codes, code 4 as an all-zero column. The reverse complement is the
+flip of the length and channel axes, tensor.flip(dims=(1, 2)), which for codes A, C, G, T = 0..3 is the complement and
+the reversal (done here on the codes, before the one-hot). Every batch has the same shape: a short last batch is padded
+with all-zero rows whose outputs are dropped; Cherimoya has no cross-row op, so padding cannot change the other rows.
+
+Control tracks (--control; the outputs' .json records "control": "none" or "zero")
+  The head is LogCountWrapper(ControlWrapper(model)). A model trained without controls is called as before:
+  ControlWrapper forwards model(X) unchanged (wrappers.py:55-60), "control": "none". A model trained with control
+  tracks (n_control_tracks > 0, e.g. a Tn5-bias track) gets an all-zero control of the input's shape, dtype and device
+  (wrappers.py:61-64), "control": "zero", the only choice: windows carry no control. Its count head is one Linear over
+  [mean of the trunk's output, log(sum of the control + 1)] (cherimoya.py:457-470), so the zero control adds
+  w * log(1) = 0: the counts are the sequence branch's alone, the analogue of ChromBPNet's corrected model. A control
+  shared by both alleles (the reference's) would add the same w * log(S + 1) to both, so logFC is the same as with any
+  shared control, on both strands (the trimmed window the sum covers is symmetric). Absolute log counts, and with them
+  AAQ, are the sequence-only counts: comparable with this model's own peak windows (also zero control), not with the
+  counts the model predicts under its training control. The profile head, which adds the control inside its
+  convolution (cherimoya.py:450-455), is not read.
+  Precision and forward path are the same with a zero control: the zeros take the one-hot's dtype (bf16 under
+  --precision bf16; torch.cat promotes under autocast), the count head sums the control in float32 before the log
+  (cherimoya.py:460-468), and each Cheri block picks the megakernel or the grad path from its own input
+  (cheri.py:1105-1118, 1171-1181), before the control joins after the last block.
 
 Forward path (each Cheri block picks one per call, cheri.py:1105-1118, 1171-1181):
   default       under torch.no_grad() on a GPU: the fused Triton inference megakernel. For fp32 input it has two
@@ -40,7 +56,8 @@ Inputs and outputs are predict_common's (its docstring has the formats):
 
     python workflows/variant_scoring/predict_cherimoya.py --model <dir>/fold_0/cherimoya.fold_0.torch \\
         --windows <root>/windows/variants.npz --windows <root>/windows/null.npz \\
-        --windows <root>/windows/peaks.<dataset>.npz --out-dir <root>/preds/<dataset>/fold_0 [--batch 1024]
+        --windows <root>/windows/peaks.<dataset>.npz --out-dir <root>/preds/<dataset>/fold_0 [--batch 1024] \\
+        [--model-name <name>] [--control zero]
     python workflows/variant_scoring/predict_cherimoya.py --model ... --probe --probe-json probe.json \\
         [--probe-batches 64,256,512,1024,2048] [--barrier <dir> --barrier-n 2]
 
@@ -66,6 +83,13 @@ import predict_common as pc  # noqa: E402
 logger = logging.getLogger("predict_cherimoya")
 
 PRECISIONS = ("default", "strict-fp32", "bf16")
+# What a model trained with control tracks gets in their place (see Control tracks above): windows carry no control,
+# so all zeros is the only choice. A model without control tracks records "none".
+CONTROLS = ("zero",)
+# The outputs' "head", by "control".
+HEADS = {"none": "cherimoya.wrappers.LogCountWrapper: model(X)[1], log(count + 1) scale",
+         "zero": "cherimoya.wrappers.LogCountWrapper(ControlWrapper(model)): model(X, zero control)[1], log(count + 1) "
+                 "scale; the control's count input is log(0 + 1) = 0, so the counts are the sequence branch's"}  # fmt: skip
 
 
 def set_precision(precision: str) -> None:
@@ -80,14 +104,18 @@ def set_precision(precision: str) -> None:
         torch.backends.cudnn.allow_tf32 = False
 
 
+def control_mode(model) -> str:
+    """The outputs' "control": "zero" for a model with control tracks (ControlWrapper feeds it zeros), else "none"."""
+    return "zero" if model.n_control_tracks else "none"
+
+
 def load_model(path: Path, device: str):
-    """Cherimoya.load(path, device, compile=False).eval(), checked to be one unstranded track without controls."""
+    """Cherimoya.load(path, device, compile=False).eval(), checked to be one unstranded track. A model with control
+    tracks loads too; CountPredictor gives it a zero control (Control tracks above)."""
     import cherimoya  # noqa: F401  (sets TF32 matmuls and cudnn.benchmark, cherimoya.py:15-16)
     from cherimoya import Cherimoya
 
     model = Cherimoya.load(str(path), device=device, compile=False).eval()
-    if model.n_control_tracks:
-        raise ValueError(f"{path}: the model takes {model.n_control_tracks} control track(s); windows have none")
     if list(model.signal_groups) != [1]:
         raise ValueError(f"{path}: expected one unstranded track (signal_groups [1]), got {model.signal_groups}")
     model.requires_grad_(False)
@@ -96,15 +124,22 @@ def load_model(path: Path, device: str):
 
 class CountPredictor:
     """Cherimoya's count head on uint8 code rows, forward and reverse complement, one forward call per batch and
-    strand. Outputs stay on the device until the end of a call, so the CPU queues batches ahead of the GPU."""
+    strand. Outputs stay on the device until the end of a call, so the CPU queues batches ahead of the GPU. The head
+    is LogCountWrapper(ControlWrapper(model)): model(X) for a model without control tracks, model(X, zeros) for one
+    with them (`control`, the only choice being "zero")."""
 
-    def __init__(self, model, device: str, precision: str = "default", grad_path: bool = False):
+    def __init__(self, model, device: str, precision: str = "default", grad_path: bool = False,
+                 control: str = "zero"):  # fmt: skip
         import torch
-        from cherimoya.wrappers import LogCountWrapper
+        from cherimoya.wrappers import ControlWrapper, LogCountWrapper
 
+        if control not in CONTROLS:
+            raise ValueError(f"control must be one of {CONTROLS}, got {control!r}")
         self.torch = torch
         self.device = torch.device(device)
-        self.head = LogCountWrapper(model)
+        self.head = LogCountWrapper(ControlWrapper(model))
+        self.control = control_mode(model)
+        self.control_tracks = int(model.n_control_tracks)
         self.precision = precision
         self.grad_path = grad_path or precision == "strict-fp32"
         self.dtype = torch.bfloat16 if precision == "bf16" else torch.float32
@@ -166,6 +201,8 @@ def backend_info(predictor: CountPredictor) -> dict:
         "cherimoya": importlib.metadata.version("cherimoya"),
         "precision": predictor.precision,
         "forward_path": predictor.path,
+        "control": predictor.control,
+        "control_tracks": predictor.control_tracks,
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
         "allow_tf32": {"matmul": torch.backends.cuda.matmul.allow_tf32, "cudnn": torch.backends.cudnn.allow_tf32},
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
@@ -194,6 +231,9 @@ def main(argv=None) -> int:
     ap.add_argument("--model-name", default="cherimoya", help="output file prefix (default cherimoya)")
     ap.add_argument("--precision", choices=PRECISIONS, default="default", help="see above (default: the stack's)")
     ap.add_argument("--grad-path", action="store_true", help="the autograd forward instead of the megakernel")
+    ap.add_argument("--control", choices=CONTROLS, default="zero",
+                    help="for a model with control tracks: what it gets in their place (default zero, the only "
+                         "choice; see above). Ignored for a model without them")  # fmt: skip
     ap.add_argument("--device", default="cuda", help="cuda (default) or cpu")
     pc.add_common_args(ap, default_batch=1024, default_probe_batches="64,256,512,1024,2048")
     args = ap.parse_args(argv)
@@ -208,10 +248,10 @@ def main(argv=None) -> int:
         return 1
     model = load_model(args.model, args.device)
     set_precision(args.precision)
-    predictor = CountPredictor(model, args.device, args.precision, args.grad_path)
+    predictor = CountPredictor(model, args.device, args.precision, args.grad_path, args.control)
     info = backend_info(predictor)
-    logger.info("%s on %s: %s path, precision %s, batch %d", args.model, info["device"], predictor.path,
-                args.precision, args.batch)  # fmt: skip
+    logger.info("%s on %s: %s path, precision %s, batch %d, control %s (%d track(s))", args.model, info["device"],
+                predictor.path, args.precision, args.batch, predictor.control, predictor.control_tracks)  # fmt: skip
 
     def predict(tokens: np.ndarray, batch: int) -> dict[str, dict[str, np.ndarray]]:
         return {args.model_name: predictor.predict(tokens, batch)}
@@ -231,7 +271,7 @@ def main(argv=None) -> int:
 
     window_sets = [pc.load_windows(path, name) for name, path in specs]
     meta = {"script": "workflows/variant_scoring/predict_cherimoya.py", **info,
-            "head": "cherimoya.wrappers.LogCountWrapper: model(X)[1], log(count + 1) scale",
+            "head": HEADS[predictor.control],
             "model_files": {args.model_name: pc.file_info(args.model)}}  # fmt: skip
     pc.run_window_sets(window_sets, predict, [args.model_name], args.out_dir, args.batch, sample=args.sample,
                        sample_seed=args.sample_seed, permute_seed=args.permute_seed, overwrite=args.overwrite,

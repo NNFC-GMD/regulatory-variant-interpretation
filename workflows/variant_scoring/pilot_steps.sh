@@ -14,11 +14,18 @@
 #              cherimoya interpreter for the tests that need torch (pytest's own pure-Python packages from the
 #              default environment, put on PYTHONPATH from a directory of links; skipped if that cannot import them).
 #              Only the first run gates step 2. The second adds the tangermeme shuffle tests, whose property
-#              build_windows.py checks on every null row anyway; it gets its own row (tests_cherimoya) in status.tsv
+#              build_windows.py checks on every null row anyway; it gets its own row (tests_cherimoya) in status.tsv.
+#              Nothing is written into the checkout: no bytecode (PYTHONDONTWRITEBYTECODE, and PYTHONPYCACHEPREFIX on
+#              scratch), no .pytest_cache (-p no:cacheprovider), and the tests write under pytest's tmp_path, in
+#              TMPDIR on scratch. With PILOT_GATE_TESTS=0 a failure here fails nothing: see that knob
 #   2 windows  build_windows.py: the variant windows, the null (in the cherimoya interpreter: it needs tangermeme)
 #              and each dataset's peak windows; then, when the genomic null's list is there (PILOT_GENOMIC_NULL),
 #              its variant windows (windows/genomic_null.npz). That build gates nothing: a failure gets its own row
-#              (windows_genomic_null) in status.tsv                              needs 1 (unless PILOT_GATE_TESTS=0)
+#              (windows_genomic_null) in status.tsv. A set that exists is kept (PILOT_REBUILD=1 rebuilds it); a set
+#              whose windows/<name>.npz, .json or .dropped.tsv is a symbolic link (another root's windows, shared) is
+#              always kept, PILOT_REBUILD or not, since build_windows.py writes the .json and .dropped.tsv through
+#              the link, into the other root; a link whose .npz is missing is a failed build, not rebuilt
+#                                                                                needs 1 (unless PILOT_GATE_TESTS=0)
 #   3 probe    probe_throughput.py: passes/s per model at batch 64-1024 (Cherimoya also 2048), with 1 and 2
 #              processes per GPU                                                 needs 2
 #   4 checks   on one dataset and fold (PILOT_V_DATASET, PILOT_V_FOLD):
@@ -34,14 +41,15 @@
 #                  the clone, the container or apptainer is missing; a failed run gets its own row (4 v2 failed) in
 #                  status.tsv
 #                                                                                needs 2
-#   5 predict  every dataset x fold: Cherimoya, and ChromBPNet's bias-free and bias models in one process (the full
-#              model derived), on the variant, null and peak windows and, when built, the genomic null's;
-#              PILOT_SLOTS_PER_GPU processes per GPU, each pinned to its own CPUs. The tasks go longest first into one
-#              queue (every ChromBPNet task, ~33 min per fold at 3.2M variants on an idle H100, then every Cherimoya
-#              one, ~8 min), and each slot takes the next task when it is free, so the GPUs end within about one
-#              Cherimoya task of each other. A failed task runs once more at half the batch (task <name>.retry),
-#              keeping the window sets it finished. A task that runs past PILOT_TASK_MINUTES is stopped (timeout,
-#              exit 124) and counts as failed, so a hung process cannot keep its GPU until the job's time limit.
+#   5 predict  every dataset x fold, for each kind of model in PILOT_KINDS: Cherimoya, and ChromBPNet's corrected
+#              and bias models in one process (the uncorrected model derived), on the variant, null and peak windows
+#              and, when built, the genomic null's; PILOT_SLOTS_PER_GPU processes per GPU, each pinned to its own CPUs.
+#              The tasks go longest first into one queue (every ChromBPNet task, ~33 min per fold at 3.2M variants on
+#              an idle H100, then every Cherimoya one, ~8 min), and each slot takes the next task when it is free, so
+#              the GPUs end within about one Cherimoya task of each other. A failed task runs once more at half the
+#              batch (task <name>.retry), keeping the window sets it finished. A task that runs past
+#              PILOT_TASK_MINUTES is stopped (timeout, exit 124) and counts as failed, so a hung process cannot keep
+#              its GPU until the job's time limit.
 #              While V2's VS run is still going, the last GPU's slots wait for it to end before they take a task:
 #              TensorFlow's memory there is uncapped, and a slot's cap (PILOT_GPU_FRACTION) is a ceiling, not a
 #              reservation, so the two could otherwise run each other out of GPU memory. V2 is a few minutes on
@@ -56,7 +64,11 @@
 #              score_genomic_null. PILOT_FOLD_TSV=0 leaves out the per-fold TSVs (scores.py --no-fold-tsv; the
 #              .npz tables that compare.py and null_report.py read are always written). Runs when step 5 ran, even if
 #              some of its tasks failed: scores.py leaves out (and exits 1 for) a model without predictions,
-#              compare.py a model without scores
+#              compare.py a model without scores. scores.py scores the models of PILOT_KINDS (--models: cherimoya;
+#              cbp_nobias, cbp_bias, cbp_full). Unless PILOT_KINDS has both kinds, compare.py and null_report.py, which
+#              compare Cherimoya with ChromBPNet, do not run: their rows (compare, analysis) are `skipped` in
+#              status.tsv. V5 and the summary run as usual; without chrombpnet, V2's comparison (it reads ChromBPNet's
+#              corrected predictions) is left out, and V2's own row still records a failed VS run
 #                                                                                needs 5 (to have run)
 #   Checks never gate the predictions: a check outside its tolerance is state `outside_tolerance` (exit 3; 2 is
 #   argparse's usage error, so it means failed).
@@ -81,6 +93,7 @@
 # Knobs (environment; also read from ${PILOT_ENV:-${PILOT_ROOT}/pilot.env} when that file exists):
 #   PILOT_ROOT              the pilot directory: manifest.json (make_manifest.py) and lists/ in it; every output
 #                           goes under it (required)
+#   PILOT_MANIFEST          the manifest (default ${PILOT_ROOT}/manifest.json)
 #   PILOT_STEPS             steps to run (default 1,2,3,4,5,6)
 #   PILOT_LIST              the variant list TSV (default: the one lists/*.tsv, not counting *.callsets.tsv and
 #                           *.dropped.tsv)
@@ -98,6 +111,17 @@
 #   DEFAULT_PY, CHERIMOYA_PY, CHROMBPNET_PY   the interpreters, if not those (no `pixi run`: a dozen processes
 #                           start at once, and these environments need no activation)
 #   PILOT_GPUS              GPU indices (default: every GPU nvidia-smi lists)
+#   PILOT_KINDS             the models steps 5 and 6 run: chrombpnet, cherimoya or both (default "chrombpnet
+#                           cherimoya"; space- or comma-separated, in any order: ChromBPNet's tasks still go first).
+#                           Step 5 queues only these kinds' tasks, and step 6 scores only their models; compare.py and
+#                           null_report.py need both (step 6). Steps 3 and 4 run both whatever it says (the manifest
+#                           holds both), as do step 1's backend tests (CHROMBPNET_PY is needed either way)
+#   PILOT_GPU_CLAIM_DIR     empty (default): off. A directory (made if missing): every process run_logged starts on a
+#                           GPU (step 4's checks, step 5's tasks) has <dir>/<gpu>.<pid>.<random>.claim while it runs,
+#                           touched before and removed after it, for a GPU picker of another job step on the node that
+#                           counts such files per GPU (a motif chain's claim_gpu), so that it sees these tasks. Step 3's
+#                           probe processes and step 4's V2 run take none; a claim of a task killed with this script
+#                           (SIGKILL) stays until the directory is removed (the box's scratch, at its end)
 #   PILOT_SLOTS_PER_GPU     prediction processes per GPU (default 3); PILOT_GPU_FRACTION each one's memory share
 #                           (default 0.3)
 #   PILOT_CHERIMOYA_BATCH, PILOT_CHROMBPNET_BATCH   prediction batch sizes (default 1024, 512)
@@ -106,8 +130,10 @@
 #   PILOT_V_DATASET, PILOT_V_FOLD   where V2-V4 run (default: the manifest's first dataset, fold 0)
 #   PILOT_V_N, PILOT_V3_N   rows for V2/V4 and for V3 (default 2000, 500)
 #   PILOT_PROBE_SECONDS     timed seconds per probe batch size (default 20)
-#   PILOT_GATE_TESTS        1 (default): failing tests in the default environment skip every later step; 0: carry on
-#   PILOT_REBUILD           1: rebuild window sets that exist (default: keep them)
+#   PILOT_GATE_TESTS        1 (default): failing tests in the default environment skip every later step; 0: carry on,
+#                           and step 1's rows (tests, tests_cherimoya) do not count in the exit status: a failed test is
+#                           in status.tsv and the log, but this script still exits 0 when every other row is fine
+#   PILOT_REBUILD           1: rebuild window sets that exist (default: keep them); never a linked set (step 2)
 #   PILOT_V2                1: run V2 (default 0, off). V2 executes VS main, downloaded code, so it is set only after
 #                           the user says so. It also needs VS_REPO (a kundajelab/variant-scorer checkout, main
 #                           @0e1e341), VS_SIF (the chrombpnet 1.x TF-Keras container), and apptainer on PATH or from
@@ -185,6 +211,33 @@ task_minutes="${PILOT_TASK_MINUTES:-0}"
 # Base 10: bash arithmetic would read 08 as a bad octal number and 010 as 8.
 hold_minutes=$(( 10#${hold_minutes} ))
 task_minutes=$(( 10#${task_minutes} ))
+# PILOT_KINDS: the kinds of model steps 5 and 6 run, in the queue's order (ChromBPNet's longer tasks first), whatever
+# order the knob lists them in.
+kinds_text="${PILOT_KINDS:-chrombpnet cherimoya}"
+read -r -a kinds_given <<< "${kinds_text//,/ }"
+kinds=()
+for kind in "${kinds_given[@]}"; do
+    [[ "${kind}" == chrombpnet || "${kind}" == cherimoya ]] || {
+        echo "ERROR: PILOT_KINDS takes chrombpnet and cherimoya (space- or comma-separated), got ${kind}" >&2; exit 1; }
+done
+for kind in chrombpnet cherimoya; do
+    [[ " ${kinds_given[*]} " == *" ${kind} "* ]] && kinds+=( "${kind}" )
+done
+(( ${#kinds[@]} > 0 )) || { echo "ERROR: PILOT_KINDS names no kind of model (${PILOT_KINDS:-})" >&2; exit 1; }
+# has_kind <kind> -- PILOT_KINDS has it.
+has_kind() { [[ " ${kinds[*]} " == *" $1 "* ]]; }
+# both_kinds -- PILOT_KINDS has Cherimoya and ChromBPNet, which compare.py and null_report.py compare.
+both_kinds() { has_kind chrombpnet && has_kind cherimoya; }
+# The models step 6 scores, in scores.py's MODELS order: Cherimoya; ChromBPNet's corrected, bias and uncorrected
+# (derived from the other two) models.
+score_models=()
+if has_kind cherimoya; then score_models+=( cherimoya ); fi
+if has_kind chrombpnet; then score_models+=( cbp_nobias cbp_bias cbp_full ); fi
+# PILOT_GPU_CLAIM_DIR: a claim file per GPU task, for another job step's GPU picker (run_logged); empty = off.
+gpu_claim_dir="${PILOT_GPU_CLAIM_DIR:-}"
+if [[ -n "${gpu_claim_dir}" ]]; then
+    mkdir -p "${gpu_claim_dir}" || { echo "ERROR: cannot make PILOT_GPU_CLAIM_DIR ${gpu_claim_dir}" >&2; exit 1; }
+fi
 # The genomic null's list. `-`, not `:-`: an empty PILOT_GENOMIC_NULL turns the null off; only an unset one takes the
 # default. step_windows builds it when the file is there and not empty.
 genomic_null_list="${PILOT_GENOMIC_NULL-${PILOT_ROOT}/nulls/genomic_null.tsv}"
@@ -267,12 +320,22 @@ v_row() { "${DEFAULT_PY}" "${vs}/read_manifest.py" tasks "${manifest}" --dataset
 
 # run_logged <name> <gpu|-> <cpus> <gpu fraction> <cmd...> -- run a command pinned to <cpus> with its GPU (- for none)
 # and memory caps; log to logs/<name>.log, exit status to logs/<name>.exit, one row in tasks.tsv. Returns its status.
+# With PILOT_GPU_CLAIM_DIR, a GPU command has its claim file there while it runs.
 run_logged() {
-    local name="$1" gpu="$2" cpus="$3" fraction="$4" started t0 rc n
+    local name="$1" gpu="$2" cpus="$3" fraction="$4" started t0 rc n claim=""
     shift 4
     n="$(awk -F, '{ print NF }' <<< "${cpus}")"
     started="$(et)"
     t0=${SECONDS}
+    # <gpu>.<pid>.<random>.claim: the GPU index first, which is how the other picker reads it (the part before the
+    # first dot); this shell's PID and a random number keep two tasks' claims on one GPU apart.
+    if [[ "${gpu}" != "-" && -n "${gpu_claim_dir}" ]]; then
+        claim="${gpu_claim_dir}/${gpu}.${BASHPID}.${RANDOM}.claim"
+        if ! touch "${claim}"; then
+            say "WARNING: ${name}: no GPU claim (cannot write ${claim}); it runs unclaimed"
+            claim=""
+        fi
+    fi
     (
         if [[ "${gpu}" == "-" ]]; then
             export CUDA_VISIBLE_DEVICES="" JAX_PLATFORMS=cpu
@@ -287,6 +350,7 @@ run_logged() {
         exec taskset -c "${cpus}" "$@"
     ) > "${logs}/${name}.log" 2>&1
     rc=$?
+    if [[ -n "${claim}" ]]; then rm -f "${claim}"; fi
     echo "${rc}" > "${logs}/${name}.exit"
     (
         flock -x 8
@@ -401,10 +465,24 @@ step_tests() {
 
 # ------------------------------------------------------------------------------------------------ 2 windows
 # build_set <name> <python> <build_windows.py arguments...> -- build windows/<name>.npz in the background, unless
-# it exists; uses step_windows's pids, slot, fasta.
+# it exists; uses step_windows's pids, slot, fasta. Returns 1 for a linked set without its .npz, else 0 (the build's
+# own status is its PID's, in pids).
 build_set() {
-    local name="$1" py="$2"
+    local name="$1" py="$2" out
     shift 2
+    # A linked set (another root's windows) is kept whatever PILOT_REBUILD says: build_windows.py writes <name>.json
+    # and <name>.dropped.tsv with open(), which follows a link and would overwrite the other root's files (only the
+    # .npz is renamed into place, which replaces a link instead).
+    for out in "${windows}/${name}".{npz,json,dropped.tsv}; do
+        [[ -L "${out}" ]] || continue
+        if [[ -s "${windows}/${name}.npz" ]]; then
+            say "windows ${name}: ${out} is a link (to $(readlink "${out}")); kept, never rebuilt here"
+            return 0
+        fi
+        say "ERROR: windows ${name}: ${out} is a link (to $(readlink "${out}")), and ${windows}/${name}.npz is" \
+            "missing or empty; not rebuilt through the link (fix or remove the links)"
+        return 1
+    done
     if [[ -s "${windows}/${name}.npz" && "${PILOT_REBUILD:-0}" != 1 ]]; then
         say "windows ${name}: ${windows}/${name}.npz exists; kept"
         return 0
@@ -416,14 +494,14 @@ build_set() {
 }
 
 step_windows() {
-    local fasta list ds peaks slot=0 pids=() rc=0 t0
+    local fasta list ds peaks slot=0 pids=() rc=0 t0 gn_rc
     fasta="$(manifest_cmd genome)" || return 1
     list="$(variant_list)" || return 1
     say "variant list ${list}; genome ${fasta}"
-    build_set "${variants_name}" "${DEFAULT_PY}" --list "${list}"
-    build_set null "${CHERIMOYA_PY}" --null --list "${list}" --n "${null_n}" --seed "${seed}"
+    build_set "${variants_name}" "${DEFAULT_PY}" --list "${list}" || rc=1
+    build_set null "${CHERIMOYA_PY}" --null --list "${list}" --n "${null_n}" --seed "${seed}" || rc=1
     while IFS=$'\t' read -r ds peaks; do
-        build_set "peaks.${ds}" "${DEFAULT_PY}" --peaks "${peaks}" --n "${peaks_n}" --seed "${seed}"
+        build_set "peaks.${ds}" "${DEFAULT_PY}" --peaks "${peaks}" --n "${peaks_n}" --seed "${seed}" || rc=1
     done < <(manifest_cmd peaks)
     wait_all "${pids[@]}" || rc=1
     # The genomic null: its list's variant windows, built as the variants' are (no shuffle, so the default
@@ -439,8 +517,10 @@ step_windows() {
         fi
         pids=()
         t0=${SECONDS}
-        build_set genomic_null "${DEFAULT_PY}" --list "${genomic_null_list}"
-        if ! wait_all "${pids[@]}"; then
+        gn_rc=0
+        build_set genomic_null "${DEFAULT_PY}" --list "${genomic_null_list}" || gn_rc=1
+        wait_all "${pids[@]}" || gn_rc=1
+        if (( gn_rc != 0 )); then
             say "genomic null: the build failed; recorded as windows_genomic_null; it gates nothing"
             record 2 windows_genomic_null failed 1 "$(( SECONDS - t0 ))" \
                 "see ${logs}/windows/genomic_null.log; gates nothing"
@@ -701,15 +781,15 @@ step_predict() {
     per=$(( ${#allowed[@]} / n_slots ))
     (( per > 0 )) || { echo "ERROR: ${n_slots} slots but only ${#allowed[@]} CPUs" >&2; return 1; }
     # Longest first: every ChromBPNet task (both parts in one process, ~6,400 passes/s on an idle H100, so ~33 min a
-    # fold at 3.2M variants x 2 alleles x 2 strands), then every Cherimoya task (~26,000 passes/s, ~8 min). Each slot
-    # takes the next one when it is free (largest first, then whoever is free: the GPUs end within about one Cherimoya
-    # task of each other), slot s on GPU s % n_gpus.
-    for kind in chrombpnet cherimoya; do
+    # fold at 3.2M variants x 2 alleles x 2 strands), then every Cherimoya task (~26,000 passes/s, ~8 min); only the
+    # kinds of PILOT_KINDS. Each slot takes the next one when it is free (largest first, then whoever is free: the GPUs
+    # end within about one Cherimoya task of each other), slot s on GPU s % n_gpus.
+    for kind in "${kinds[@]}"; do
         for row in "${rows[@]}"; do order+=( "${kind}"$'\t'"${row}" ); done
     done
     echo 0 > "${queue}"
-    say "${#order[@]} prediction tasks, ChromBPNet's first, over ${n_slots} slots (${#gpus[@]} GPUs x ${gpu_slots})," \
-        "${per} CPUs each; next task from ${queue}"
+    say "${#order[@]} prediction tasks (${kinds[*]}, in that order) over ${n_slots} slots (${#gpus[@]} GPUs x" \
+        "${gpu_slots}), ${per} CPUs each; next task from ${queue}"
     if v2_running; then say "V2's VS run is still on GPU ${gpus[-1]}: that GPU's slots start when it ends"; fi
     for (( i = 0; i < n_slots; i++ )); do
         predict_worker "${gpus[$(( i % ${#gpus[@]} ))]}" "$(cpu_block "${i}" "${per}")" &
@@ -720,7 +800,8 @@ step_predict() {
 
 # ------------------------------------------------------------------------------------------------ 6 score
 # v2_compare -- wait for V2's VS run (bounded: its commands are under timeout) and compare its scores with ours. A V2
-# run that failed gets its own row (4 v2 failed) in status.tsv and does not fail this step.
+# run that failed gets its own row (4 v2 failed) in status.tsv and does not fail this step. Without chrombpnet in
+# PILOT_KINDS there is nothing of ours to compare with.
 v2_compare() {
     local vs_scores="${checks}/v2/vs/nobias.variant_scores.tsv" v2_exit
     if [[ -n "${v2_pid:-}" ]]; then
@@ -734,6 +815,10 @@ v2_compare() {
     fi
     if [[ ! -s "${vs_scores}" ]]; then
         say "V2: no VS scores ($(cat "${checks}/v2/skipped.txt" 2>/dev/null || echo "see ${logs}/checks/v2.log"))"
+        return 0
+    fi
+    if ! has_kind chrombpnet; then
+        say "V2: no comparison: PILOT_KINDS (${kinds[*]}) has no chrombpnet, so step 5 predicted no cbp_nobias"
         return 0
     fi
     pinned "${DEFAULT_PY}" "${vs}/vchecks.py" vs-compare --vs-scores "${vs_scores}" \
@@ -768,7 +853,7 @@ step_score() {
             launch "score/scores.${null}.${ds}" - "$(cpu_block "${slot}" 8)" 0 "${DEFAULT_PY}" "${vs}/scores.py" \
                 --datasets "${ds}" --preds-root "${preds}" --windows-root "${windows}" --list "${list}" \
                 --variants "${variants_name}" --null "${null}" --peaks 'peaks.{dataset}' \
-                --out-root "$(scored_dir "${null}" scores)" "${fold_args[@]}"
+                --out-root "$(scored_dir "${null}" scores)" --models "${score_models[@]}" "${fold_args[@]}"
             if [[ "${null}" == null ]]; then null_pids+=( "${launched_pid}" ); else gn_pids+=( "${launched_pid}" ); fi
             slot=$(( slot + 1 ))
         done
@@ -779,26 +864,36 @@ step_score() {
     say "scores.py: done for ${#datasets[@]} dataset(s) x ${#nulls[@]} null(s) in $(( SECONDS - t0 )) s;" \
         "logs ${logs}/score/scores.*.log"
     # compare.py per null, both at once, each with one worker process per dataset on its own 32 CPUs. Single-threaded
-    # BLAS: the workers are the parallelism.
-    slot=0
-    for null in "${nulls[@]}"; do
-        launch "score/compare.${null}" - "$(cpu_block "${slot}" 32)" 0 env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-            MKL_NUM_THREADS=1 "${CHERIMOYA_PY}" "${vs}/compare.py" --scores-root "$(scored_dir "${null}" scores)" \
-            --datasets "${datasets[@]}" --list "${list}" --variants "${variants_name}" --null "${null}" \
-            --out-dir "$(scored_dir "${null}" compare)" --workers "${#datasets[@]}"
-        compare_pids+=( "${launched_pid}" )
-        slot=$(( slot + 1 ))
-    done
-    wait "${compare_pids[0]}"
-    st+=( "$?" )
-    if (( ${#compare_pids[@]} > 1 )); then wait "${compare_pids[1]}" || gn_rc=1; fi
+    # BLAS: the workers are the parallelism. It compares Cherimoya with ChromBPNet, so it needs both in PILOT_KINDS.
+    if both_kinds; then
+        slot=0
+        for null in "${nulls[@]}"; do
+            launch "score/compare.${null}" - "$(cpu_block "${slot}" 32)" 0 env OMP_NUM_THREADS=1 \
+                OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 "${CHERIMOYA_PY}" "${vs}/compare.py" \
+                --scores-root "$(scored_dir "${null}" scores)" --datasets "${datasets[@]}" --list "${list}" \
+                --variants "${variants_name}" --null "${null}" --out-dir "$(scored_dir "${null}" compare)" \
+                --workers "${#datasets[@]}"
+            compare_pids+=( "${launched_pid}" )
+            slot=$(( slot + 1 ))
+        done
+        wait "${compare_pids[0]}"
+        st+=( "$?" )
+        if (( ${#compare_pids[@]} > 1 )); then wait "${compare_pids[1]}" || gn_rc=1; fi
+    else
+        say "compare: not run: it compares Cherimoya with ChromBPNet, and PILOT_KINDS is ${kinds[*]}"
+        record 6 compare skipped - 0 "PILOT_KINDS=${kinds[*]}: compare.py compares Cherimoya with ChromBPNet"
+    fi
     if (( gn_rc != 0 )); then
         say "genomic null: scores.py or compare.py failed; recorded as score_genomic_null"
         record 6 score_genomic_null failed 1 "$(( SECONDS - t0 ))" "see ${logs}/score/; gates nothing"
     fi
     # null_report.py over every null scored above; it gates nothing and gets its own row (analysis) in status.tsv.
+    # Its rule is Cherimoya against ChromBPNet's uncorrected model, so it needs both in PILOT_KINDS.
     t0=${SECONDS}
-    if [[ ! -f "${vs}/null_report.py" ]]; then
+    if ! both_kinds; then
+        say "analysis: not run: null_report.py compares Cherimoya with ChromBPNet, and PILOT_KINDS is ${kinds[*]}"
+        record 6 analysis skipped - 0 "PILOT_KINDS=${kinds[*]}: null_report.py compares Cherimoya with ChromBPNet"
+    elif [[ ! -f "${vs}/null_report.py" ]]; then
         say "analysis: no ${vs}/null_report.py"
         record 6 analysis failed 1 0 "no ${vs}/null_report.py; gates nothing"
     else
@@ -837,9 +932,12 @@ preflight() {
     [[ -n "$(v_row)" ]] || { echo "ERROR: no fold ${v_fold} of ${v_dataset} in ${manifest}" >&2; return 1; }
 }
 
-# failed_rows -- the rows of status.tsv in state `failed`, as "<step> <name>" lines; exit 1 when there are none. This
-# script's exit status reads it.
+# failed_rows -- the rows of status.tsv in state `failed`, as "<step> <name>" lines; exit 1 when there are none.
 failed_rows() { awk -F'\t' 'NR > 1 && $3 == "failed" { print $1, $2; found = 1 } END { exit !found }' "${status}"; }
+
+# exit_rows -- the failed rows that make this script exit 1, as failed_rows prints them: every one, except step 1's
+# when the tests gate nothing (gate empty: PILOT_GATE_TESTS=0); exit 1 when there are none.
+exit_rows() { failed_rows | awk -v gate="${gate:-}" 'gate == "1" || $1 != 1 { print; found = 1 } END { exit !found }'; }
 
 # hold_rows -- the failed rows that hold the node (see Hold above), as failed_rows prints them; exit 1 when there are
 # none. step 1's tests hold only when they gate step 2 (gate, set in main).
@@ -926,7 +1024,7 @@ printf 'step\tname\tstate\texit\tseconds\tstarted_et\tnote\n' > "${status}"
 printf 'name\tgpu\tcpus\texit\tseconds\tstarted_et\n' > "${tasks_tsv}"
 say "pilot box ${box_id} on $(hostname): ${#allowed[@]} CPUs, GPUs ${gpus[*]:-none}; steps ${PILOT_STEPS:-1,2,3,4,5,6}"
 say "PILOT_ROOT ${PILOT_ROOT}; code ${repo_root} ($(git -C "${repo_root}" rev-parse --short HEAD 2>/dev/null || echo '?'))"
-say "logs ${logs}"
+say "logs ${logs}; models ${kinds[*]}; GPU claims ${gpu_claim_dir:-off}"
 step_started="$(et)"
 if ! preflight > "${logs}/0.preflight.log" 2>&1; then
     cat "${logs}/0.preflight.log" >&2
@@ -959,4 +1057,8 @@ if (( hold_minutes > 0 )) && hold_rows > /dev/null; then
 elif (( hold_minutes > 0 )) && failed_rows > /dev/null; then
     say "no hold: the failed rows ($(failed_rows | paste -sd, - | sed 's/,/, /g')) gate nothing and need no rerun"
 fi
-if failed_rows > /dev/null; then exit 1; fi
+if exit_rows > /dev/null; then exit 1; fi
+if failed_rows > /dev/null; then
+    say "exit 0: the only failed rows are step 1's ($(failed_rows | paste -sd, - | sed 's/,/, /g')), which gate" \
+        "nothing with PILOT_GATE_TESTS=0"
+fi

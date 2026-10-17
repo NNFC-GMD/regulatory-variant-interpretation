@@ -68,6 +68,9 @@ Outputs, for --out <dir>/<name>.npz
                       the VS commit followed.
   <name>.dropped.tsv  every dropped row: id, reason, detail.
   The .npz is written last, under a temporary name that is then renamed, so its presence means the build finished.
+  An output path that is a symbolic link (a window set shared from another directory) is refused before anything is
+  built: the .json and .dropped.tsv are written with open(), which would follow the link and overwrite the files it
+  points to. Remove the links to build the set here.
 
 Variant list: a TSV with a header row. It needs at least variant_id, chrom, pos (1-based, as in a VCF), ref and alt
 (anchored VCF alleles, as `bcftools norm -m -any` writes them), plus stratum for --null; other columns are ignored.
@@ -485,6 +488,12 @@ def main(argv=None) -> int:
         ap.error("--list is needed unless --peaks is given")
     if args.n < 1:
         ap.error("--n must be at least 1")
+    outputs = (args.out, args.out.with_suffix(".json"), args.out.with_suffix(".dropped.tsv"))
+    linked = [str(p) for p in outputs if p.is_symlink()]
+    if linked:
+        logger.error("%s: a symbolic link; the build would write through it, over the file it points to. Nothing "
+                     "built; remove the link(s) to build the set here", ", ".join(linked))  # fmt: skip
+        return 1
     started = time.time()
     meta: dict = {
         "mode": "null" if args.null else "peaks" if args.peaks else "variants",

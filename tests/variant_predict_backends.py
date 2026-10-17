@@ -11,7 +11,8 @@ raises, and the traceback goes to stderr with exit status 1.
 
 Cherimoya: a 2-layer, 16-filter Cherimoya built with Cherimoya(..., compile=False, random_state=0), its weights redrawn
 larger than the default init (which leaves the model almost constant), saved and reloaded through
-predict_cherimoya.load_model. ChromBPNet: the fork's own architecture builders and save path, as its training writes
+predict_cherimoya.load_model; then the same with one control track (n_control_tracks=1), which gets a zero control.
+ChromBPNet: the fork's own architecture builders and save path, as its training writes
 the three files (bpnet_model / chrombpnet_with_bias_model.getModelGivenModelOptionsAndWeightInits, model.save,
 save_model_without_bias; fork tests/test_models.py builds them the same way), with 4- and 8-filter models.
 """
@@ -167,6 +168,7 @@ def check_cherimoya(tmp: Path) -> dict:
     assert np.array_equal(full["ids"], np.load(variants)["ids"]), "ids not in window order"
     meta = json.loads((out_dir / "cherimoya.variants.json").read_text())
     assert meta["windows"]["builder"]["fasta_md5"] == "0" * 32 and meta["model_file"]["bytes"] > 0
+    assert meta["control"] == "none" and meta["control_tracks"] == 0 and meta["head"] == pch.HEADS["none"]
     passed("CLI writes every set with ids, VS's strand average and the builder's provenance")
 
     target = out_dir / "cherimoya.variants.npz"
@@ -195,14 +197,84 @@ def check_cherimoya(tmp: Path) -> dict:
     assert [r["batch"] for r in probe["results"]] == [2, 4] and all(r["passes"] > 0 for r in probe["results"])
     passed("probe mode")
 
+    # A model trained with one control track: fconv and linear take one input more (cherimoya.py:254-258), and the
+    # predictor feeds it an all-zero control through cherimoya.wrappers.ControlWrapper.
     ctl = Cherimoya(n_filters=16, n_layers=2, n_control_tracks=1, compile=False, random_state=0)
-    ctl.save(str(tmp / "ctl.torch"))
+    with torch.no_grad():
+        for p in ctl.parameters():
+            p.copy_(torch.randn(p.shape, generator=g) * (0.3 if p.ndim > 1 else 0.1))
+        ctl.linear.weight[:, 16] = 0.5  # the control's count weight, set so that a real control surely moves counts
+    ctl_path = tmp / "ctl.torch"
+    ctl.save(str(ctl_path))
+    ctl_loaded = pch.load_model(ctl_path, "cpu")
+    assert ctl_loaded.n_control_tracks == 1 and tuple(ctl_loaded.linear.weight.shape) == (1, 17)
+    assert float(ctl_loaded.linear.weight[0, 16]) == 0.5, "the control's count weight did not survive save and load"
+    ctl_pred = pch.CountPredictor(ctl_loaded, "cpu")
+    assert ctl_pred.control == "zero" and ctl_pred.control_tracks == 1 and predictor.control == "none"
+    ctl_out = ctl_pred.predict(t, batch=3)
+    zeros = torch.zeros(len(t), 1, pc.WINDOW)
+    with torch.no_grad():
+        ref_fwd = ctl_loaded(torch.from_numpy(pc.one_hot(t, "NCL")), zeros)[1][:, 0].numpy()
+        ref_rev = ctl_loaded(torch.from_numpy(pc.one_hot(pc.reverse_complement(t), "NCL")), zeros)[1][:, 0].numpy()
+    close(ctl_out["fwd"], ref_fwd, 1e-5, "control model: forward strand vs model(X, zeros)[1]")
+    close(ctl_out["rev"], ref_rev, 1e-5, "control model: reverse strand vs model(revcomp X, zeros)[1]")
+    assert np.std(ref_fwd) > 1e-3, "tiny control model too flat to test with"
+    passed("a model with a control track loads; its count head is model(X, zeros)[1] on both strands")
+
+    # The zero control is the sequence branch alone: the same weights without the control's input channel and count
+    # column, in a model without control tracks, give the same counts.
+    state = {k: v.clone() for k, v in ctl_loaded.state_dict().items()}
+    state["fconv.weight"] = state["fconv.weight"][:, :16]
+    state["linear.weight"] = state["linear.weight"][:, :16]
+    seq_only = Cherimoya(n_filters=16, n_layers=2, compile=False)
+    seq_only.load_state_dict(state)
+    seq_only.eval().requires_grad_(False)
+    seq_out = pch.CountPredictor(seq_only, "cpu").predict(t, batch=3)
+    close(ctl_out["fwd"], seq_out["fwd"], 1e-5, "zero control vs the sequence branch alone, forward")
+    close(ctl_out["rev"], seq_out["rev"], 1e-5, "zero control vs the sequence branch alone, reverse")
+    passed("the zero control's counts are the sequence branch's alone")
+
+    # logFC with the zero control equals logFC with any control both alleles share (the reference's), on both
+    # strands: the control enters the count head as one w * log(sum + 1) term, the same for both alleles. The reverse
+    # strand gets the control reversed, as training's reverse-complement augmentation flips it (cherimoya/io.py).
+    v1 = tokens(6, 3)
+    v2 = v1.copy()
+    centre = slice(pc.ALLELE_INDEX - 10, pc.ALLELE_INDEX + 11)  # 21 bases changed, so the alleles' counts surely differ
+    v2[:, centre] = (v1[:, centre] + 1) % 4
+    shared = torch.rand(len(v1), 1, pc.WINDOW, generator=g) * 3
+
+    def counts(x: np.ndarray, control) -> dict[str, np.ndarray]:
+        with torch.no_grad():
+            fwd = ctl_loaded(torch.from_numpy(pc.one_hot(x, "NCL")), control)[1][:, 0].numpy()
+            rev = ctl_loaded(torch.from_numpy(pc.one_hot(pc.reverse_complement(x), "NCL")), control.flip(-1))[1]
+        return {"fwd": fwd, "rev": rev[:, 0].numpy()}
+
+    real = {"a1": counts(v1, shared), "a2": counts(v2, shared)}
+    zero = {"a1": counts(v1, torch.zeros_like(shared)), "a2": counts(v2, torch.zeros_like(shared))}
+    close(zero["a1"]["fwd"], ctl_pred.predict(v1, 4)["fwd"], 1e-5, "control model: predictor vs model(X, zeros)[1]")
+    for s in pc.STRANDS:
+        close(zero["a2"][s] - zero["a1"][s], real["a2"][s] - real["a1"][s], 1e-5,
+              f"zero-control logFC vs a shared real control's, {s}")  # fmt: skip
+    assert np.max(np.abs(real["a1"]["fwd"] - zero["a1"]["fwd"])) > 1e-3, "the real control moved no count: no test"
+    assert np.max(np.abs(zero["a2"]["fwd"] - zero["a1"]["fwd"])) > 1e-5, "the alleles' counts do not differ: no test"
+    passed("zero-control logFC equals a shared real control's on both strands")
+
+    bf16 = pch.CountPredictor(ctl_loaded, "cpu", precision="bf16").predict(t, 3)["fwd"]
+    assert bf16.shape == ctl_out["fwd"].shape and np.isfinite(bf16).all(), "control model: bf16 gave no finite outputs"
     try:
-        pch.load_model(tmp / "ctl.torch", "cpu")
+        pch.CountPredictor(ctl_loaded, "cpu", control="real")
     except ValueError:
-        passed("a model with control tracks is refused")
+        pass
     else:
-        raise AssertionError("a model with control tracks was accepted")
+        raise AssertionError("a control other than zero was accepted")
+    ctl_dir = tmp / "ctl_preds"
+    assert pch.main(["--model", str(ctl_path), "--model-name", "ctl", "--control", "zero", "--device", "cpu",
+                     "--windows", str(variants), "--out-dir", str(ctl_dir), "--batch", "4"]) == 0  # fmt: skip
+    ctl_res = check_outputs(ctl_dir, ["ctl"], {"variants": ["a1", "a2"]})[("ctl", "variants")]
+    close(ctl_res["a1_fwd"], ctl_pred.predict(a1, 5)["fwd"], 1e-5, "control model: CLI a1 vs predictor")
+    ctl_meta = json.loads((ctl_dir / "ctl.variants.json").read_text())
+    assert ctl_meta["control"] == "zero" and ctl_meta["control_tracks"] == 1 and ctl_meta["head"] == pch.HEADS["zero"]
+    passed("control model: bf16 runs, only the zero control is accepted, the CLI records control zero")
     import cherimoya
 
     return {"torch": torch.__version__, "cherimoya": getattr(cherimoya, "__version__", None)}

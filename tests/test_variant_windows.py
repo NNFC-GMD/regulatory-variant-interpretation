@@ -464,6 +464,23 @@ def test_peak_windows(tmp_path, fasta, vs_window):
     assert meta["dropped"] == {"duplicate": 1, "off_chrom_end": 1, "unknown_chrom": 1} and meta["n_kept"] == 4
 
 
+def test_cli_refuses_to_write_through_a_link(tmp_path, fasta):
+    # A set linked from another directory (a shared one) is never rebuilt through the link: the .json would be
+    # written over the other directory's.
+    peaks = _write_peaks(tmp_path / "peaks.narrowPeak.gz")
+    shared = tmp_path / "shared" / "peaks.npz"
+    assert bw.main(["--peaks", str(peaks), "--fasta", str(fasta), "--out", str(shared)]) == 0
+    before = {suffix: shared.with_suffix(suffix).read_bytes() for suffix in (".npz", ".json", ".dropped.tsv")}
+    here = tmp_path / "here"
+    here.mkdir()
+    for suffix in (".npz", ".json"):
+        (here / f"peaks{suffix}").symlink_to(shared.with_suffix(suffix))
+    assert bw.main(["--peaks", str(peaks), "--fasta", str(fasta), "--out", str(here / "peaks.npz"), "--n", "2"]) == 1
+    assert {suffix: shared.with_suffix(suffix).read_bytes() for suffix in before} == before
+    assert (here / "peaks.npz").is_symlink() and (here / "peaks.json").is_symlink()
+    assert not (here / "peaks.dropped.tsv").exists()
+
+
 def test_peak_subsample_is_fixed_by_the_seed(tmp_path, fasta):
     peaks = _write_peaks(tmp_path / "peaks.narrowPeak.gz")
     ids = []

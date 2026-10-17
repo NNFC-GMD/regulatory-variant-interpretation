@@ -1,9 +1,9 @@
 """The variant-scoring predictors: windows in, VS's per-strand log counts out, the same way for both models.
 
-The model-free parts (predict_common.py, vchecks.py, read_manifest.py, probe_throughput.py) need numpy only and run
-here. The model code needs torch (the pixi `cherimoya` environment) or Keras/JAX (the chrombpnet fork's `cuda13`
-environment), and neither of those has pytest, so the backend tests run tests/variant_predict_backends.py in that
-environment's interpreter, on the CPU, with tiny random models:
+The model-free parts (predict_common.py, vchecks.py, read_manifest.py, probe_throughput.py, predict_cherimoya.py's
+argument checks) need numpy only and run here. The model code needs torch (the pixi `cherimoya` environment) or
+Keras/JAX (the chrombpnet fork's `cuda13` environment), and neither of those has pytest, so the backend tests run
+tests/variant_predict_backends.py in that environment's interpreter, on the CPU, with tiny random models:
   VS_CHERIMOYA_PYTHON    the cherimoya environment's python (else this interpreter, if it has torch and cherimoya)
   VS_CHROMBPNET_PYTHON   the fork's cuda13 python (else this interpreter, if it has chrombpnet and keras)
 A backend test is skipped when neither is available, and fails when its variable names a missing interpreter.
@@ -28,6 +28,7 @@ import pytest
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "workflows" / "variant_scoring"))
 
+import predict_cherimoya as pch  # noqa: E402  (numpy at import; torch only inside its functions)
 import predict_common as pc  # noqa: E402
 import probe_throughput as pt  # noqa: E402
 import read_manifest as rm  # noqa: E402
@@ -506,9 +507,18 @@ def _run_backend(python: str, backend: str, tmp_path: Path) -> dict:
     return report
 
 
+def test_cherimoya_control_other_than_zero_is_refused(tmp_path):
+    # argparse refuses it before the model code (and torch) is imported, so this runs without the backend.
+    assert pch.CONTROLS == ("zero",) and set(pch.HEADS) == {"none", "zero"}
+    with pytest.raises(SystemExit) as err:
+        pch.main(["--model", str(tmp_path / "m.torch"), "--control", "real", "--windows", str(tmp_path / "w.npz"),
+                  "--out-dir", str(tmp_path / "out")])  # fmt: skip
+    assert err.value.code == 2 and not (tmp_path / "out").exists()
+
+
 def test_cherimoya_backend_with_a_tiny_model(tmp_path):
     report = _run_backend(_backend_python("VS_CHERIMOYA_PYTHON", ("torch", "cherimoya")), "cherimoya", tmp_path)
-    assert len(report["checks"]) >= 9
+    assert len(report["checks"]) >= 13
 
 
 def test_chrombpnet_backend_with_tiny_models(tmp_path):

@@ -16,6 +16,14 @@ through one definition on one region set:
   ChromBPNet the profile probabilities and log counts in that file.
   Cherimoya  the model's prediction for [centre - 1057, centre + 1057) from the
              genome; its 1000-bp output covers the same window as observed.
+  controls   for a model trained with control tracks: compare.json's
+             `controls`, or, without that key, the non-null `controls` of the
+             fit.json beside it. Each track is read over the model's input
+             window, [centre - 1057, centre + 1057), by tangermeme's own
+             reader (float32, NaN read as 0), as training read it, and passed
+             to the model. The row is then the model's prediction with its
+             real control -- the uncorrected one -- against observed, as
+             ChromBPNet's row is its uncorrected model (bias model included).
   measures   ChromBPNet's definitions (chrombpnet/training/metrics.py):
              counts -- Pearson, Spearman and MSE of predicted log counts
              against log(1 + observed total); profile -- per region, the
@@ -31,9 +39,18 @@ writing a comparison.
 
 Output (the paths come from compare.json, written by make_jobs.py):
   compare.tsv          one row per model: dataset, fold, model, n_regions and
-                       the five measures
+                       the five measures; with controls, a last column
+                       `control`: `real` for Cherimoya, `n/a` for ChromBPNet,
+                       which takes no control track (no column = no control)
   compare_counts.npz   observed and both models' log counts per region, for
-                       plotting
+                       plotting; with controls also `control_logsum`, the
+                       log(1 + control total over the output window) that the
+                       counts head took as input
+
+A model trained with controls is refused when no control is found for it, and
+a control-free model when controls are given. Without controls compare.tsv is
+byte for byte what it was before controls were supported, and
+compare_counts.npz holds the same arrays.
 
     python workflows/cherimoya/compare_chrombpnet.py -p <dataset>/fold_<k>/compare.json
 
@@ -59,6 +76,8 @@ IN_WINDOW, OUT_WINDOW = 2114, 1000
 MEASURES = ("counts_pearson", "counts_spearman", "counts_mse", "median_jsd", "median_norm_jsd")
 # How far a recomputed ChromBPNet measure may sit from its own report.
 TOLERANCE = 1e-6
+# compare.tsv's `control` column, written only when the model was given its control tracks.
+CONTROL_COLUMN = {"chrombpnet": "n/a", "cherimoya": "real"}
 
 
 def counts_measures(true_logcounts: np.ndarray, pred_logcounts: np.ndarray) -> dict:
@@ -142,15 +161,51 @@ def read_sequences(fasta: str, chroms, centers) -> np.ndarray:
     return one_hot(seqs)
 
 
-def predict_cherimoya(model_path: str, X: np.ndarray, batch_size: int, device: str, dtype: str):
+def resolve_controls(p: dict, parameters: Path) -> tuple[list[str] | None, str]:
+    """The control tracks to feed the model, as a flat list of files, and the JSON that named them: compare.json's
+    non-null `controls`, else the non-null `controls` of the fit.json beside it, else none (None, ""). Entries are
+    files or groups of files, as in `signals`; a relative path is taken from that JSON's directory, where the fit
+    ran."""
+    source, controls = parameters, p.get("controls")
+    if controls is None:
+        fit_json = parameters.parent / "fit.json"
+        if fit_json.exists():
+            source, controls = fit_json, json.loads(fit_json.read_text()).get("controls")
+    if controls is None:
+        return None, ""
+    if not isinstance(controls, list):
+        raise ValueError(f"{source}: controls must be a list of files or of file groups, got {controls!r}")
+    files = [f for entry in controls for f in ([entry] if isinstance(entry, str) else entry)]
+    if not files:
+        return None, ""
+    return [f if Path(f).is_absolute() else str(source.parent / f) for f in files], str(source)
+
+
+def read_controls(files: list[str], chroms, centers) -> np.ndarray:
+    """(n, n_tracks, IN_WINDOW) float32: each control track over the model's input window, read with the functions
+    tangermeme's extract_loci reads `in_signals` with for training (float32, NaN as 0)."""
+    from tangermeme.io import _extract_locus_signal, _load_signals
+
+    signals = _load_signals(list(files))
+    out = np.zeros((len(centers), len(files), IN_WINDOW), dtype=np.float32)
+    for i, (c, m) in enumerate(zip(chroms, centers)):
+        out[i] = _extract_locus_signal(signals, str(c), int(m) - IN_WINDOW // 2, int(m) + IN_WINDOW // 2)
+    return out
+
+
+def predict_cherimoya(model_path: str, X: np.ndarray, batch_size: int, device: str, dtype: str, X_ctl=None):
     import torch
     from cherimoya import Cherimoya
     from tangermeme.predict import predict
 
     model = Cherimoya.load(model_path, device=device, compile=False).eval()
-    if model.n_control_tracks:
-        raise ValueError("the model was trained with controls; this comparison has none")
-    logits, logcounts = predict(model, torch.from_numpy(X), batch_size=batch_size, device=device,
+    if model.n_control_tracks and X_ctl is None:
+        raise ValueError("the model was trained with controls, and neither compare.json nor the fit.json beside it "
+                         "names them")  # fmt: skip
+    if X_ctl is not None and X_ctl.shape[1] != model.n_control_tracks:
+        raise ValueError(f"{X_ctl.shape[1]} control track(s) given; the model takes {model.n_control_tracks}")
+    args = None if X_ctl is None else (torch.from_numpy(X_ctl),)
+    logits, logcounts = predict(model, torch.from_numpy(X), args=args, batch_size=batch_size, device=device,
                                 dtype=dtype, verbose=False)  # fmt: skip
     logits = logits.float().numpy()
     logcounts = logcounts.float().numpy()
@@ -177,6 +232,17 @@ def check_against_report(ours: dict, report_path: Path) -> list[str]:
     ]
 
 
+def format_table(p: dict, rows: dict, n_regions: int, control: bool = False) -> str:
+    """compare.tsv's text. The `control` column is there only when the model was given its controls, so that a
+    control-free table stays byte for byte what it was before controls were supported."""
+    extra = ["control"] if control else []
+    lines = ["\t".join(["dataset", "fold", "model", "n_regions", *MEASURES, *extra])]
+    for model, m in rows.items():
+        cells = [p["dataset"], str(p["fold"]), model, str(n_regions), *(f"{m[k]:.6g}" for k in MEASURES)]
+        lines.append("\t".join(cells + ([CONTROL_COLUMN[model]] if control else [])))
+    return "".join(line + "\n" for line in lines)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-p", "--parameters", type=Path, required=True, help="compare.json from make_jobs.py")
@@ -193,6 +259,11 @@ def main(argv=None) -> int:
         if not Path(p[key]).exists():
             logger.error("%s fold %s: no %s at %s", p["dataset"], p["fold"], key, p[key])
             return 1
+    controls, controls_from = resolve_controls(p, args.parameters)
+    for f in controls or []:
+        if not Path(f).exists():
+            logger.error("%s fold %s: no control track at %s (named in %s)", p["dataset"], p["fold"], f, controls_from)
+            return 1
 
     chroms, centers, cbp_probs, cbp_logcounts = read_chrombpnet(Path(p["chrombpnet_predictions"]))
     logger.info("%s fold %s: %d ChromBPNet test peaks on %s", p["dataset"], p["fold"], len(centers),
@@ -207,18 +278,23 @@ def main(argv=None) -> int:
         return 1
 
     X = read_sequences(p["sequences"], chroms, centers)
-    che_probs, che_logcounts = predict_cherimoya(p["model"], X, args.batch_size, args.device, args.dtype)
+    X_ctl = None
+    if controls:
+        logger.info("%s fold %s: real control from %s: %s", p["dataset"], p["fold"], controls_from, ", ".join(controls))
+        X_ctl = read_controls(controls, chroms, centers)
+    che_probs, che_logcounts = predict_cherimoya(p["model"], X, args.batch_size, args.device, args.dtype, X_ctl)
     rows["cherimoya"] = measures(observed, che_probs, che_logcounts)
 
     out = Path(p["output"])
     with open(out.with_suffix(".tsv.partial"), "w") as fh:
-        fh.write("\t".join(["dataset", "fold", "model", "n_regions", *MEASURES]) + "\n")
-        for model, m in rows.items():
-            fh.write("\t".join([p["dataset"], str(p["fold"]), model, str(len(centers)),
-                                *(f"{m[k]:.6g}" for k in MEASURES)]) + "\n")  # fmt: skip
-    np.savez_compressed(out.with_name("compare_counts.npz"), chrom=chroms, center=centers,
-                        observed=np.log(1 + observed.sum(axis=1)), chrombpnet=cbp_logcounts,
-                        cherimoya=che_logcounts)  # fmt: skip
+        fh.write(format_table(p, rows, len(centers), control=X_ctl is not None))
+    arrays = {"chrom": chroms, "center": centers, "observed": np.log(1 + observed.sum(axis=1)),
+              "chrombpnet": cbp_logcounts, "cherimoya": che_logcounts}  # fmt: skip
+    if X_ctl is not None:
+        # The count head's control input: log(1 + the control's total over the output window), all tracks summed.
+        trim = (IN_WINDOW - OUT_WINDOW) // 2
+        arrays["control_logsum"] = np.log(1 + X_ctl[:, :, trim : IN_WINDOW - trim].astype(np.float64).sum(axis=(1, 2)))
+    np.savez_compressed(out.with_name("compare_counts.npz"), **arrays)
     out.with_suffix(".tsv.partial").rename(out)
     for model, m in rows.items():
         logger.info("%-10s %s", model, "  ".join(f"{k} {m[k]:.4f}" for k in MEASURES))

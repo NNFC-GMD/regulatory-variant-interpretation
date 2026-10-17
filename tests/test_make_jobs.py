@@ -69,6 +69,49 @@ def test_overrides_and_forbidden_overrides(tmp_path):
         mj.main(args + ["--set", 'test_chroms=["chr2"]'])
 
 
+def test_controls_reach_fit_and_compare_json(tmp_path):
+    args = _tree(tmp_path)
+    assert mj.main(args) == 0
+    workdir = tmp_path / "cheri" / "ds" / "fold_0"
+    assert "controls" not in json.loads((workdir / "compare.json").read_text())  # control-free: as before
+
+    track = tmp_path / "bias.bw"
+    track.touch()
+    root = tmp_path / "arms" / "tn5"  # a new out-root, made with its parents
+    args[args.index("--out-root") + 1] = str(root)
+    assert mj.main(args + ["--set", f'controls=["{track}"]']) == 0
+    workdir = root / "ds" / "fold_0"
+    fit = json.loads((workdir / "fit.json").read_text())
+    compare = json.loads((workdir / "compare.json").read_text())
+    assert fit["controls"] == compare["controls"] == [str(track)]
+    assert compare["model"] == str(workdir / "cherimoya.fold_0.torch")
+    assert compare["output"] == str(workdir / "compare.tsv")
+    lines = (root / "tasks.tsv").read_text().splitlines()[1:]
+    assert all(line.split("\t")[3] == "yes" for line in lines)
+
+
+def test_missing_control_track_marks_the_row(tmp_path):
+    assert mj.main(_tree(tmp_path) + ["--set", f'controls=["{tmp_path / "absent.bw"}"]']) == 0
+    lines = (tmp_path / "cheri" / "tasks.tsv").read_text().splitlines()[1:]
+    assert all(line.split("\t")[3] == "no" for line in lines)
+
+
+def test_relative_out_root_is_made_absolute(tmp_path, monkeypatch):
+    args = _tree(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    args[args.index("--out-root") + 1] = "rel"
+    assert mj.main(args) == 0
+    compare = json.loads((tmp_path / "rel" / "ds" / "fold_0" / "compare.json").read_text())
+    assert compare["model"] == str(tmp_path / "rel" / "ds" / "fold_0" / "cherimoya.fold_0.torch")
+
+
+def test_control_files_flattens_groups():
+    assert mj.control_files(None) == []
+    assert mj.control_files(["a.bw", ["b+.bw", "b-.bw"]]) == ["a.bw", "b+.bw", "b-.bw"]
+    with pytest.raises(ValueError, match="list"):
+        mj.control_files("a.bw")
+
+
 def test_tasks_tsv_marks_readiness(tmp_path):
     assert mj.main(_tree(tmp_path, with_model=True)) == 0
     lines = (tmp_path / "cheri" / "tasks.tsv").read_text().splitlines()

@@ -20,6 +20,8 @@ steps, so `exclusion_lists` stays null unless --exclusion-list is given.
 Everything else is Cherimoya's default (cherimoya_cli/defaults.py), except
 `random_state`, which is --seed-base + fold: the default 0 would start all
 five folds from the same initialisation. --set overrides any fit parameter.
+`--set 'controls=["<track>.bw"]'` trains with control tracks; the list goes
+into compare.json too, so that the comparison feeds the model the same control.
 
 For every dataset and fold this writes, under --out-root:
 
@@ -30,12 +32,14 @@ For every dataset and fold this writes, under --out-root:
   <dataset>/fold_<k>/compare.json  compare_chrombpnet.py's inputs: the
                                    Cherimoya model, ChromBPNet's test-set
                                    predictions for the same fold, the bigwig
-                                   and the genome
+                                   and the genome, and the controls when the
+                                   fit has any (the key is left out otherwise)
   tasks.tsv                        one row per (dataset, fold), with whether
                                    the inputs exist; run_box.sh works through it
 
-Inputs missing at writing time are reported and the row is marked
-`inputs_ready=no`; rerun once the ChromBPNet steps have made them.
+Inputs missing at writing time (control tracks included) are reported and the
+row is marked `inputs_ready=no`; rerun once the steps have made them. A relative
+--out-root is made absolute, since the jobs run from their own directories.
 
     python workflows/cherimoya/make_jobs.py \\
         --chrombpnet-configs <configs>/*/config.yaml \\
@@ -122,6 +126,15 @@ def parse_set(items: list[str]) -> dict:
     return out
 
 
+def control_files(controls) -> list[str]:
+    """The files of a `controls` spec, flat: each entry is a file or a group (a list of files), as for `signals`."""
+    if controls is None:
+        return []
+    if isinstance(controls, str):
+        raise ValueError(f"controls must be a list of files or of file groups, got the string {controls!r}")
+    return [f for entry in controls for f in ([entry] if isinstance(entry, str) else entry)]
+
+
 def fit_parameters(cfg, fold, paths, chroms, genome, exclusion_list, seed_base, overrides):
     params = {
         "name": f"cherimoya.fold_{fold}",
@@ -157,7 +170,8 @@ def main(argv=None) -> int:
     ap.add_argument("--seed-base", type=int, default=1234,
                     help="fold k trains with random_state seed-base + k (default 1234)")  # fmt: skip
     ap.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE",
-                    help="override a Cherimoya fit parameter, e.g. --set dtype=bfloat16")  # fmt: skip
+                    help="override a Cherimoya fit parameter, e.g. --set dtype=bfloat16; "
+                         "--set 'controls=[\"<track>.bw\"]' also reaches compare.json")  # fmt: skip
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -167,13 +181,14 @@ def main(argv=None) -> int:
     if not args.genome.exists():
         logger.error("genome not found: %s", args.genome)
         return 1
+    out_root = args.out_root.absolute()
     rows, n_missing = [], 0
     for config in sorted(args.chrombpnet_configs):
         cfg = read_config(config)
         for fold in cfg["folds"]:
             chroms = read_fold(args.folds_dir, fold)
             paths = dataset_paths(cfg, fold, args.models_subdir)
-            workdir = args.out_root / cfg["dataset_name"] / f"fold_{fold}"
+            workdir = out_root / cfg["dataset_name"] / f"fold_{fold}"
             workdir.mkdir(parents=True, exist_ok=True)
             params = fit_parameters(cfg, fold, paths, chroms, args.genome, args.exclusion_list,
                                     args.seed_base, overrides)  # fmt: skip
@@ -188,20 +203,27 @@ def main(argv=None) -> int:
                 "chrombpnet_metrics": str(paths["chrombpnet_metrics"]),
                 "output": str(workdir / "compare.tsv"),
             }
+            # Only with controls, so that a control-free compare.json stays what it always was.
+            if params.get("controls") is not None:
+                compare["controls"] = params["controls"]
             (workdir / "compare.json").write_text(json.dumps(compare, indent=4) + "\n")
             missing = [k for k in ("signal", "peaks", "negatives") if not paths[k].exists()]
             for k in missing:
                 logger.warning("%s fold %s: no %s at %s", cfg["dataset_name"], fold, k, paths[k])
+            for f in control_files(params.get("controls")):
+                if not Path(f).exists():
+                    logger.warning("%s fold %s: no control track at %s", cfg["dataset_name"], fold, f)
+                    missing.append(f)
             n_missing += bool(missing)
             rows.append((cfg["dataset_name"], fold, str(workdir), "no" if missing else "yes",
                          "yes" if paths["chrombpnet_predictions"].exists() else "no"))  # fmt: skip
 
-    args.out_root.mkdir(parents=True, exist_ok=True)
-    with open(args.out_root / "tasks.tsv", "w") as fh:
+    out_root.mkdir(parents=True, exist_ok=True)
+    with open(out_root / "tasks.tsv", "w") as fh:
         fh.write("dataset\tfold\tworkdir\tinputs_ready\tchrombpnet_ready\n")
         for row in rows:
             fh.write("\t".join(row) + "\n")
-    logger.info("%d task(s) in %s; %d lack a training input", len(rows), args.out_root / "tasks.tsv", n_missing)
+    logger.info("%d task(s) in %s; %d lack a training input", len(rows), out_root / "tasks.tsv", n_missing)
     return 0
 
 

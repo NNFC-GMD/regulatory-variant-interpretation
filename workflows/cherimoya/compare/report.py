@@ -34,7 +34,7 @@ What it computes that the levels do not:
             medians are quantized); each model's attribution magnitude (median per-peak L2 norm and sum)
   level 3   CIs on each model's own shares; tests of seqlet overlap (fold averages, and QC folds), of the overlap
             with matched partners, and of the Tn5/DNase-flagged patterns (fold averages and QC folds)
-  bias      the bias control split by what the reference pattern is: the bias-included model's patterns are
+  bias      the bias control split by what the reference pattern is: the uncorrected model's patterns are
             annotated here with level 3's rules (best MotifCompendium match; flagged when the best match in
             chrombpnet's motifs.meme is a Tn5 or DNase I entry at q <= 0.05)
   level 4   per dataset, the share of each model's patterns and seqlets in clusters holding both models'
@@ -1242,7 +1242,7 @@ def bias_control(rep: Report, l3: dict | None) -> dict:
         kind = {}
     bc["reference_kind"] = [kind.get((r, p), "unknown") if mt else "no match"
                             for r, p, mt in zip(bc["reference"], bc["reference_match"], bc["matched"])]  # fmt: skip
-    # each checked pattern's own level-3 flag, and whether bias-corrected ChromBPNet has a tomtom partner for it (fold
+    # each checked pattern's own level-3 flag, and whether ChromBPNet corrected has a tomtom partner for it (fold
     # averages: patterns.tsv's matched_tomtom; the control's QC fold: qc_patterns.tsv's matched_cross)
     own, partner = {}, {}
     if l3 is not None:
@@ -1314,7 +1314,7 @@ def plot_bias(rep: Report, l3: dict | None, ref) -> None:
         for yi, v in zip(y, r["cherimoya_patterns"]):
             ax2.text(v + 0.8, yi, str(int(v)), va="center", fontsize=7.4, color=INK2)
         ax2.set_xlabel("Cherimoya patterns without a cluster partner that match it")
-        ax2.set_title("Reference: the bias-included ChromBPNet's patterns (profile head)")
+        ax2.set_title("Reference: ChromBPNet uncorrected's patterns (profile head)")
         ax2.grid(axis="y", visible=False)
         ax2.set_axisbelow(True)
         ax2.set_xlim(0, max(1.0, float(r["cherimoya_patterns"].max())) * 1.15)
@@ -1326,7 +1326,7 @@ def plot_bias(rep: Report, l3: dict | None, ref) -> None:
         ax2.set_visible(False)
     fig.tight_layout()
     rep.figure(fig, "bias_control", "Left: Tn5/DNase-flagged patterns per dataset for each model. Right: for each "
-               "pattern of the bias-included ChromBPNet, labelled with its MotifCompendium match or, for Tn5/DNase "
+               "pattern of ChromBPNet uncorrected, labelled with its MotifCompendium match or, for Tn5/DNase "
                "patterns, its motifs.meme entry, how many unmatched Cherimoya patterns match it, coloured by "
                "whether the reference pattern is a Tn5/DNase pattern.")  # fmt: skip
 
@@ -2184,8 +2184,8 @@ def masthead(rep: Report, R: dict, generated: str) -> str:
   <p class="dek">Two sequence-to-accessibility models trained on the same {len(rep.everything)} AMSC pseudobulk ATAC
   datasets with the same five chromosome folds. Performance covers every dataset; attributions, TF-MoDISco motifs,
   motif compendia and Fi-NeMo hits cover the {len(rep.shared)} datasets both models were interpreted on.</p>
-  <div class="legend"><span class="lg">{key("chrombpnet")}<span class="lgd">bias-corrected model for attributions, full
-  model for performance</span></span><span class="lg">{key("cherimoya")}<span class="lgd">no bias model</span></span>
+  <div class="legend"><span class="lg">{key("chrombpnet")}<span class="lgd">corrected model (chrombpnet_nobias.h5) for attributions,
+  uncorrected model (chrombpnet.h5) for performance</span></span><span class="lg">{key("cherimoya")}<span class="lgd">no bias model</span></span>
   <span class="lg">{key("cross")}<span class="lgd">agreement between the two</span></span></div>
   <div class="status">{"".join(chips)}</div>
   <p class="meta"><span>Generated {h(generated)}</span><span>Data as of the newest input,
@@ -2531,8 +2531,8 @@ def bias_finding(rep: Report, bc: dict, l3: dict) -> dict:
     p = f"p {pval(t['p'], t['p_method'])}" if t else "p NA"
     out = {"fc": fc, "fk": fk, "n": n, "partner": partner, "db_flagged": flagged, "n_checked": n_checked}
     out["flag_text"] = (f"Cherimoya, which has no bias model, carries more Tn5/DNase-flagged patterns: {fk} "
-                      f"fold-average patterns over the {nd} datasets against {fc} for bias-corrected ChromBPNet ({p}). "
-                      "Bias-corrected ChromBPNet has some too, so the difference is one of degree.")  # fmt: skip
+                      f"fold-average patterns over the {nd} datasets against {fc} for ChromBPNet corrected ({p}). "
+                      "ChromBPNet corrected has some too, so the difference is one of degree.")  # fmt: skip
     checked = (
         f"{n_fa} fold-average patterns without a cluster partner and {n_qc} of the control's own QC fold "
         f"without a tomtom partner"
@@ -2540,13 +2540,13 @@ def bias_finding(rep: Report, bc: dict, l3: dict) -> dict:
         else f"{n_fa} fold-average patterns without a cluster partner"
     )
     matched = n["Tn5/DNase"] + n["TF or other"]
-    out["checked"] = (f"Of the {n_checked} Cherimoya patterns checked against the bias-included ChromBPNet "
+    out["checked"] = (f"Of the {n_checked} Cherimoya patterns checked against ChromBPNet uncorrected "
                       f"({checked}), {matched} match one of its patterns: {n['Tn5/DNase']} its Tn5/DNase patterns "
                       f"and {n['TF or other']} its TF patterns, and {partner['TF or other']} of those "
-                      f"{n['TF or other']} also have a tomtom partner in bias-corrected ChromBPNet.")  # fmt: skip
-    out["lead"] = (f"Cherimoya carries more Tn5/DNase-flagged patterns than bias-corrected ChromBPNet ({fk} against "
-                   f"{fc} over the {nd} datasets, {p}), but bias-corrected ChromBPNet has some too, so the difference "
-                   "is one of degree; and most of Cherimoya's unmatched patterns that the bias-included ChromBPNet "
+                      f"{n['TF or other']} also have a tomtom partner in ChromBPNet corrected.")  # fmt: skip
+    out["lead"] = (f"Cherimoya carries more Tn5/DNase-flagged patterns than ChromBPNet corrected ({fk} against "
+                   f"{fc} over the {nd} datasets, {p}), but ChromBPNet corrected has some too, so the difference "
+                   "is one of degree; and most of Cherimoya's unmatched patterns that ChromBPNet uncorrected "
                    f"also finds match its TF patterns ({n['TF or other']} of {matched}), not its Tn5 "
                    "patterns.")  # fmt: skip
     ref = bc["reference"]
@@ -2557,15 +2557,15 @@ def bias_finding(rep: Report, bc: dict, l3: dict) -> dict:
         tf_names = list(dict.fromkeys(str(x) for x in tf["annotation"].dropna()))
     names = f" ({', '.join(tf_names)})" if tf_names else ""
     out["closing"] = (
-        f"Most of the Cherimoya patterns that the bias-included model also finds match its TF patterns{names}, not "
+        f"Most of the Cherimoya patterns that the uncorrected model also finds match its TF patterns{names}, not "
         f"its Tn5 patterns: they are mostly TF motifs that the cluster rule left unmatched "
-        f"({partner['TF or other']} of {n['TF or other']} have a tomtom partner in bias-corrected ChromBPNet), "
+        f"({partner['TF or other']} of {n['TF or other']} have a tomtom partner in ChromBPNet corrected), "
         f"though {flagged['TF or other']} of them are themselves database-flagged Tn5/DNase. Of the "
         f"{n['Tn5/DNase']} that match its Tn5/DNase patterns, {partner['Tn5/DNase']} also have a tomtom partner in "
-        f"bias-corrected ChromBPNet, so it carries similar patterns too. The {n['no match']} checked patterns that "
+        f"ChromBPNet corrected, so it carries similar patterns too. The {n['no match']} checked patterns that "
         f"match no reference pattern are not cleared by this control: {partner['no match']} of them have a tomtom "
-        f"partner in bias-corrected ChromBPNet and {flagged['no match']} are database-flagged. The control is one "
-        "dataset and fold, on the profile head (DeepSHAP has no rule for the counts head of the full model), while "
+        f"partner in ChromBPNet corrected and {flagged['no match']} are database-flagged. The control is one "
+        "dataset and fold, on the profile head (DeepSHAP has no rule for the counts head of the uncorrected model), while "
         "every other pattern here comes from the counts head, so it indicates, but does not measure, how much of "
         "Cherimoya's extra signal is bias."
     )
@@ -2656,7 +2656,7 @@ def section_level1(rep: Report, n: Numbering, l1: dict | None) -> str:
     lead = (
         f'<p class="lead">{fnd["headline"]}{gain} Both models were scored on ChromBPNet\'s test peaks of each fold '
         f"({count(round(l1['paired']['n_regions'].mean()))} peaks per fold on average) with ChromBPNet's own measures; "
-        f"ChromBPNet is scored as its own evaluation scores it, with the full bias-included model. {nf} folds over "
+        f"ChromBPNet is scored as its own evaluation scores it, with its uncorrected model (bias model included). {nf} folds over "
         f"{nd} datasets; the {len(rep.shared)} shared datasets are the ones interpreted below.</p>"
     )
     a = md[md["set"] == "all"].set_index("measure")
@@ -3466,7 +3466,7 @@ def control_sentence(rep: Report, bc: dict) -> str:
     names = {f"bias_control/{c['name']}" for c in used}
     n_pat = int(ref["reference"].isin(names).sum()) if ref is not None and not ref.empty else 0
     parts = [
-        f"the {h(c['head'])} head of ChromBPNet's bias-included model on "
+        f"the {h(c['head'])} head of ChromBPNet's uncorrected model on "
         f"{h(rep.labels.get(c.get('dataset'), c.get('dataset')))} fold {h(c.get('fold'))}"
         for c in used
     ]
@@ -3487,7 +3487,7 @@ def section_bias(rep: Report, n: Numbering, bc: dict | None, l3: dict | None, l4
         return f'<section id="bias-control">{head}<p>No bias control has been compared yet.</p></section>'
     fnd = bias_finding(rep, bc, l3) if l3 else None
     lead = (f"<p class=\"lead\">{fnd['lead'] + ' ' if fnd else ''}ChromBPNet's attributions come from its "
-            "bias-corrected model; without a bias model, Cherimoya can learn Tn5 or DNase I sequence preference that "
+            "corrected model; without a bias model, Cherimoya can learn Tn5 or DNase I sequence preference that "
             "ChromBPNet's bias model absorbs. Two checks: the motif-database flag of level 3 (a pattern whose best "
             "match in ChromBPNet's motif database, motifs.meme, is a TN5_ or DNASE_ entry at q ≤ 0.05), and a "
             f"control.{control_sentence(rep, bc)}</p>")  # fmt: skip
@@ -3532,7 +3532,7 @@ def section_bias(rep: Report, n: Numbering, bc: dict | None, l3: dict | None, l4
                  count(r["cherimoya_seqlets"])] for _, r in rr.iterrows()]  # fmt: skip
         t2 = table_html(
             n,
-            "The reference: the bias-included ChromBPNet's TF-MoDISco patterns, annotated here with "
+            "The reference: ChromBPNet uncorrected's TF-MoDISco patterns, annotated here with "
             "level 3's rules, and the unmatched Cherimoya patterns that match each (tomtom-lite, q ≤ 0.05, "
             "database decoys).",
             [
@@ -3567,13 +3567,13 @@ def section_bias(rep: Report, n: Numbering, bc: dict | None, l3: dict | None, l4
             n,
             f"The {int(split['patterns'].sum())} Cherimoya patterns checked, {what}, by what they match in the "
             "reference, with how many are themselves flagged Tn5/DNase and how many have a tomtom partner in "
-            "bias-corrected ChromBPNet (its fold average, or its same QC fold).",
+            "ChromBPNet corrected (its fold average, or its same QC fold).",
             [
                 "Matches",
                 "Cherimoya patterns",
                 "Their seqlets",
                 "Themselves flagged Tn5/DNase",
-                "With a partner in bias-corrected ChromBPNet",
+                "With a partner in ChromBPNet corrected",
             ],
             srows,
         )
@@ -3587,7 +3587,7 @@ def section_bias(rep: Report, n: Numbering, bc: dict | None, l3: dict | None, l4
             n,
             "bias_control",
             "Left: Tn5/DNase-flagged patterns per dataset (lines join a dataset's two "
-            "values), at fold averages and per QC fold. Right: each pattern of the bias-included ChromBPNet "
+            "values), at fold averages and per QC fold. Right: each pattern of ChromBPNet uncorrected "
             "(profile head) and how many unmatched Cherimoya patterns match it; a bar is labelled with the pattern's "
             "best MotifCompendium match or, for the Tn5/DNase patterns (orange), with its motifs.meme Tn5/DNase "
             "entry.",
@@ -3647,11 +3647,11 @@ def section_caveats(rep: Report, R: dict) -> str:
     items = [
         (
             "Bias model",
-            "ChromBPNet's attributions (levels 2–5) come from its bias-corrected model; Cherimoya attributes its "
+            "ChromBPNet's attributions (levels 2–5) come from its corrected model; Cherimoya attributes its "
             "log-counts head with no bias model, so it can learn Tn5/DNase motifs that ChromBPNet's bias model "
-            "absorbs. Bias-corrected ChromBPNet still shows some, so the difference is one of degree."
+            "absorbs. ChromBPNet corrected still shows some, so the difference is one of degree."
             + (" " + "; ".join(bias_bits) + "." if bias_bits else "")
-            + " Level 1 is not affected: it scores ChromBPNet's full bias-included model against observed counts. "
+            + " Level 1 is not affected: it scores ChromBPNet's uncorrected model (bias model included) against observed counts. "
             "The bias control used one dataset and fold and the profile head, so it indicates, but does not measure, "
             "how much of Cherimoya's extra signal is bias.",
         ),
@@ -3711,7 +3711,7 @@ def section_methods(rep: Report, R: dict, prov: dict, generated: str) -> str:
          "how many values were above and below 0."),
         ("Level 1", "compare_chrombpnet.py per fold: counts Pearson and Spearman and MSE of log counts, and the median "
          "JSD and normalized JSD of the profiles, on ChromBPNet's test peaks; ChromBPNet from its evaluation "
-         "predictions (chrombpnet_predictions.h5, full model). Residuals: predicted minus observed log(1 + counts)."),
+         "predictions (chrombpnet_predictions.h5, uncorrected model). Residuals: predicted minus observed log(1 + counts)."),
         ("Level 2", "compare_attributions.py: per peak, Pearson and Spearman of the projected scores, cosine of the "
          "4 × W hypothetical maps, Jaccard of the top 50 positions by |projected score|, and each map's sum and L2 "
          "norm, in the 500-bp and 1,000-bp windows (summit ± 250 and ± 500 bp). ChromBPNet from its 05.0 h5 and "
@@ -3734,7 +3734,7 @@ def section_methods(rep: Report, R: dict, prov: dict, generated: str) -> str:
     if bc and bc.get("controls"):
         used = [c for c in bc["controls"] if c["state"] == "done"]
         refused = [c for c in bc["controls"] if c["state"] != "done"]
-        text = ("bias_control.sh runs 05.0's contribs_bw (DeepSHAP) on ChromBPNet's bias-included model "
+        text = ("bias_control.sh runs 05.0's contribs_bw (DeepSHAP) on ChromBPNet's uncorrected model "
                 "(chrombpnet.h5) over the fold's 30K-peak QC subsample, then TF-MoDISco as 04.5 does; "
                 "compare_modisco.py --bias compares the result: "
                 + "; ".join(f"{h(c['name'])}, the {h(c['head'])} head on {h(c.get('dataset'))} fold "

@@ -652,7 +652,7 @@ def selftest() -> int:
         assert float(m[("h2h", "all", "cherimoya")]["concordance"]) == 1.0
         p = [r for r in csv.DictReader(open(d / "out" / "paired.tsv"), delimiter="\t")
              if r["group"] == "all" and r["measure"] == "concordance"]  # fmt: skip
-        assert abs(float(p[0]["a_minus_b"]) - 2 / 3) < 1e-9, p[0]
+        assert abs(float(p[0]["a_minus_b"]) - 2 / 3) < 1e-3, p[0]  # the TSV holds 4 significant digits
         assert int(p[0]["a_right_b_wrong"]) == 2 and int(p[0]["a_wrong_b_right"]) == 0
         assert (d / "out" / "report.md").is_file() and (d / "out" / "rows.tsv.gz").is_file()
         # --effect-allele second flips the swapped rows.

@@ -21,7 +21,8 @@ Groups and datasets
   (e.g. the samples of the same condition). Per group and model, the prediction is the mean of the fold-mean logFC
   over the group's datasets that the model has scores for (`matched`), and, for the head-to-head, over the group's
   datasets that every model in --models has (`h2h`, the same datasets for all; groups with none are left out of it).
-  The held-out logFC (the fold that never trained on the variant's chromosome) is compared too (`heldout`).
+  `heldout` is h2h with the held-out logFC (each dataset's fold that never trained on the variant's chromosome)
+  instead of the fold mean: the same datasets and rows for every model.
 
 Subsets
   by the variant's distance to its phenotype's centre (phenotype_id chrom:start-end): --subset NAME=MAXBP, default
@@ -35,12 +36,14 @@ Measures, per setting, group (and all groups pooled), subset and model
   spearman, pearson   of logFC against the effect size
   Intervals are percentile bootstrap 95% CIs (--n-boot, --seed) over variants: rows sharing a variant_id are drawn
   together (one variant is often the lead of several groups). Paired differences between two models on the same
-  rows (--pairs) come from the same draws, with a two-sided bootstrap p, and McNemar's exact test on the sign calls.
+  rows (--pairs; h2h and heldout) come from the same draws, with a two-sided bootstrap p, and McNemar's exact test
+  on the sign calls.
 
 Inputs
   --qtl CSV or TSV (columns --variant-col, --effect-col, --group-col, --phenotype-col, optional --af-col, --se-col,
   --p-col); --fasta (with .fai); --groups; --scores-root (one or more: <root>/<dataset>/<model>.<variants>.summary.npz
-  or .tsv.gz, scores.py's); --list (the scored variant list, for the allele-frequency check).
+  or .tsv.gz, scores.py's); --list (the scored variant list, for the allele-frequency check); --source (a sentence
+  naming where the QTL table comes from, kept in run.json for the reports that read it).
 Outputs, under --out-dir
   rows.tsv.gz   every QTL row: its genome alleles, orientation, distance, whether scored, and each model's predictions
   metrics.tsv, paired.tsv, curves.tsv (concordance by top fraction), per_dataset.tsv, run.json, report.md,
@@ -369,12 +372,14 @@ _STATE: dict = {}
 
 
 def _combo(job: tuple[str, str, float, str]) -> tuple[list[dict], list[dict], list[dict]]:
-    """One setting, subset and group: each model's measures with bootstrap CIs, and the paired differences (h2h)."""
+    """One setting, subset and group: each model's measures with bootstrap CIs, and the paired differences (h2h and
+    heldout)."""
     setting, sub, maxbp, g = job
     qtl, models, groups, tops, args = (_STATE[k] for k in ("qtl", "models", "groups", "tops", "args"))
     preds = _STATE["settings"][setting]
     rows = (qtl.dist <= maxbp) & (np.isin(qtl.group, list(groups)) if g == "all" else qtl.group == g)
-    if setting == "h2h":  # the same rows for every model
+    same_rows = setting in ("h2h", "heldout")
+    if same_rows:  # the same rows for every model
         rows &= np.all([np.isfinite(preds[m]) for m in models], axis=0)
     idx = np.flatnonzero(rows)
     if len(idx) < args.min_rows:
@@ -397,7 +402,7 @@ def _combo(job: tuple[str, str, float, str]) -> tuple[list[dict], list[dict], li
             for f in np.linspace(0.05, 1.0, 20):
                 c_rows.append({"subset": sub, "model": m, "top_fraction": float(f),
                                "concordance": top_concordance(p, e, float(f))})  # fmt: skip
-    if setting != "h2h":
+    if not same_rows:
         return m_rows, p_rows, c_rows
     for a, b in (pair.split(":") for pair in args.pairs):
         if a not in base or b not in base:
@@ -407,7 +412,7 @@ def _combo(job: tuple[str, str, float, str]) -> tuple[list[dict], list[dict], li
             bd = bd[np.isfinite(bd)]
             p_boot = float(min(1.0, 2 * min(np.mean(bd <= 0), np.mean(bd >= 0)))) if len(bd) else math.nan
             lo, hi = ci(list(bd))
-            prow = {"subset": sub, "group": g, "model_a": a, "model_b": b, "measure": k,
+            prow = {"setting": setting, "subset": sub, "group": g, "model_a": a, "model_b": b, "measure": k,
                     "a_minus_b": base[a][k] - base[b][k], "lo": lo, "hi": hi, "p_boot": p_boot, "n": len(idx)}  # fmt: skip
             if k == "concordance":
                 prow["a_right_b_wrong"], prow["a_wrong_b_right"], prow["p_mcnemar"] = mcnemar(preds[a][idx],
@@ -423,7 +428,8 @@ def run(args) -> int:
     fasta = Fasta(args.fasta)
     qtl = load_qtl(args, fasta)
     logger.info("%s: %s", args.qtl, qtl.counts)
-    run_info: dict = {"started_et": now_et(), "argv": sys.argv, "code": code_commit(), "counts": dict(qtl.counts)}
+    run_info: dict = {"started_et": now_et(), "argv": sys.argv, "code": code_commit(), "source": args.source,
+                      "counts": dict(qtl.counts)}  # fmt: skip
     if args.list and args.list_af:
         chk = af_check(qtl, Path(args.list), args.list_af)
         run_info["af_check"] = chk
@@ -476,7 +482,7 @@ def run(args) -> int:
                 continue
             mine = [d for d in ds if d in have.get(m, set())]
             settings["matched"][m][rows] = group_pred(m, mine, "logfc.mean")[rows]
-            settings["heldout"][m][rows] = group_pred(m, mine, "logfc.heldout")[rows]
+            settings["heldout"][m][rows] = group_pred(m, h2h_sets[g], "logfc.heldout")[rows]
             settings["h2h"][m][rows] = group_pred(m, h2h_sets[g], "logfc.mean")[rows]
     run_info["datasets"] = {g: {"matched": {m: [d for d in ds if d in have.get(m, set())] for m in models},
                                 "h2h": h2h_sets[g]} for g, ds in groups.items()}  # fmt: skip
@@ -551,13 +557,17 @@ def write_report(out: Path, metrics, paired, info, models, tops) -> None:
                          f"{fmt(r['concordance'])} [{fmt(r['concordance_lo'])}, {fmt(r['concordance_hi'])}] | "
                          f"{fmt(r.get('top_0.1', math.nan))} | {fmt(r['spearman'])} |")  # fmt: skip
         lines.append("")
-    if paired:
-        lines += ["## paired (h2h, same rows)", "", "| subset | group | A − B | measure | diff [95% CI] | p (boot) | "
-                  "McNemar p |", "|---|---|---|---|---|---|---|"]  # fmt: skip
-        for r in paired:
+    for setting in ("h2h", "heldout"):
+        rows = [r for r in paired if r["setting"] == setting]
+        if not rows:
+            continue
+        lines += [f"## paired ({setting}, same rows)", "", "| subset | group | A − B | measure | diff [95% CI] | "
+                  "p (boot) | McNemar p |", "|---|---|---|---|---|---|---|"]  # fmt: skip
+        for r in rows:
             lines.append(f"| {r['subset']} | {r['group']} | {r['model_a']} − {r['model_b']} | {r['measure']} | "
                          f"{fmt(r['a_minus_b'])} [{fmt(r['lo'])}, {fmt(r['hi'])}] | {fmt(r['p_boot'])} | "
                          f"{fmt(r.get('p_mcnemar', ''))} |")  # fmt: skip
+        lines.append("")
     (out / "report.md").write_text("\n".join(lines) + "\n")
 
 
@@ -617,12 +627,13 @@ def selftest() -> int:
             fh.write("variant_id,slope,experimental_group,phenotype_id,af\n")
             for r in qrows:
                 fh.write(",".join(map(str, r)) + "\n")
-        (d / "groups.tsv").write_text("group\tdatasets\ng1\tdsA,dsB\ng2\tdsB\n")
+        (d / "groups.tsv").write_text("group\tdatasets\ng1\tdsA,dsB\ng2\tdsB,dsC\n")
         # Genome ids: chr1:2:C:A (effect +1 for genome ALT A), chr1:3:G:T (-2), chr2:3:G:A (+0.5); chr2:4 is C in
         # the genome, neither A nor T: a mismatch; chr2:5 is A: same, but 945 bp from its peak's centre.
         ids = np.array(["chr1:2:C:A", "chr1:3:G:T", "chr2:3:G:A", "chr2:5:A:G", "chrX:1:A:C"])
         lf = {("dsA", "cherimoya"): [0.3, -0.4, 0.0, 0.1, 9], ("dsB", "cherimoya"): [0.1, -0.2, 0.6, 0.1, 9],
-              ("dsA", "cbp_nobias"): [-0.3, -0.4, 0, 0.1, 9], ("dsB", "cbp_nobias"): [-0.1, 0.2, -0.6, 0.1, 9]}  # fmt: skip
+              ("dsA", "cbp_nobias"): [-0.3, -0.4, 0, 0.1, 9], ("dsB", "cbp_nobias"): [-0.1, 0.2, -0.6, 0.1, 9],
+              ("dsC", "cherimoya"): [0.0, 0.0, -1.0, 0.1, 9]}  # fmt: skip
         for (ds, m), v in lf.items():
             (d / "scores" / ds).mkdir(parents=True, exist_ok=True)
             sc.save_table(d / "scores" / ds / f"{m}.variants.summary.tsv.gz",
@@ -644,16 +655,21 @@ def selftest() -> int:
         assert float(m[("matched", "g1", "cherimoya")]["concordance"]) == 1.0
         # ChromBPNet corrected g1: -0.2 (effect +: wrong), -0.1 (effect -: right).
         assert float(m[("matched", "g1", "cbp_nobias")]["concordance"]) == 0.5
-        # g2 from dsB only: Cherimoya +0.6 right, ChromBPNet -0.6 wrong; chr2:5 is 945 bp off: not in in_peak.
-        assert float(m[("matched", "g2", "cherimoya")]["concordance"]) == 1.0
+        # g2, matched: Cherimoya mean(dsB +0.6, dsC -1.0) = -0.2, effect +: wrong; ChromBPNet (dsB) -0.6: wrong.
+        # chr2:5 is 945 bp off: not in in_peak.
+        assert float(m[("matched", "g2", "cherimoya")]["concordance"]) == 0.0
         assert int(m[("matched", "g2", "cherimoya")]["n"]) == 1
         assert float(m[("matched", "g2", "cbp_nobias")]["concordance"]) == 0.0
-        # h2h uses the datasets both models have: the same here.
-        assert float(m[("h2h", "all", "cherimoya")]["concordance"]) == 1.0
-        p = [r for r in csv.DictReader(open(d / "out" / "paired.tsv"), delimiter="\t")
-             if r["group"] == "all" and r["measure"] == "concordance"]  # fmt: skip
-        assert abs(float(p[0]["a_minus_b"]) - 2 / 3) < 1e-3, p[0]  # the TSV holds 4 significant digits
-        assert int(p[0]["a_right_b_wrong"]) == 2 and int(p[0]["a_wrong_b_right"]) == 0
+        # h2h and heldout use the datasets both models have (g2: dsB only), so Cherimoya's +0.6 is right.
+        for setting in ("h2h", "heldout"):
+            assert float(m[(setting, "g2", "cherimoya")]["concordance"]) == 1.0, setting
+            assert float(m[(setting, "all", "cherimoya")]["concordance"]) == 1.0, setting
+        p = {r["setting"]: r for r in csv.DictReader(open(d / "out" / "paired.tsv"), delimiter="\t")
+             if r["group"] == "all" and r["measure"] == "concordance"}  # fmt: skip
+        assert set(p) == {"h2h", "heldout"}, p
+        for r in p.values():
+            assert abs(float(r["a_minus_b"]) - 2 / 3) < 1e-3, r  # the TSV holds 4 significant digits
+            assert int(r["a_right_b_wrong"]) == 2 and int(r["a_wrong_b_right"]) == 0, r
         assert (d / "out" / "report.md").is_file() and (d / "out" / "rows.tsv.gz").is_file()
         # --effect-allele second flips the swapped rows.
         args2 = build_parser().parse_args(["--qtl", str(d / "q.csv"), "--fasta", str(d / "g.fa"), "--groups",
@@ -670,6 +686,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--qtl", type=Path)
     ap.add_argument("--fasta", type=Path)
     ap.add_argument("--groups", type=Path)
+    ap.add_argument("--source", default="", help="where the QTL table comes from (a sentence; kept in run.json)")
     ap.add_argument("--scores-root", nargs="+", default=[])
     ap.add_argument("--variants", default="variants", help="the window set's name in the summaries (variants)")
     ap.add_argument("--list", type=Path, help="the scored variant list, for the allele-frequency check")

@@ -1875,7 +1875,7 @@ def points(x, d: int = 1) -> str:
 
 
 def share_ci(lo, hi, d: int = 1) -> str:
-    return f"[{100 * float(lo):.{d}f}, {100 * float(hi):.{d}f}]" if isnum(lo) and isnum(hi) else ""
+    return f"[{num(100 * float(lo), d)}, {num(100 * float(hi), d)}]" if isnum(lo) and isnum(hi) else ""
 
 
 def plain_p(p) -> str:
@@ -1910,7 +1910,7 @@ def plot_level6(rep: Report, l6: dict) -> None:
     ax1.set_ylabel("share with the measured direction")
     ax1.set_title("Direction right, by confidence")
     handles, names = ax1.get_legend_handles_labels()
-    ax1.legend(handles[::-1], names[::-1], loc="lower left")
+    ax1.legend(handles[::-1], names[::-1], loc="center right")
 
     rows = ["all"] + l6["groups"]
     ys = np.arange(len(rows))[::-1].astype(float)
@@ -1944,7 +1944,6 @@ def plot_level6(rep: Report, l6: dict) -> None:
         ax3.scatter(x, y, s=26, color=COLOURS["cross"], edgecolor="white", linewidth=0.5, zorder=3)
         ax3.set_xlim(lo, hi)
         ax3.set_ylim(lo, hi)
-        ax3.set_aspect("equal")
     ax3.set_xlabel("ChromBPNet corrected, % right")
     ax3.set_ylabel("Cherimoya, % right")
     ax3.set_title("Each dataset alone")
@@ -2385,14 +2384,19 @@ def masthead(rep: Report, R: dict, generated: str) -> str:
         if p.get("key") in ("supplement", "production"):
             chip(f"{p['label']} · pending", "pending")
     eta = pending_eta(rep) if rep.pending else ""
+    variants = ""
+    if l6 and l6.get("state") == "done":
+        k = len(h2h_datasets(l6))
+        variants = " The variant effects, compared with measured caQTLs, cover " + (
+            "those datasets." if k == len(rep.shared) else f"the {k} of them that stand for a caQTL group."
+        )
     return f"""
 <header class="masthead">
   <p class="eyebrow">AMSC · 10x multiome ATAC · model comparison</p>
   <h1>Cherimoya vs ChromBPNet</h1>
   <p class="dek">Two sequence-to-accessibility models trained on the same {len(rep.everything)} AMSC pseudobulk ATAC
   datasets with the same five chromosome folds. Performance covers every dataset; attributions, TF-MoDISco motifs,
-  motif compendia, Fi-NeMo hits and the variant effects compared with measured caQTLs cover the {len(rep.shared)}
-  datasets both models were interpreted on.</p>
+  motif compendia and Fi-NeMo hits cover the {len(rep.shared)} datasets both models were interpreted on.{variants}</p>
   <div class="legend"><span class="lg">{key("chrombpnet")}<span class="lgd">corrected model (chrombpnet_nobias.h5) for attributions and
   variant effects, uncorrected model (chrombpnet.h5) for performance</span></span><span class="lg">{key("cherimoya")}<span class="lgd">no bias model</span></span>
   <span class="lg">{key("cross")}<span class="lgd">agreement between the two</span></span></div>
@@ -3732,7 +3736,8 @@ def section_level6(rep: Report, n: Numbering, l6: dict | None) -> str:
             f"base){af_text}. A model's prediction is its logFC, log<sub>2</sub> of the counts it predicts with the "
             "ALT allele over the REF allele, mean of its five folds, averaged over the datasets that stand for the "
             f"lead's group. Compared here are the leads within {maxbp:g} bp of their peak's centre, inside the peak, "
-            f"on the {k} datasets with both models' variant scores. 50% is chance.</p>")  # fmt: skip
+            f"on the {k} datasets that have both models' variant scores and stand for a caQTL group. 50% is "
+            "chance.</p>")  # fmt: skip
 
     def vkey(m: str) -> str:
         cls = {"cherimoya": "cheri", "cbp_nobias": "cbp", "cbp_full": "cbp"}.get(m)

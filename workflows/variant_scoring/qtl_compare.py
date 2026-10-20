@@ -489,6 +489,9 @@ def run(args) -> int:
 
     subsets = [(n, float(b)) for n, b in (s.split("=") for s in args.subset)]
     tops = [float(f) for f in args.top]
+    run_info["settings"] = {"models": models, "pairs": list(args.pairs), "subsets": dict(subsets), "tops": tops,
+                            "n_boot": args.n_boot, "seed": args.seed, "min_rows": args.min_rows,
+                            "effect_allele": args.effect_allele}  # fmt: skip
     group_names = ["all"] + sorted(set(qtl.group) & set(groups))
     combos = [(setting, sub, maxbp, g) for setting in settings for sub, maxbp in subsets for g in group_names]
     _STATE.update(qtl=qtl, settings=settings, models=models, groups=groups, tops=tops, args=args)

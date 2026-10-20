@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""The comparison's report: one page that reads levels 1-5 and says what they found.
+"""The comparison's report: one page that reads levels 1-6 and says what they found.
 
 Reads the levels' outputs under --comparison-root (performance/, attributions/, modisco/, compendium/, finemo/,
-bias_control/), each fold's comparison under --cheri-root and the compendia under --compendia-root, computes the
-statistics the levels leave out, and writes, under --out-dir (default <comparison-root>/report):
+bias_control/), each fold's comparison under --cheri-root, the compendia under --compendia-root and, for level 6,
+qtl_compare.py's comparison of the models' variant scores with measured QTLs (--caqtl), computes the statistics the
+levels leave out, and writes, under --out-dir (default <comparison-root>/report):
 
   index.html        the report page: the findings with their key numbers, one section per level with figures and
                     compact tables, the bias control, the caveats, and the methods with each input's time (ET) and
                     the code's commits. Self-contained (figures embedded as PNG data URIs, fonts from Google Fonts),
                     ready to publish as a private Artifact page
   statistics.tsv    every interval and test on the page, one row each: level, family, quantity, test (interval or
-                    wilcoxon), over (datasets or folds), n, estimate (the median of the values, or of the paired
-                    differences), ci95_lo and ci95_hi (percentile bootstrap, --n-boot resamples, --seed; datasets are
-                    resampled, and for rows over folds whole datasets with their folds unless the note says
-                    otherwise), statistic and p (two-sided Wilcoxon signed-rank), p_method (how scipy's 'auto'
-                    computed p: exact, the signed-rank distribution; permutation, every sign flip, for up to 13
-                    values with ties or zeros; normal, the normal approximation with tie and continuity corrections,
-                    for more than 50 values or ties or zeros among 14-50; the page marks these with a dagger),
-                    higher and lower (how many datasets or folds the difference is above or below 0; the test drops
-                    the differences of 0), note
+                    wilcoxon; level 6: interval, mcnemar or bootstrap), over (datasets or folds; level 6: variants),
+                    n, estimate (the median of the values, or of the paired differences; level 6: the share or the
+                    difference itself), ci95_lo and ci95_hi (percentile bootstrap, --n-boot resamples, --seed;
+                    datasets are resampled, and for rows over folds whole datasets with their folds unless the note
+                    says otherwise; level 6: qtl_compare.py's bootstrap over variants), statistic and p (two-sided
+                    Wilcoxon signed-rank; level 6: McNemar's exact test, or the bootstrap p), p_method (how scipy's
+                    'auto' computed p: exact, the signed-rank distribution; permutation, every sign flip, for up to
+                    13 values with ties or zeros; normal, the normal approximation with tie and continuity
+                    corrections, for more than 50 values or ties or zeros among 14-50; the page marks these with a
+                    dagger; level 6: exact binomial or bootstrap), higher and lower (how many datasets or folds the
+                    difference is above or below 0; the test drops the differences of 0; level 6, McNemar rows: the
+                    leads only the first and only the second model calls the right way), note
   tables/*.tsv      the tables behind the numbers on the page (level<l>_*.tsv, bias_*.tsv, inputs.tsv, checks.tsv)
   figures/*.pdf/.png
                     the page's figures (Okabe-Ito blue for ChromBPNet and vermillion for Cherimoya in every panel;
@@ -42,6 +46,8 @@ What it computes that the levels do not:
             the reciprocal like-for-like pairs
   level 5   hits per 10,000 shared peaks per model; precision and recall by cluster class and by sign (the
             sign from joint_clusters.tsv); per-motif medians; the largest motifs; 11.0's motif reports side by side
+  level 6   nothing new: qtl_compare.py's shares, intervals and tests as written (the shares are computed again from
+            its rows.tsv.gz as a check), and per dataset how often Cherimoya is ahead
 The tests levels 2, 3 and 5 already ran are computed again from their tables (for the statistic as well as p) and
 checked against the levels' statistics.tsv (tables/checks.tsv).
 
@@ -51,13 +57,14 @@ finemo/<ds>/production/). A part that cannot be computed is shown on the page wi
 still written, and the script exits 1. Each run writes the page again; .done/report.json records what it read.
 
     python workflows/cherimoya/compare/report.py [--comparison-root <dir>] [--out-dir <dir>] [--cheri-root <dir>]
-        [--compendia-root <dir>] [--datasets <shared list>] [--pending-eta "<sentence>"]
+        [--compendia-root <dir>] [--datasets <shared list>] [--caqtl <qtl_compare.py output>] [--pending-eta "<sentence>"]
         [--repo <name>=<checkout> ...] [--n-boot 10000] [--seed 0] [--dpi 144]
 
 The roots default to the environment compare.sh exports (COMPARISON_ROOT, CHERI_ROOT, COMPENDIA_ROOT), else to the
 siblings of --comparison-root (<parent>/cherimoya, <parent>/compendia). --datasets defaults to
 <compendia-root>/inputs/shared10.txt; level 1 reads it and <compendia-root>/inputs/rest29.txt (else every
-<cheri-root>/configs/<dataset>/). Runs in the pixi cherimoya environment (numpy, scipy, pandas, matplotlib, h5py,
+<cheri-root>/configs/<dataset>/). --caqtl defaults to the newest <comparison-root>/../variant_scoring/caqtl/out/<run>/
+(by its run.json); without one, level 6 is shown as pending. Runs in the pixi cherimoya environment (numpy, scipy, pandas, matplotlib, h5py,
 memelite), inside a box: about two minutes on 4 cores.
 """
 
@@ -90,7 +97,7 @@ import summarize  # noqa: E402
 
 logger = logging.getLogger("report")
 
-FORMAT = 1
+FORMAT = 2
 MODELS = common.MODELS
 NAMES = common.NAMES
 MEASURES = summarize.MEASURES
@@ -150,6 +157,10 @@ CLASSES = ("shared", "chrombpnet_only", "cherimoya_only")
 CLASS_NAMES = {"shared": "both models", "chrombpnet_only": "ChromBPNet only", "cherimoya_only": "Cherimoya only"}
 CLASS_COLOURS = {"shared": COLOURS["cross"], "chrombpnet_only": COLOURS["chrombpnet"],
                  "cherimoya_only": COLOURS["cherimoya"]}  # fmt: skip
+VARIANT_MODELS = ("cherimoya", "cbp_nobias", "cbp_full", "cbp_bias")
+"""qtl_compare.py's models: Cherimoya, ChromBPNet's corrected and uncorrected models and its bias model."""
+VARIANT_STYLE = {"cherimoya": (COLOURS["cherimoya"], "-"), "cbp_nobias": (COLOURS["chrombpnet"], "-"),
+                 "cbp_full": (COLOURS["chrombpnet"], ":"), "cbp_bias": (MUTED, "--")}  # fmt: skip
 NAN = float("nan")
 
 
@@ -1754,6 +1765,196 @@ def plot_level5(rep: Report, groups, top) -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# level 6: the models' variant effects against measured QTLs (qtl_compare.py's outputs)
+
+
+def newest_caqtl(root: Path) -> Path | None:
+    """The newest qtl_compare.py output under <root>/out/ (by its run.json's modification time), or None."""
+    runs = [p.parent for p in (root / "out").glob("*/run.json") if (p.parent / "paired.tsv").is_file()]
+    return max(runs, key=lambda p: (p / "run.json").stat().st_mtime_ns) if runs else None
+
+
+def level6(rep: Report) -> dict:
+    import pandas as pd
+
+    d = rep.args.caqtl
+    if d is None or not (Path(d) / "run.json").is_file():
+        rep.pending.append({"part": "Level 6", "key": "variants", "label": "Level 6", "short": "variant effects",
+                            "what": "The models' variant scores are not compared with measured QTLs yet (no "
+                            "qtl_compare.py output)"})  # fmt: skip
+        return {"state": "pending"}
+    d = Path(d)
+    info = json.loads(rep.use("level6/run", d / "run.json").read_text())
+    met = rep.table("level6_metrics", read_tsv(rep.use("level6/metrics", d / "metrics.tsv")))
+    par = rep.table("level6_paired", read_tsv(rep.use("level6/paired", d / "paired.tsv")))
+    per = rep.table("level6_per_dataset", read_tsv(rep.use("level6/per_dataset", d / "per_dataset.tsv")))
+    cur = read_tsv(rep.use("level6/curves", d / "curves.tsv"))
+    if "setting" not in par.columns:
+        raise ValueError(f"{d / 'paired.tsv'} has no setting column: it predates qtl_compare.py's like-for-like "
+                         "held-out setting; run qtl_compare.py again")  # fmt: skip
+    st = info.get("settings") or {}
+    subsets = {k: float(v) for k, v in (st.get("subsets") or {"in_peak": 250.0, "near": 500.0}).items()}
+    primary = next(iter(subsets))
+    labels = dict(zip(met["model"], met["model_label"]))
+
+    fam = "caQTL sign concordance"
+    for _, r in met.iterrows():
+        rep.stats.add(level="6", family=f"{fam}, {r['setting']}, {r['subset']}",
+                      quantity=f"{r['group']}: {r['model_label']}", test="interval", over="variants", n=int(r["n"]),
+                      estimate=r["concordance"], ci95_lo=r["concordance_lo"], ci95_hi=r["concordance_hi"],
+                      note="the share of leads whose logFC has the slope's sign; bootstrap over variants")  # fmt: skip
+    for _, r in par.iterrows():
+        mc = r["measure"] == "concordance"
+        rep.stats.add(level="6", family=f"{fam}, {r['setting']}, {r['subset']}, paired",
+                      quantity=f"{r['group']}: {r['measure']}, {labels.get(r['model_a'], r['model_a'])} - "
+                      f"{labels.get(r['model_b'], r['model_b'])}", test="mcnemar" if mc else "bootstrap",
+                      over="variants", n=int(r["n"]), estimate=r["a_minus_b"], ci95_lo=r["lo"], ci95_hi=r["hi"],
+                      p=r["p_mcnemar"] if mc else r["p_boot"], p_method="exact binomial" if mc else "bootstrap",
+                      higher=r["a_right_b_wrong"] if mc else NAN, lower=r["a_wrong_b_right"] if mc else NAN,
+                      note="higher, lower: the leads only A, only B calls the right way" if mc else "")  # fmt: skip
+
+    # The shares again from rows.tsv.gz (each lead's predictions), against metrics.tsv.
+    if (d / "rows.tsv.gz").is_file():
+        rows = pd.read_csv(rep.use("level6/rows", d / "rows.tsv.gz"), sep="\t", keep_default_na=False,
+                           na_values=["NA", ""])  # fmt: skip
+        pairs = []
+        for setting in ("h2h", "heldout"):
+            cols = [c for c in rows.columns if c.startswith(f"{setting}.")]
+            for sub, maxbp in subsets.items():
+                sel = (rows["dist_to_centre"] <= maxbp).to_numpy() & rows[cols].notna().all(axis=1).to_numpy()
+                e = rows["effect"].to_numpy(float)[sel]
+                for c in cols:
+                    p = rows[c].to_numpy(float)[sel]
+                    ok = (p != 0) & (e != 0)
+                    theirs = met[(met["setting"] == setting) & (met["subset"] == sub) & (met["group"] == "all")
+                                 & (met["model"] == c.split(".", 1)[1])]["concordance"]  # fmt: skip
+                    pairs.append((float(np.mean(np.sign(p[ok]) == np.sign(e[ok]))) if ok.any() else NAN,
+                                  float(theirs.iloc[0]) if len(theirs) else NAN))  # fmt: skip
+        rep.check("level 6: sign concordance from rows.tsv.gz (h2h and heldout, every subset, all groups)", pairs)
+
+    # Per dataset alone: how many datasets Cherimoya is ahead of ChromBPNet corrected in.
+    wins = (0, 0)
+    pp = per[per["subset"] == primary].pivot_table(index="dataset", columns="model", values="concordance")
+    if {"cherimoya", "cbp_nobias"} <= set(pp.columns):
+        both = pp.dropna(subset=["cherimoya", "cbp_nobias"])
+        wins = (int((both["cherimoya"] > both["cbp_nobias"]).sum()), len(both))
+    groups = [g for g in dict.fromkeys(met.loc[(met["setting"] == "h2h") & (met["subset"] == primary), "group"])
+              if g != "all"]  # fmt: skip
+    l6 = {"state": "done", "dir": d, "info": info, "met": met, "par": par, "per": per, "cur": cur, "labels": labels,
+          "subsets": subsets, "primary": primary, "groups": groups, "wins": wins}  # fmt: skip
+    plot_level6(rep, l6)
+    return l6
+
+
+def l6_metric(l6: dict, setting: str, group: str, model: str, subset: str | None = None) -> dict | None:
+    m = l6["met"]
+    x = m[(m["setting"] == setting) & (m["subset"] == (subset or l6["primary"])) & (m["group"] == group)
+          & (m["model"] == model)]  # fmt: skip
+    return x.iloc[0].to_dict() if len(x) else None
+
+
+def l6_pair(l6: dict, setting: str, group: str, a: str, b: str, measure: str = "concordance",
+            subset: str | None = None) -> dict | None:  # fmt: skip
+    p = l6["par"]
+    x = p[(p["setting"] == setting) & (p["subset"] == (subset or l6["primary"])) & (p["group"] == group)
+          & (p["model_a"] == a) & (p["model_b"] == b) & (p["measure"] == measure)]  # fmt: skip
+    return x.iloc[0].to_dict() if len(x) else None
+
+
+def h2h_datasets(l6: dict) -> list[str]:
+    return sorted({x for g in (l6["info"].get("datasets") or {}).values() for x in g.get("h2h", [])})
+
+
+def group_name(g: str) -> str:
+    return "all groups" if g == "all" else g.replace("_", " ")
+
+
+def points(x, d: int = 1) -> str:
+    """A difference of two shares in percentage points, signed: '+1.5'."""
+    return num(100 * float(x), d, True) if isnum(x) else "NA"
+
+
+def share_ci(lo, hi, d: int = 1) -> str:
+    return f"[{100 * float(lo):.{d}f}, {100 * float(hi):.{d}f}]" if isnum(lo) and isnum(hi) else ""
+
+
+def plain_p(p) -> str:
+    """p without HTML (for the summary's tiles): '1.4×10⁻⁷'."""
+    if not isnum(p):
+        return "NA"
+    p = float(p)
+    if p < 1e-3:
+        mant, exp = f"{p:.1e}".split("e")
+        return f"{mant}×10{str(int(exp)).translate(str.maketrans('-0123456789', '⁻⁰¹²³⁴⁵⁶⁷⁸⁹'))}"
+    return f"{p:.2g}" if p < 0.1 else f"{p:.2f}"
+
+
+def plot_level6(rep: Report, l6: dict) -> None:
+    plt = pyplot()
+    from matplotlib.lines import Line2D
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12.8, 4.3), gridspec_kw={"width_ratios": [1.1, 1.35, 0.9]})
+    sub = l6["primary"]
+    cur = l6["cur"][l6["cur"]["subset"] == sub]
+    for m in ("cbp_bias", "cbp_nobias", "cherimoya"):
+        c = cur[cur["model"] == m].sort_values("top_fraction")
+        if len(c):
+            col, ls = VARIANT_STYLE[m]
+            ax1.plot(100 * c["top_fraction"], c["concordance"], color=col, ls=ls, lw=1.7, marker="o", markersize=2.6,
+                     label=l6["labels"].get(m, m))  # fmt: skip
+    ax1.axhline(0.5, color=MUTED, lw=0.8, ls=":")
+    ax1.text(99, 0.507, "chance", ha="right", va="bottom", fontsize=7.2, color=MUTED)
+    ax1.set_xlim(0, 102)
+    ax1.set_ylim(0.45, 1.01)
+    ax1.set_xlabel("the model's most confident leads, % (by |logFC|)")
+    ax1.set_ylabel("share with the measured direction")
+    ax1.set_title("Direction right, by confidence")
+    handles, names = ax1.get_legend_handles_labels()
+    ax1.legend(handles[::-1], names[::-1], loc="lower left")
+
+    rows = ["all"] + l6["groups"]
+    ys = np.arange(len(rows))[::-1].astype(float)
+    ticks = []
+    for g, y in zip(rows, ys):
+        base = l6_metric(l6, "h2h", g, "cherimoya")
+        ticks.append(f"{group_name(g)} ({count(base['n']) if base else 'NA'})")
+        for setting, off, filled in (("h2h", 0.13, True), ("heldout", -0.13, False)):
+            r = l6_pair(l6, setting, g, "cherimoya", "cbp_nobias")
+            if r is None:
+                continue
+            ax2.plot([100 * r["lo"], 100 * r["hi"]], [y + off] * 2, color=INK, lw=1.1, solid_capstyle="butt")
+            ax2.scatter([100 * r["a_minus_b"]], [y + off], s=24, color=INK if filled else "white", edgecolor=INK,
+                        linewidth=1.1, zorder=3)  # fmt: skip
+    ax2.axvline(0, color=MUTED, lw=0.9)
+    ax2.set_yticks(ys, ticks)
+    ax2.set_ylim(-0.6, len(rows) - 0.4)
+    ax2.grid(axis="y", visible=False)
+    ax2.set_xlabel("Cherimoya − ChromBPNet corrected, percentage points")
+    ax2.set_title("Difference by caQTL group (leads)")
+    ax2.legend(handles=[Line2D([], [], ls="", marker="o", color=INK, markersize=5, label="fold mean"),
+                        Line2D([], [], ls="", marker="o", markerfacecolor="white", markeredgecolor=INK, markersize=5,
+                               label="held-out fold")], loc="lower right")  # fmt: skip
+
+    pp = l6["per"][l6["per"]["subset"] == sub].pivot_table(index="dataset", columns="model", values="concordance")
+    if {"cherimoya", "cbp_nobias"} <= set(pp.columns):
+        b = pp.dropna(subset=["cherimoya", "cbp_nobias"])
+        x, y = 100 * b["cbp_nobias"].to_numpy(float), 100 * b["cherimoya"].to_numpy(float)
+        lo, hi = float(np.floor(min(x.min(), y.min()) - 1)), float(np.ceil(max(x.max(), y.max()) + 1))
+        ax3.plot([lo, hi], [lo, hi], color=MUTED, lw=0.9, zorder=1)
+        ax3.scatter(x, y, s=26, color=COLOURS["cross"], edgecolor="white", linewidth=0.5, zorder=3)
+        ax3.set_xlim(lo, hi)
+        ax3.set_ylim(lo, hi)
+        ax3.set_aspect("equal")
+    ax3.set_xlabel("ChromBPNet corrected, % right")
+    ax3.set_ylabel("Cherimoya, % right")
+    ax3.set_title("Each dataset alone")
+    fig.tight_layout()
+    rep.figure(fig, "level6_caqtl", "Left: the share of caQTL leads whose predicted direction matches the measured "
+               "one, among each model's most confident leads. Middle: Cherimoya minus ChromBPNet corrected by caQTL "
+               "group, with 95% CIs. Right: each dataset alone, ChromBPNet corrected against Cherimoya.")  # fmt: skip
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # provenance
 
 
@@ -2173,6 +2374,13 @@ def masthead(rep: Report, R: dict, generated: str) -> str:
         else:
             miss = part.get("missing") or []
             chip(f"Level {i} · {len(rep.shared) - len(miss)}/{len(rep.shared)} datasets", "pending" if miss else "done")
+    l6 = R.get("l6")
+    if l6 is None:
+        chip("Level 6 · not computed", "problem")
+    elif l6.get("state") != "done":
+        chip("Level 6 · pending", "pending")
+    else:
+        chip("Level 6 · done", "done")
     for p in rep.pending:
         if p.get("key") in ("supplement", "production"):
             chip(f"{p['label']} · pending", "pending")
@@ -2183,9 +2391,10 @@ def masthead(rep: Report, R: dict, generated: str) -> str:
   <h1>Cherimoya vs ChromBPNet</h1>
   <p class="dek">Two sequence-to-accessibility models trained on the same {len(rep.everything)} AMSC pseudobulk ATAC
   datasets with the same five chromosome folds. Performance covers every dataset; attributions, TF-MoDISco motifs,
-  motif compendia and Fi-NeMo hits cover the {len(rep.shared)} datasets both models were interpreted on.</p>
-  <div class="legend"><span class="lg">{key("chrombpnet")}<span class="lgd">corrected model (chrombpnet_nobias.h5) for attributions,
-  uncorrected model (chrombpnet.h5) for performance</span></span><span class="lg">{key("cherimoya")}<span class="lgd">no bias model</span></span>
+  motif compendia, Fi-NeMo hits and the variant effects compared with measured caQTLs cover the {len(rep.shared)}
+  datasets both models were interpreted on.</p>
+  <div class="legend"><span class="lg">{key("chrombpnet")}<span class="lgd">corrected model (chrombpnet_nobias.h5) for attributions and
+  variant effects, uncorrected model (chrombpnet.h5) for performance</span></span><span class="lg">{key("cherimoya")}<span class="lgd">no bias model</span></span>
   <span class="lg">{key("cross")}<span class="lgd">agreement between the two</span></span></div>
   <div class="status">{"".join(chips)}</div>
   <p class="meta"><span>Generated {h(generated)}</span><span>Data as of the newest input,
@@ -2201,6 +2410,7 @@ def toc() -> str:
         ("level-3", "3", "TF-MoDISco"),
         ("level-4", "4", "Compendia"),
         ("level-5", "5", "Fi-NeMo hits"),
+        ("level-6", "6", "Variant effects"),
         ("bias-control", "", "Bias control"),
         ("caveats", "", "Caveats"),
         ("methods", "", "Methods and provenance"),
@@ -2574,7 +2784,7 @@ def bias_finding(rep: Report, bc: dict, l3: dict) -> dict:
 
 def summary_section(rep: Report, R: dict) -> str:
     items, keys = [], []
-    l1, l2, l3, l4, l5, bc = (R.get(k) for k in ("l1", "l2", "l3", "l4", "l5", "bias"))
+    l1, l2, l3, l4, l5, l6, bc = (R.get(k) for k in ("l1", "l2", "l3", "l4", "l5", "l6", "bias"))
     if l1 and l1.get("state") == "done":
         f1 = l1_finding(l1)
         items.append(("Performance", f"{f1['headline']} {f1['detail']}"))
@@ -2616,6 +2826,10 @@ def summary_section(rep: Report, R: dict) -> str:
         keys.append(("Fi-NeMo hits matched within 5 bp", f"{pct(P['estimate'], 0)} / {pct(Rr['estimate'], 0)}",
                      "of Cherimoya's hits / of ChromBPNet's hits, median of datasets; no within-model ceiling (Fi-NeMo "
                      "ran on fold averages only)"))  # fmt: skip
+    f6 = l6_finding(rep, l6) if l6 and l6.get("state") == "done" else None
+    if f6:
+        items.append(("Variant effects", f6["text"]))
+        keys.append(f6["tile"])
     if bc and bc.get("state") == "done" and l3 and l3.get("state") == "done":
         fb = bias_finding(rep, bc, l3)
         items.append(("Bias", f"{fb['flag_text']} {fb['checked']}"))
@@ -2629,7 +2843,8 @@ def summary_section(rep: Report, R: dict) -> str:
     n_sh, n_all = len(rep.shared), len(rep.everything)
     floors = ", ".join(f"{pval(2.0 / 2**k)} for {k} {what}" for k, what in ((n_sh, "datasets"), (n_all, "datasets"))
                        if k)  # fmt: skip
-    floor = (f"<p class=\"tcap\">p-values are two-sided Wilcoxon signed-rank tests. With n paired values the exact p "
+    floor = (f"<p class=\"tcap\">p-values are two-sided Wilcoxon signed-rank tests, except at level 6 (McNemar's "
+             f"exact test on the variants, or a bootstrap p). With n paired values the exact Wilcoxon p "
              f"cannot fall below 2/2<sup>n</sup>: {floors}. p marked {APPROX} comes from the normal approximation, "
              f"used for more than 50 values (the folds of all datasets) or for ties or zeros among 14–50, and can fall "
              f"further. At those floors read p as “every dataset (or fold) went the same way”, not as a measure of "
@@ -3457,6 +3672,205 @@ def section_level5(rep: Report, n: Numbering, l5: dict | None) -> str:
 </section>"""
 
 
+def l6_finding(rep: Report, l6: dict) -> dict | None:
+    """Level 6: 'text' (the summary's sentences), 'lead' and 'tile'."""
+    c, b = l6_metric(l6, "h2h", "all", "cherimoya"), l6_metric(l6, "h2h", "all", "cbp_nobias")
+    d = l6_pair(l6, "h2h", "all", "cherimoya", "cbp_nobias")
+    if not (c and b and d):
+        return None
+    full, bias = l6_metric(l6, "h2h", "all", "cbp_full"), l6_metric(l6, "h2h", "all", "cbp_bias")
+    held = l6_pair(l6, "heldout", "all", "cherimoya", "cbp_nobias")
+    k = len(h2h_datasets(l6))
+    diffs = [l6_pair(l6, "h2h", g, "cherimoya", "cbp_nobias") for g in l6["groups"]]
+    diffs = [x for x in diffs if x]
+    ahead = sum(x["a_minus_b"] > 0 for x in diffs)
+    clear = sum(x["lo"] > 0 for x in diffs)
+    w, nd = l6["wins"]
+    head = (f"On the {count(c['n'])} caQTL leads inside their peaks, scored on the same {k} datasets, the sign of "
+            f"Cherimoya's predicted effect matches the measured one for {pct(c['concordance'])} of leads and "
+            f"ChromBPNet corrected's for {pct(b['concordance'])}: {points(d['a_minus_b'])} percentage points "
+            f"{share_ci(d['lo'], d['hi'])}, McNemar p {pval(d['p_mcnemar'])}.")  # fmt: skip
+    more = (f" Cherimoya is ahead in {w}/{nd} datasets taken alone and in {ahead}/{len(diffs)} caQTL groups "
+            f"({clear} with a CI above 0)")  # fmt: skip
+    if held:
+        more += (f", and on each dataset's held-out fold too ({points(held['a_minus_b'])} points, p "
+                 f"{pval(held['p_mcnemar'])})")  # fmt: skip
+    more += "."
+    t1, t2 = c.get("top_0.1"), b.get("top_0.1")
+    if isnum(t1) and isnum(t2):
+        more += (f" Both are right on {pct(t1)} of their most confident 10% of leads, so the difference lies in the "
+                 "weaker calls." if pct(t1) == pct(t2) else f" On their most confident 10% of leads Cherimoya is right "
+                 f"on {pct(t1)} and ChromBPNet corrected on {pct(t2)}.")  # fmt: skip
+    if full and bias:
+        more += (f" ChromBPNet uncorrected scores like corrected ({pct(full['concordance'])}); its bias model alone "
+                 f"gets {pct(bias['concordance'])} right.")  # fmt: skip
+    tile = ("caQTL leads in peaks with the measured direction", f"{pct(b['concordance'])} → {pct(c['concordance'])}",
+            f"ChromBPNet corrected → Cherimoya, {count(c['n'])} leads on the same {k} datasets; "
+            f"{points(d['a_minus_b'])} points, McNemar p {plain_p(d['p_mcnemar'])}")  # fmt: skip
+    return {"text": head + more, "lead": head, "tile": tile}
+
+
+def section_level6(rep: Report, n: Numbering, l6: dict | None) -> str:
+    head = '<div class="head"><p class="eyebrow">Level 6</p><h2>Variant effects against measured caQTLs</h2></div>'
+    if l6 is None:
+        return f'<section id="level-6">{head}{problem_html(rep, "Level 6")}</section>'
+    if l6.get("state") != "done":
+        return f'<section id="level-6">{head}{pending_html(rep, "Level 6")}</section>'
+    info, labels, sub = l6["info"], l6["labels"], l6["primary"]
+    cnt, af = info.get("counts") or {}, info.get("af_check") or {}
+    dsets = info.get("datasets") or {}
+    maxbp = l6["subsets"][sub]
+    fnd = l6_finding(rep, l6)
+    src = info.get("source") or "the QTL table given to qtl_compare.py"
+    k = len(h2h_datasets(l6))
+    af_text = (f"; the table's allele frequency follows the scored list's frequency of the genome's ALT allele (r = "
+               f"{num(af.get('r_af_vs_list_alt_af'), 3)} on {count(af.get('n'))} variants), so the effect allele is "
+               "the genome's ALT" if af else "")  # fmt: skip
+    lead = (f'<p class="lead">{fnd["lead"] + " " if fnd else ""}The measured effects are {h(src)}. Each lead is put '
+            f"on the genome's alleles ({count(cnt.get('swapped'))} of the {count(cnt.get('rows'))} rows name the "
+            f"genome's ALT allele first in their variant id, {count(cnt.get('mismatch'))} match neither genome "
+            f"base){af_text}. A model's prediction is its logFC, log<sub>2</sub> of the counts it predicts with the "
+            "ALT allele over the REF allele, mean of its five folds, averaged over the datasets that stand for the "
+            f"lead's group. Compared here are the leads within {maxbp:g} bp of their peak's centre, inside the peak, "
+            f"on the {k} datasets with both models' variant scores. 50% is chance.</p>")  # fmt: skip
+
+    def vkey(m: str) -> str:
+        cls = {"cherimoya": "cheri", "cbp_nobias": "cbp", "cbp_full": "cbp"}.get(m)
+        sw = f'<i class="sw {cls}"></i>' if cls else ""
+        return f'<span class="key">{sw}{h(labels.get(m, m))}</span>'
+
+    def share(r: dict | None) -> str:
+        if r is None:
+            return "NA"
+        return f'{pct(r["concordance"])}<span class="sub">{share_ci(r["concordance_lo"], r["concordance_hi"])}</span>'
+
+    def diff(r: dict | None) -> str:
+        if r is None:
+            return "NA"
+        return (f'{points(r["a_minus_b"])}<span class="sub">{share_ci(r["lo"], r["hi"])} · '
+                f'{count(r["a_right_b_wrong"])} vs {count(r["a_wrong_b_right"])} · p {pval(r["p_mcnemar"])}</span>')  # fmt: skip
+
+    models = [m for m in VARIANT_MODELS if l6_metric(l6, "h2h", "all", m)]
+    rows1 = []
+    for m in models:
+        r = l6_metric(l6, "h2h", "all", m)
+        rho = f'{num(r["spearman"])}<span class="sub">{ci(r["spearman_lo"], r["spearman_hi"])}</span>'
+        rows1.append([vkey(m), count(r["n"]), share(r), pct(r.get("top_0.1")), pct(r.get("top_0.25")),
+                      pct(r.get("top_0.5")), rho, num(r["pearson"])])  # fmt: skip
+    cd = l6_pair(l6, "h2h", "all", "cherimoya", "cbp_nobias")
+    cs = l6_pair(l6, "h2h", "all", "cherimoya", "cbp_nobias", "spearman")
+    fu = l6_pair(l6, "h2h", "all", "cbp_nobias", "cbp_full")
+    pc, pb = l6_metric(l6, "h2h", "all", "cherimoya"), l6_metric(l6, "h2h", "all", "cbp_nobias")
+    tail = ""
+    if cd:
+        tail += (f" Cherimoya − ChromBPNet corrected on the same leads: {points(cd['a_minus_b'])} points "
+                 f"{share_ci(cd['lo'], cd['hi'])}; {count(cd['a_right_b_wrong'])} leads only Cherimoya calls the right "
+                 f"way against {count(cd['a_wrong_b_right'])} only ChromBPNet corrected does (McNemar p "
+                 f"{pval(cd['p_mcnemar'])}).")  # fmt: skip
+    if cs:
+        tail += (f" Spearman ρ: {num(cs['a_minus_b'], 4, True)} {ci(cs['lo'], cs['hi'], 4, True)} (bootstrap p "
+                 f"{pval(cs['p_boot'])}).")  # fmt: skip
+    if pc and pb and isnum(pc["pearson"]) and isnum(pb["pearson"]) and pc["pearson"] < pb["pearson"]:
+        tail += (f" Pearson r, which large effects weigh on most, is higher for ChromBPNet corrected "
+                 f"({num(pb['pearson'])} against {num(pc['pearson'])}; no interval was computed for it).")  # fmt: skip
+    if fu:
+        tail += f" ChromBPNet corrected − uncorrected: {points(fu['a_minus_b'], 2)} points."
+    t1 = table_html(n, f"Every model on the same {count(pc['n']) if pc else 'NA'} leads (fold means, {k} "
+                    "datasets): the share whose predicted direction matches the measured one [95% CI], the same "
+                    "share among the model's most confident 10%, 25% and 50% of leads (by |logFC|), and the "
+                    "correlations of logFC with the measured slope." + tail,
+                    ["Model", "Leads", "Direction right", "Top 10%", "Top 25%", "Top 50%", "Spearman ρ", "Pearson r"],
+                    rows1)  # fmt: skip
+
+    rows2 = []
+    for g in l6["groups"]:
+        dg = dsets.get(g) or {}
+        mine = (dg.get("matched") or {}).get("cherimoya") or []
+        r_c, r_b = l6_metric(l6, "h2h", g, "cherimoya"), l6_metric(l6, "h2h", g, "cbp_nobias")
+        r_x = l6_metric(l6, "h2h", g, "cbp_bias")
+        rows2.append([h(group_name(g)), f"{len(dg.get('h2h') or [])} of {len(mine)}", count(r_c["n"]) if r_c else "NA",
+                      share(r_c), share(r_b), pct(r_x["concordance"]) if r_x else "NA",
+                      diff(l6_pair(l6, "h2h", g, "cherimoya", "cbp_nobias"))])  # fmt: skip
+    only = [g for g in dsets if not (dsets[g].get("h2h") or []) and l6_metric(l6, "matched", g, "cherimoya")]
+    for g in only:
+        r = l6_metric(l6, "matched", g, "cherimoya")
+        mine = (dsets[g].get("matched") or {}).get("cherimoya") or []
+        rows2.append([h(group_name(g)), f"0 of {len(mine)}", count(r["n"]), share(r), "—", "—",
+                      "Cherimoya alone, on its datasets"])  # fmt: skip
+    same = {}
+    for g, dg in dsets.items():
+        same.setdefault(tuple(sorted((dg.get("matched") or {}).get("cherimoya") or [])), []).append(g)
+    shared_sets = [gs for gs in same.values() if len(gs) > 1]
+    same_text = (" One prediction stands for several groups when their datasets are the same (e.g. "
+                 f"{h(' and '.join(group_name(g) for g in shared_sets[0]))}), and a variant that leads in several "
+                 "groups counts once in each; the bootstrap draws all its rows together."
+                 if shared_sets else "")  # fmt: skip
+    t2 = table_html(n, "By caQTL group (fold means, the leads inside their peaks): the datasets with both models' "
+                    "variant scores out of the group's datasets, the leads, each model's share with the measured "
+                    "direction [95% CI], and Cherimoya − ChromBPNet corrected in percentage points [95% CI] · the "
+                    "leads only Cherimoya and only ChromBPNet corrected calls right · McNemar p." + same_text,
+                    ["Group", "Datasets", "Leads", "Cherimoya", "ChromBPNet corrected", "Bias model",
+                     "Cherimoya − corrected"], rows2, left=2)  # fmt: skip
+
+    rows3 = []
+    order = [sub] + [x for x in l6["subsets"] if x != sub]
+    for s_, (setting, what) in ((x, y) for x in order for y in (("h2h", "fold mean"), ("heldout", "held-out fold"))):
+        r_c, r_b = l6_metric(l6, setting, "all", "cherimoya", s_), l6_metric(l6, setting, "all", "cbp_nobias", s_)
+        if not (r_c and r_b):
+            continue
+        rows3.append([h(f"within {l6['subsets'][s_]:g} bp, {what}"), count(r_c["n"]), share(r_c), share(r_b),
+                      diff(l6_pair(l6, setting, "all", "cherimoya", "cbp_nobias", "concordance", s_)),
+                      f"{num(r_c['spearman'])} / {num(r_b['spearman'])}"])  # fmt: skip
+    mc = l6_metric(l6, "matched", "all", "cherimoya")
+    ncheri = sorted({x for g in dsets.values() for x in (g.get("matched") or {}).get("cherimoya") or []})
+    matched_text = (f" Cherimoya on all {len(ncheri)} of its datasets for these groups: {pct(mc['concordance'])} "
+                    f"{share_ci(mc['concordance_lo'], mc['concordance_hi'])} of {count(mc['n'])} leads inside their "
+                    "peaks." if mc else "")  # fmt: skip
+    t3 = table_html(n, "The same comparison on each dataset's held-out fold (the fold whose model never trained on "
+                    "the variant's chromosome) and on the leads farther from their peak's centre (still inside the "
+                    "scored window). The same datasets and leads for both models in every row; Cherimoya − "
+                    "ChromBPNet corrected as in the table above; Spearman ρ Cherimoya / ChromBPNet corrected."
+                    + matched_text,
+                    ["Leads", "n", "Cherimoya", "ChromBPNet corrected", "Cherimoya − corrected", "Spearman ρ"],
+                    rows3)  # fmt: skip
+
+    per = l6["per"][l6["per"]["subset"] == sub]
+    rows4 = []
+    for ds in dict.fromkeys(per["dataset"]):
+        x = per[per["dataset"] == ds].set_index("model")
+        if "cbp_nobias" not in x.index:
+            continue
+        rows4.append([h(rep.labels.get(ds, ds)), h(", ".join(group_name(g) for g in str(x["groups"].iloc[0])
+                                                              .split(","))), count(x["n"].iloc[0])]
+                     + [pct(x.loc[m, "concordance"]) if m in x.index else "NA" for m in models])  # fmt: skip
+    t4 = details(f"Each dataset alone ({len(rows4)} datasets)", table_html(
+        n, "Each dataset's own models on the leads of the groups it stands for (inside their peaks): the share with "
+        "the measured direction.", ["Dataset", "Groups", "Leads"] + [h(labels.get(m, m)) for m in models], rows4,
+        left=2, cls="compact")) if rows4 else ""  # fmt: skip
+    return f"""
+<section id="level-6">
+  {head}
+  {lead}
+  {
+        figure_html(
+            rep,
+            n,
+            "level6_caqtl",
+            "Left: among each model's most confident leads (the top x% by |logFC|), the share whose predicted "
+            "direction matches the measured one; ChromBPNet uncorrected is left out, it lies on corrected. Middle: "
+            "Cherimoya − ChromBPNet corrected by caQTL group (leads in brackets), with bootstrap 95% CIs over "
+            "variants, from the fold means (filled) and from each dataset's held-out fold (hollow). Right: each "
+            "dataset's own models on the leads of the groups it stands for; points above the diagonal favour "
+            "Cherimoya.",
+        )
+    }
+  {t1}
+  {t2}
+  {t3}
+  {t4}
+</section>"""
+
+
 def control_sentence(rep: Report, bc: dict) -> str:
     """The controls used, in one sentence for the lead ('' when none was used)."""
     used = [c for c in bc["controls"] if c["state"] == "done"]
@@ -3603,7 +4017,7 @@ def section_bias(rep: Report, n: Numbering, bc: dict | None, l3: dict | None, l4
 def section_caveats(rep: Report, R: dict) -> str:
     """The plan's caveats (bias model, float16, dropped N windows), the ceilings and the p-value floors; each item's
     text is HTML."""
-    l2, l3, l4, l5 = (R.get(k) for k in ("l2", "l3", "l4", "l5"))
+    l2, l3, l4, l5, l6 = (R.get(k) for k in ("l2", "l3", "l4", "l5", "l6"))
     bias_bits = []
     if l3 and l3.get("state") == "done":
         per = l3["per"]
@@ -3641,6 +4055,25 @@ def section_caveats(rep: Report, R: dict) -> str:
     if l5 and l5.get("state") == "done":
         dd = l5["totals"]["chrombpnet_hits_on_dropped_peaks"]
         drop += f" ChromBPNet has {count(dd.min())}–{count(dd.max())} hits per dataset on them."
+    l6_bias, l6_items = "", []
+    if l6 and l6.get("state") == "done":
+        fu = l6_pair(l6, "h2h", "all", "cbp_nobias", "cbp_full")
+        bm = l6_metric(l6, "h2h", "all", "cbp_bias")
+        if fu and bm:
+            l6_bias = (f" For variant effects (level 6) the bias model cancels out of the allele difference: ChromBPNet "
+                       f"uncorrected's share differs from corrected's by {num(100 * abs(fu['a_minus_b']), 2)} points. The bias "
+                       f"model alone, which sees only Tn5's sequence preference, gets {pct(bm['concordance'])} of the "
+                       "directions right, above chance: some measured effects follow how the allele changes Tn5's "
+                       "preference, or something that goes with it.")  # fmt: skip
+        l6_items.append((
+            "caQTL leads",
+            "Level 6's ground truth is each caQTL's lead variant as released, not a fine-mapped causal variant: a lead "
+            "can tag the causal variant through linkage disequilibrium, and then no model can be right about it except "
+            "by chance, so neither model is expected to reach 100%. Only significant caQTLs are released, so level 6 tests "
+            "the direction of real effects, not whether a model tells caQTLs from variants without an effect (there are "
+            "no negatives and no AUROC). The caQTLs were mapped in the source's own pseudobulks of each group's cells, "
+            "while each model stands for a whole sample, so one dataset stands for every group of its condition.",
+        ))  # fmt: skip
     n_sh, n_all = len(rep.shared), len(rep.everything)
     floors = [(n_sh, "datasets"), (n_all - n_sh, "datasets"), (n_all, "datasets"), (5 * n_sh, "folds")]
     floor_text = ", ".join(f"{pval(2.0 / 2**k)} for {k} {what}" for k, what in floors if k > 0)
@@ -3653,7 +4086,7 @@ def section_caveats(rep: Report, R: dict) -> str:
             + (" " + "; ".join(bias_bits) + "." if bias_bits else "")
             + " Level 1 is not affected: it scores ChromBPNet's uncorrected model (bias model included) against observed counts. "
             "The bias control used one dataset and fold and the profile head, so it indicates, but does not measure, "
-            "how much of Cherimoya's extra signal is bias.",
+            "how much of Cherimoya's extra signal is bias." + l6_bias,
         ),
         (
             "Float16",
@@ -3685,7 +4118,7 @@ def section_caveats(rep: Report, R: dict) -> str:
             "training data, so the dataset-level test is the one to read. At those floors, read p as “all in the "
             "same direction”, not as an effect size.",
         ),
-    ]
+    ] + l6_items
     lis = "".join(f"<li><b>{h(t)}.</b> {x}</li>" for t, x in items)
     return f"""
 <section id="caveats">
@@ -3697,8 +4130,8 @@ def section_caveats(rep: Report, R: dict) -> str:
 def section_methods(rep: Report, R: dict, prov: dict, generated: str) -> str:
     a = rep.args
     defs = [
-        ("Statistics", f"Every interval on this page is a percentile bootstrap 95% CI of the median, {a.n_boot:,} "
-         f"resamples, seed {a.seed}, and every one resamples datasets: for values over datasets, the datasets; for "
+        ("Statistics", f"Every interval of levels 1–5 is a percentile bootstrap 95% CI of the median, {a.n_boot:,} "
+         f"resamples, seed {a.seed}, and every one resamples datasets (level 6's are described under it): for values over datasets, the datasets; for "
          "values over folds, whole datasets with all their folds. (The levels' own statistics files resample single "
          "folds for their fold rows; this page does not show those intervals, and the checks below compare only "
          "their medians and p.) The endpoints are Monte Carlo estimates: another seed moves them by up to about a "
@@ -3729,6 +4162,21 @@ def section_methods(rep: Report, R: dict, prov: dict, generated: str) -> str:
         ("Tables", "Under the output directory: statistics.tsv, tables/*.tsv (one per section and the inputs and "
          "checks below) and figures/*.pdf/.png."),
     ]  # fmt: skip
+    l6 = R.get("l6")
+    if l6 and l6.get("state") == "done":
+        st = l6["info"].get("settings") or {}
+        sub = ", ".join(f"{k} ≤ {v:g} bp" for k, v in l6["subsets"].items())
+        defs.insert(len(defs) - 1, ("Level 6", "qtl_compare.py (rvi-variant-scoring) on scores.py's variant summaries: "
+                    "each QTL row's variant on the genome's alleles (REF is the genome base, the effect the slope "
+                    "for the genome's ALT), a model's logFC (log2 of predicted counts, ALT over REF, mean of the "
+                    "five folds, or the held-out fold's) averaged over the datasets that stand for the row's group, "
+                    "and on the rows with every model's prediction: the share whose logFC has the slope's sign "
+                    "(rows where either is 0 left out), that share among the model's top fractions by |logFC|, and "
+                    f"Spearman and Pearson correlations. Subsets by distance to the peak's centre: {sub}. Intervals: "
+                    f"percentile bootstrap 95% CIs over variants, {st.get('n_boot', 'NA')} resamples, seed "
+                    f"{st.get('seed', 'NA')}, the rows of one variant drawn together; paired differences from the same "
+                    "draws; McNemar's exact test (two-sided binomial on the leads only one of the two models calls "
+                    f"right). Output read: {l6['dir']}."))  # fmt: skip
     items = [(h(x), h(y)) for x, y in defs]
     bc = R.get("bias")
     if bc and bc.get("controls"):
@@ -3763,6 +4211,10 @@ def section_methods(rep: Report, R: dict, prov: dict, generated: str) -> str:
         crow.append([h("Cherimoya attribution engine (pin)"), f'<code>{h(str(eng.get("git_commit"))[:7])}</code>',
                      h(eng.get("git_branch") or ""), h(f"{eng.get('engine')} (attribution_engine.json)"),
                      h(et(eng.get("written")))])  # fmt: skip
+    if l6 and l6.get("state") == "done":
+        info = l6["info"]
+        crow.append([h("qtl_compare.py (level 6, rvi-variant-scoring)"), f"<code>{h(info.get('code') or '?')}</code>",
+                     "", h(f"run {l6['dir'].name}"), h(info.get("finished_et") or "")])  # fmt: skip
     for c in prov["compendia"]:
         pl = c.get("pipeline") or {}
         sw = c.get("software") or {}
@@ -3878,7 +4330,8 @@ def render(rep: Report, R: dict, prov: dict, generated: str) -> str:
         masthead(rep, R, generated), toc(), summary_section(rep, R),
         section_level1(rep, n, R.get("l1")), section_level2(rep, n, R.get("l2")), section_level3(rep, n, R.get("l3")),
         section_level4(rep, n, R.get("l4"), R.get("l5")), section_level5(rep, n, R.get("l5")),
-        section_bias(rep, n, R.get("bias"), R.get("l3"), R.get("l4")), section_caveats(rep, R),
+        section_level6(rep, n, R.get("l6")), section_bias(rep, n, R.get("bias"), R.get("l3"), R.get("l4")),
+        section_caveats(rep, R),
         section_methods(rep, R, prov, generated),
     ]  # fmt: skip
     return (
@@ -3904,6 +4357,7 @@ def run(args: argparse.Namespace) -> int:
     R["bias"] = rep.part("Bias control", bias_control, R["l3"] if R["l3"] and R["l3"].get("state") == "done" else None)
     R["l4"] = rep.part("Level 4", level4)
     R["l5"] = rep.part("Level 5", level5, R["l4"] if R["l4"] and R["l4"].get("state") == "done" else None)
+    R["l6"] = rep.part("Level 6", level6)
     prov = provenance(rep)
     changed = [role for role, entry in rep.seen.items() if common.stat_entry(entry["path"]) != entry]
     if changed:
@@ -3929,12 +4383,14 @@ def run(args: argparse.Namespace) -> int:
             f"{len(rep.stats.rows)} statistics")  # fmt: skip
     if R.get("l1") and R["l1"].get("state") == "done":
         note += f"; level 1 {R['l1']['n_folds']}/{R['l1']['expected']} folds"
+    if R.get("l6") and R["l6"].get("state") == "done":
+        note += f"; level 6 from {R['l6']['dir']}"
     if pend:
         note += f"; pending: {'; '.join(pend)}"
     if rep.problems:
         note += f"; not computed: {', '.join(p for p, _ in rep.problems)}"
     settings = {"datasets": rep.shared, "everything": rep.everything, "n_boot": args.n_boot, "seed": args.seed,
-                "pending_eta": args.pending_eta, "dpi": args.dpi}  # fmt: skip
+                "pending_eta": args.pending_eta, "dpi": args.dpi, "caqtl": args.caqtl}  # fmt: skip
     common.Marker(rep.out, "report", FORMAT, rep.inputs, settings).write(outputs, note)
     if size > 16e6:
         rep.problems.append(("Page", f"index.html is {size / 1e6:.1f} MB, over the 16 MB limit"))
@@ -3962,6 +4418,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cheri-tag", default="cheri10")
     ap.add_argument("--supplement-tag", default="cheri39")
     ap.add_argument("--sensitivity-tag", help="default <joint>_t090")
+    ap.add_argument("--caqtl", type=Path, help="qtl_compare.py's output directory for level 6 (default the newest "
+                    "<comparison-root>/../variant_scoring/caqtl/out/<run>/)")  # fmt: skip
     ap.add_argument("--pending-eta", help="a sentence on when the pending parts are expected, shown as given with them "
                     "(e.g. 'No date is set yet.')")  # fmt: skip
     ap.add_argument("--repo", action="append", metavar="NAME=PATH", help="a checkout whose commit the methods list "
@@ -3978,6 +4436,7 @@ def main(argv: list[str] | None = None) -> int:
     args.compendia_root = args.compendia_root or parent / "compendia"
     args.chrombpnet_root = args.chrombpnet_root or parent / "chrombpnet"
     args.out_dir = args.out_dir or args.comparison_root / "report"
+    args.caqtl = args.caqtl or newest_caqtl(parent / "variant_scoring" / "caqtl")
     args.datasets = args.datasets or args.compendia_root / "inputs" / "shared10.txt"
     if not args.comparison_root.is_dir():
         raise SystemExit(f"no comparison root {args.comparison_root}")

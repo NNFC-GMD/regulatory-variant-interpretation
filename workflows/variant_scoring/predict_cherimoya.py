@@ -4,7 +4,7 @@
 The model is one fold's checkpoint, cherimoya.fold_<k>.torch: the weights the ChromBPNet comparison and the
 attribution read. It is loaded with Cherimoya's own loader, without torch.compile, and put in eval mode before the
 first call: Cherimoya.load(path, device, compile=False).eval() (site-packages cherimoya/cherimoya.py:343-389), as
-workflows/cherimoya/compare_chrombpnet.py loads it. eval() builds the blocks' bf16 weight cache that the inference
+workflows/train/compare_chrombpnet.py loads it. eval() builds the blocks' bf16 weight cache that the inference
 megakernel reads (cheri.py:1063-1086); without it every call recasts the weights.
 
 Only the count head is used: what cherimoya.wrappers.LogCountWrapper returns, model(X)[1] (wrappers.py:168-204), on

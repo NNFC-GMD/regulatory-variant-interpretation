@@ -7,8 +7,8 @@ platforms = ["linux-64"]
 # Environments:
 #
 #   default     lint and tests; no torch, no GPU
-#   cherimoya   training, evaluation and the ChromBPNet comparison
-#               (workflows/cherimoya/); CUDA 13 torch, NVIDIA driver >= 580
+#   cherimoya   training, attribution, variant scoring and the ChromBPNet comparison
+#               (workflows/); CUDA 13 torch, NVIDIA driver >= 580
 #
 # Each tool environment has its own solve group, so one tool's pins cannot move
 # another's.

@@ -29,8 +29,8 @@ pytest.importorskip("hdf5plugin")
 pytest.importorskip("yaml")
 
 TESTS = Path(__file__).resolve().parent
-CHERIMOYA = TESTS.parent / "workflows" / "cherimoya"
-sys.path.insert(0, str(CHERIMOYA))
+WORKFLOWS = TESTS.parent / "workflows"
+sys.path[:0] = [str(WORKFLOWS / d) for d in ("train", "attribution", "downstream")]
 sys.path.insert(0, str(TESTS))
 
 from test_check_dataset import FOLDS, make_dataset, write_attribution  # noqa: E402
@@ -241,7 +241,11 @@ class Box:
         return path
 
     def qc_command(self, *datasets: str) -> list[str]:
-        return ["bash", str(CHERIMOYA / "qc_modisco_folds.sh"), *([str(self.lists(*datasets))] if datasets else [])]
+        return [
+            "bash",
+            str(WORKFLOWS / "downstream" / "qc_modisco_folds.sh"),
+            *([str(self.lists(*datasets))] if datasets else []),
+        ]
 
     def run(self, *datasets: str, timeout: float = 300, **env) -> subprocess.CompletedProcess:
         return subprocess.run(self.qc_command(*datasets), env={**self.env, **env}, capture_output=True, text=True,

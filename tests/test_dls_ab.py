@@ -1,4 +1,4 @@
-"""The A/B benchmark driver workflows/cherimoya/dls_ab.py and the runner it shares with dls_e2e.py (CPU only; no torch).
+"""The A/B benchmark driver workflows/attribution/dls_ab.py and the runner it shares with dls_e2e.py (CPU only; no torch).
 
 The benchmark's numbers rest on these pieces, checked here:
 - OutputTee copies a child's output byte for byte and dates every tqdm update, including updates split across reads
@@ -24,7 +24,9 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "workflows" / "cherimoya"))
+sys.path[:0] = [
+    str(Path(__file__).resolve().parents[1] / "workflows" / d) for d in ("train", "attribution", "downstream")
+]
 
 import dls_ab  # noqa: E402
 import dls_e2e  # noqa: E402

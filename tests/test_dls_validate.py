@@ -1,4 +1,4 @@
-"""The gate arithmetic of workflows/cherimoya/dls_validate.py, and its `gates` report on synthetic runs (CPU only).
+"""The gate arithmetic of workflows/attribution/dls_validate.py, and its `gates` report on synthetic runs (CPU only).
 
 The harness's runs need a GPU and the real model, and take tens of minutes; its gates need neither. These tests check
 the pieces the verdicts rest on: the per-pair and per-peak rel-L2, the Pearson correlation, the floor-relative limits of
@@ -20,7 +20,7 @@ import pytest
 np = pytest.importorskip("numpy")
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "workflows" / "cherimoya"))
+sys.path[:0] = [str(REPO / "workflows" / d) for d in ("train", "attribution", "downstream")]
 
 import dls_validate as dv  # noqa: E402
 

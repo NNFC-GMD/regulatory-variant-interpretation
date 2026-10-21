@@ -22,7 +22,7 @@ pytest.importorskip("hdf5plugin")
 pytest.importorskip("yaml")
 
 TESTS = Path(__file__).resolve().parent
-CHERIMOYA = TESTS.parent / "workflows" / "cherimoya"
+WORKFLOWS = TESTS.parent / "workflows"
 sys.path.insert(0, str(TESTS))
 
 from test_check_dataset import FOLDS  # noqa: E402
@@ -50,7 +50,7 @@ def _bias_setup(b: Box) -> tuple[dict, Path, Path]:
 
 
 def _bias(b: Box, config: Path, out: Path, fold: str = "0", **env) -> subprocess.CompletedProcess:
-    return subprocess.run(["bash", str(CHERIMOYA / "bias_control.sh"), str(config), fold, str(out)],
+    return subprocess.run(["bash", str(WORKFLOWS / "downstream" / "bias_control.sh"), str(config), fold, str(out)],
                           env={**b.env, **env}, capture_output=True, text=True, timeout=300)  # fmt: skip
 
 
@@ -118,7 +118,7 @@ def test_bias_control_fails_on_another_error_and_on_bad_arguments(box):
     assert result.returncode == 1
     assert json.loads((out / "status.json").read_text())["state"] == "failed"
     assert _bias(b, config, out, fold="7").returncode == 1
-    usage = subprocess.run(["bash", str(CHERIMOYA / "bias_control.sh"), str(config)], env=b.env, capture_output=True,
+    usage = subprocess.run(["bash", str(WORKFLOWS / "downstream" / "bias_control.sh"), str(config)], env=b.env, capture_output=True,
                            text=True)  # fmt: skip
     assert usage.returncode == 2
 
@@ -126,7 +126,7 @@ def test_bias_control_fails_on_another_error_and_on_bad_arguments(box):
 def test_bias_control_sigterm_releases_the_claim(box):
     b = box()
     _, config, out = _bias_setup(b)
-    proc = subprocess.Popen(["bash", str(CHERIMOYA / "bias_control.sh"), str(config), "0", str(out)],
+    proc = subprocess.Popen(["bash", str(WORKFLOWS / "downstream" / "bias_control.sh"), str(config), "0", str(out)],
                             env={**b.env, "FAKE_CONTRIBS_SLEEP": "120"}, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)  # fmt: skip
     try:

@@ -72,7 +72,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / d) for d in ("variant_scoring", "nulls")]
 
 from genomic_null import code_info, file_info, read_chrom  # noqa: E402
 from gnomad_list import (  # noqa: E402

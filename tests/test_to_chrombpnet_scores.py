@@ -27,8 +27,8 @@ pytest.importorskip("hdf5plugin")
 pytest.importorskip("yaml")
 
 REPO = Path(__file__).resolve().parents[1]
-CHERIMOYA = REPO / "workflows" / "cherimoya"
-sys.path.insert(0, str(CHERIMOYA))
+WORKFLOWS = REPO / "workflows"
+sys.path[:0] = [str(WORKFLOWS / d) for d in ("train", "attribution", "downstream")]
 
 import attr_status as st  # noqa: E402
 import to_chrombpnet_scores as tcs  # noqa: E402
@@ -323,7 +323,7 @@ def test_provenance_records_sources_rows_audit_and_float16_statistics(tmp_path):
     assert set(prov["outputs"]["h5"]["datasets"]) == {f"{k}/seq" for k in KEYS}
     assert (
         prov["converter"]["files_sha256"]["to_chrombpnet_scores.py"]
-        == hashlib.sha256((CHERIMOYA / "to_chrombpnet_scores.py").read_bytes()).hexdigest()
+        == hashlib.sha256((WORKFLOWS / "downstream" / "to_chrombpnet_scores.py").read_bytes()).hexdigest()
     )
     assert prov["converter"]["git_commit"] and prov["written"] and prov["written_et"]
     ohe, attr = fold["ohe"], fold["attr"]
@@ -587,7 +587,12 @@ def test_lock_busy_exits_4(tmp_path):
 def test_the_command_line(tmp_path):
     root = _root(tmp_path)
     fold = _fold(root)
-    cmd = [sys.executable, str(CHERIMOYA / "to_chrombpnet_scores.py"), "--attribute-json", str(fold["json"])]
+    cmd = [
+        sys.executable,
+        str(WORKFLOWS / "downstream" / "to_chrombpnet_scores.py"),
+        "--attribute-json",
+        str(fold["json"]),
+    ]
     first = subprocess.run(cmd, capture_output=True, text=True)
     assert first.returncode == 0, first.stderr
     assert "wrote" in first.stderr and "dropped peak_1, peak_18, peak_45" in first.stderr

@@ -22,8 +22,8 @@ pytest.importorskip("matplotlib")
 TESTS = Path(__file__).resolve().parent
 sys.path[:0] = [
     str(TESTS),
-    str(TESTS.parent / "workflows" / "cherimoya"),
-    str(TESTS.parent / "workflows" / "cherimoya" / "compare"),
+    *(str(TESTS.parent / "workflows" / d) for d in ("train", "attribution", "downstream")),
+    str(TESTS.parent / "workflows" / "comparison"),
 ]
 
 from compare_fixtures import COMPARE, compare_env, make_performance_root  # noqa: E402
@@ -137,7 +137,7 @@ def test_usage_errors_exit_2(perf, args, unset, message):
 def test_a_level_script_that_is_not_there_fails_that_unit(perf, tmp_path, monkeypatch):
     data, env = perf
     # a copy of the driver beside no level scripts: every unit is "not built"
-    lonely = tmp_path / "repo" / "workflows" / "cherimoya" / "compare"
+    lonely = tmp_path / "repo" / "workflows" / "comparison"
     lonely.mkdir(parents=True)
     (lonely / "compare.sh").write_text(SCRIPT.read_text())
     p = subprocess.run(["bash", str(lonely / "compare.sh"), "4", "--datasets", str(data["list"])], env=env,

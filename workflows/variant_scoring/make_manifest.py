@@ -5,7 +5,7 @@ For each dataset (one igvf_tf_chrombpnet config.yaml) and each of its folds
 this records, with size and mtime (and md5 with --md5):
 
   cherimoya    `<cherimoya-root>/<dataset>/fold_<k>/cherimoya.fold_<k>.torch`, the
-               checkpoint workflows/cherimoya/ trains and attribution reads
+               checkpoint workflows/train/ trains and attribution reads
                (the `model` of that fold's attribute.json, when present).
   cbp_nobias   `<output_dir>/<models-subdir>/<dataset>_<peak_type>_fold_<k>/models/chrombpnet_nobias.h5`
   cbp_bias     `.../models/bias_model_scaled.h5`, the scaled bias model that
@@ -213,7 +213,7 @@ def main(argv=None) -> int:
     ap.add_argument("--chrombpnet-configs", nargs="+", type=Path, required=True,
                     help="igvf_tf_chrombpnet config.yaml files, one per dataset")  # fmt: skip
     ap.add_argument("--cherimoya-root", type=Path, required=True,
-                    help="workflows/cherimoya/make_jobs.py's --out-root (<dataset>/fold_<k>/ under it)")  # fmt: skip
+                    help="workflows/train/make_jobs.py's --out-root (<dataset>/fold_<k>/ under it)")  # fmt: skip
     ap.add_argument("--folds-dir", type=Path, required=True, help="the folds/ directory ChromBPNet trained with")
     ap.add_argument("--genome", type=Path, required=True, help="the FASTA both models trained with (.fai beside it)")
     ap.add_argument("--models-subdir", default="full_models",

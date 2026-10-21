@@ -82,7 +82,7 @@ pytest.importorskip("tangermeme")
 pytest.importorskip("cherimoya")
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "workflows" / "cherimoya"))
+sys.path[:0] = [str(REPO / "workflows" / d) for d in ("train", "attribution", "downstream")]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cheri_dls  # noqa: E402
@@ -486,7 +486,7 @@ _D5_CHILD = textwrap.dedent(
     from pathlib import Path
 
     repo, out = Path(sys.argv[1]), sys.argv[2]
-    sys.path.insert(0, str(repo / "workflows" / "cherimoya"))
+    sys.path[:0] = [str(repo / "workflows" / d) for d in ("train", "attribution", "downstream")]
     sys.path.insert(0, str(repo / "tests"))
     import cheri_dls
     import dls_tiny

@@ -17,7 +17,9 @@ import pytest
 from scipy.spatial.distance import jensenshannon
 from scipy.stats import pearsonr, spearmanr
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "workflows" / "cherimoya"))
+sys.path[:0] = [
+    str(Path(__file__).resolve().parents[1] / "workflows" / d) for d in ("train", "attribution", "downstream")
+]
 
 import compare_chrombpnet as cc  # noqa: E402
 

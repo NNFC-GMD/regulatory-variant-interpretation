@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "workflows" / "variant_scoring"))
+sys.path[:0] = [str(HERE.parent / "workflows" / d) for d in ("variant_scoring", "nulls", "qtl")]
 
 import predict_cherimoya as pch  # noqa: E402  (numpy at import; torch only inside its functions)
 import predict_common as pc  # noqa: E402

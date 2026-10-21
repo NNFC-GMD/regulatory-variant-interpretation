@@ -22,8 +22,8 @@ import pytest
 np = pytest.importorskip("numpy")
 
 REPO = Path(__file__).resolve().parents[1]
-CHERIMOYA = REPO / "workflows" / "cherimoya"
-sys.path.insert(0, str(CHERIMOYA))
+WORKFLOWS = REPO / "workflows"
+sys.path[:0] = [str(WORKFLOWS / d) for d in ("train", "attribution", "downstream")]
 
 import attr_status as st  # noqa: E402
 
@@ -348,7 +348,7 @@ def test_the_command_line(tmp_path, capsys):
 
 def test_code_files_are_attribute_fast_pys():
     """The pin covers exactly the files attribute_fast.py records in its meta (read from its source, not imported)."""
-    tree = ast.parse((CHERIMOYA / "attribute_fast.py").read_text())
+    tree = ast.parse((WORKFLOWS / "attribution" / "attribute_fast.py").read_text())
     value = next(
         node.value
         for node in tree.body

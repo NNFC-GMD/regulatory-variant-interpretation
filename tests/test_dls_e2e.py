@@ -1,4 +1,4 @@
-"""The end-to-end driver workflows/cherimoya/dls_e2e.py on synthetic files (CPU only; no torch, no GPU).
+"""The end-to-end driver workflows/attribution/dls_e2e.py on synthetic files (CPU only; no torch, no GPU).
 
 E9's report rests on three pieces of dls_e2e.py, checked here:
 - prepare writes a stock and a fast JSON that differ only in their three output paths;
@@ -17,7 +17,9 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "workflows" / "cherimoya"))
+sys.path[:0] = [
+    str(Path(__file__).resolve().parents[1] / "workflows" / d) for d in ("train", "attribution", "downstream")
+]
 
 import dls_e2e  # noqa: E402
 

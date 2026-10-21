@@ -56,8 +56,8 @@ pytest.importorskip("cherimoya")
 pytest.importorskip("cherimoya_cli")
 pytest.importorskip("pyfaidx")
 
-WORKFLOWS = Path(__file__).resolve().parents[1] / "workflows" / "cherimoya"
-sys.path.insert(0, str(WORKFLOWS))
+ATTRIBUTION = Path(__file__).resolve().parents[1] / "workflows" / "attribution"
+sys.path.insert(0, str(ATTRIBUTION))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import attribute_fast  # noqa: E402
@@ -700,7 +700,7 @@ def test_the_numba_cache_is_exported_before_cherimoya_is_imported(tmp_path):
     code = textwrap.dedent(
         f"""
         import os, sys
-        sys.path.insert(0, {str(WORKFLOWS)!r})
+        sys.path.insert(0, {str(ATTRIBUTION)!r})
         import attribute_fast
         heavy = sorted(m for m in ("torch", "numba", "cherimoya", "tangermeme") if m in sys.modules)
         assert not heavy, heavy
@@ -726,7 +726,7 @@ def test_triton_autotune_caching_is_exported_before_cherimoya_is_imported(tmp_pa
     code = textwrap.dedent(
         f"""
         import os, sys
-        sys.path.insert(0, {str(WORKFLOWS)!r})
+        sys.path.insert(0, {str(ATTRIBUTION)!r})
         import attribute_fast
         print(os.environ.get("TRITON_CACHE_AUTOTUNING"))
         print(attribute_fast.TRITON_AUTOTUNE["set_by_attribute_fast"], attribute_fast.TRITON_AUTOTUNE["cherimoya_imported"])

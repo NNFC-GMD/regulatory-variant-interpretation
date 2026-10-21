@@ -27,8 +27,8 @@ pytest.importorskip("hdf5plugin")
 pytest.importorskip("yaml")
 
 TESTS = Path(__file__).resolve().parent
-CHERIMOYA = TESTS.parent / "workflows" / "cherimoya"
-sys.path.insert(0, str(CHERIMOYA))
+WORKFLOWS = TESTS.parent / "workflows"
+sys.path[:0] = [str(WORKFLOWS / d) for d in ("train", "attribution", "downstream")]
 sys.path.insert(0, str(TESTS))
 
 import attr_status as st  # noqa: E402
@@ -136,7 +136,7 @@ class Box:
         return path
 
     def command(self, *datasets: str) -> list[str]:
-        return ["bash", str(CHERIMOYA / "downstream.sh"), str(self.lists(*datasets))]
+        return ["bash", str(WORKFLOWS / "downstream" / "downstream.sh"), str(self.lists(*datasets))]
 
     def run(self, *datasets: str, timeout: float = 240, **env) -> subprocess.CompletedProcess:
         return subprocess.run(self.command(*datasets), env={**self.env, **env}, capture_output=True, text=True,
@@ -441,7 +441,9 @@ def test_bad_arguments_and_environment_are_refused(box, tmp_path):
     b = box()
     make_dataset(tmp_path, "ds", convert=False)
     assert b.run("ds", CHERI_08_MAX="0").returncode == 1
-    no_list = subprocess.run(["bash", str(CHERIMOYA / "downstream.sh")], env=b.env, capture_output=True, text=True)
+    no_list = subprocess.run(
+        ["bash", str(WORKFLOWS / "downstream" / "downstream.sh")], env=b.env, capture_output=True, text=True
+    )
     assert no_list.returncode == 2
     unknown = b.run("nope")
     assert unknown.returncode == 1 and "no " in unknown.stderr and "nope/config.yaml" in unknown.stderr

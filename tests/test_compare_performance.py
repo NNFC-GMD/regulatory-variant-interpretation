@@ -21,8 +21,8 @@ pytest.importorskip("matplotlib")
 TESTS = Path(__file__).resolve().parent
 sys.path[:0] = [
     str(TESTS),
-    str(TESTS.parent / "workflows" / "cherimoya"),
-    str(TESTS.parent / "workflows" / "cherimoya" / "compare"),
+    *(str(TESTS.parent / "workflows" / d) for d in ("train", "attribution", "downstream")),
+    str(TESTS.parent / "workflows" / "comparison"),
 ]
 
 import compare_performance as cp  # noqa: E402

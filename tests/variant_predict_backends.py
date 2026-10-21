@@ -30,7 +30,7 @@ import numpy as np
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "workflows" / "variant_scoring"))
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / "workflows" / d) for d in ("variant_scoring", "nulls", "qtl")]
 
 import predict_common as pc  # noqa: E402
 

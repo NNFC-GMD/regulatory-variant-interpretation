@@ -31,7 +31,9 @@ import pytest
 torch = pytest.importorskip("torch")
 ersatz = pytest.importorskip("tangermeme.ersatz")
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "workflows" / "cherimoya"))
+sys.path[:0] = [
+    str(Path(__file__).resolve().parents[1] / "workflows" / d) for d in ("train", "attribution", "downstream")
+]
 
 import dls_refs  # noqa: E402
 

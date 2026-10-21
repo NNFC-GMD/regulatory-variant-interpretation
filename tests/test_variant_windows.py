@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "workflows" / "variant_scoring"))
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / "workflows" / d) for d in ("variant_scoring", "nulls", "qtl")]
 
 import build_windows as bw  # noqa: E402
 

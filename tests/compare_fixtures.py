@@ -1,4 +1,4 @@
-"""Synthetic inputs for the comparison's tests (workflows/cherimoya/compare/): helpers, not tests.
+"""Synthetic inputs for the comparison's tests (workflows/comparison/): helpers, not tests.
 
 make_performance_root  a Cherimoya results root whose folds hold compare.tsv, compare_counts.npz and fit.time, as
                        compare_chrombpnet.py and run_task.sh leave them, with known differences between the models
@@ -18,9 +18,9 @@ import numpy as np
 
 TESTS = Path(__file__).resolve().parent
 REPO = TESTS.parent
-CHERIMOYA = REPO / "workflows" / "cherimoya"
-COMPARE = CHERIMOYA / "compare"
-for _p in (str(CHERIMOYA), str(COMPARE), str(TESTS)):
+WORKFLOWS = REPO / "workflows"
+COMPARE = WORKFLOWS / "comparison"
+for _p in (*(str(WORKFLOWS / d) for d in ("train", "attribution", "downstream")), str(COMPARE), str(TESTS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

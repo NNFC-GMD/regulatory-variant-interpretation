@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "workflows" / "variant_scoring"))
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / "workflows" / d) for d in ("variant_scoring", "nulls", "qtl")]
 
 import gnomad_list as gl  # noqa: E402
 

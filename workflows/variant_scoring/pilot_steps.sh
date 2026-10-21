@@ -178,6 +178,7 @@ repo_root="${PILOT_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd
 [[ -f "${repo_root}/workflows/variant_scoring/build_windows.py" ]] || {
     echo "ERROR: ${repo_root} holds no workflows/variant_scoring (set PILOT_REPO_ROOT)" >&2; exit 1; }
 vs="${repo_root}/workflows/variant_scoring"
+nulls_dir="${repo_root}/workflows/nulls"
 manifest="${PILOT_MANIFEST:-${PILOT_ROOT}/manifest.json}"
 steps=",${PILOT_STEPS:-1,2,3,4,5,6},"
 rvi_main="${RVI_MAIN:-$(git -C "${repo_root}" worktree list --porcelain 2>/dev/null | awk 'NR == 1 { print $2 }')}"
@@ -893,11 +894,11 @@ step_score() {
     if ! both_kinds; then
         say "analysis: not run: null_report.py compares Cherimoya with ChromBPNet, and PILOT_KINDS is ${kinds[*]}"
         record 6 analysis skipped - 0 "PILOT_KINDS=${kinds[*]}: null_report.py compares Cherimoya with ChromBPNet"
-    elif [[ ! -f "${vs}/null_report.py" ]]; then
-        say "analysis: no ${vs}/null_report.py"
-        record 6 analysis failed 1 0 "no ${vs}/null_report.py; gates nothing"
+    elif [[ ! -f "${nulls_dir}/null_report.py" ]]; then
+        say "analysis: no ${nulls_dir}/null_report.py"
+        record 6 analysis failed 1 0 "no ${nulls_dir}/null_report.py; gates nothing"
     else
-        run_logged score/analysis - "$(cpu_block 0 32)" 0 "${DEFAULT_PY}" "${vs}/null_report.py" \
+        run_logged score/analysis - "$(cpu_block 0 32)" 0 "${DEFAULT_PY}" "${nulls_dir}/null_report.py" \
             --root "${PILOT_ROOT}" --list "${list}" --datasets "${datasets[@]}" --variants "${variants_name}" \
             --nulls "${nulls[@]}" --out-dir "${PILOT_ROOT}/analysis"
         rc=$?

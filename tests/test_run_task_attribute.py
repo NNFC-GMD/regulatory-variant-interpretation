@@ -17,11 +17,11 @@ import pytest
 pytest.importorskip("numpy")
 
 TESTS = Path(__file__).resolve().parent
-sys.path.insert(0, str(TESTS.parent / "workflows" / "cherimoya"))
+sys.path[:0] = [str(TESTS.parent / "workflows" / d) for d in ("train", "attribution", "downstream")]
 sys.path.insert(0, str(TESTS))
 
 import attr_status as st  # noqa: E402
-from test_attr_status import CHERIMOYA, _engine, _fold, _refit  # noqa: E402
+from test_attr_status import WORKFLOWS, _engine, _fold, _refit  # noqa: E402
 
 FAKE_PIXI = """#!/bin/bash
 # pixi run --frozen --manifest-path M -e ENV cmd... -> cmd..., with python = the test's interpreter
@@ -76,7 +76,7 @@ def stage(tmp_path):
 
     def run(**extra):
         return subprocess.run(
-            ["bash", str(CHERIMOYA / "run_task.sh"), str(fold), "attribute"],
+            ["bash", str(WORKFLOWS / "train" / "run_task.sh"), str(fold), "attribute"],
             env={**env, **extra},
             capture_output=True,
             text=True,

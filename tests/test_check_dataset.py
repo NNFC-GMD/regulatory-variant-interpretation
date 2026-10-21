@@ -25,8 +25,8 @@ pytest.importorskip("hdf5plugin")
 pytest.importorskip("yaml")
 
 TESTS = Path(__file__).resolve().parent
-CHERIMOYA = TESTS.parent / "workflows" / "cherimoya"
-sys.path.insert(0, str(CHERIMOYA))
+WORKFLOWS = TESTS.parent / "workflows"
+sys.path[:0] = [str(WORKFLOWS / d) for d in ("train", "attribution", "downstream")]
 sys.path.insert(0, str(TESTS))
 
 import attr_status as st  # noqa: E402

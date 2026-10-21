@@ -7,8 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-CHERIMOYA = Path(__file__).resolve().parents[1] / "workflows" / "cherimoya"
-sys.path.insert(0, str(CHERIMOYA))
+WORKFLOWS = Path(__file__).resolve().parents[1] / "workflows"
+sys.path[:0] = [str(WORKFLOWS / d) for d in ("train", "attribution", "downstream")]
 
 import pick_cores as pc  # noqa: E402
 
@@ -66,7 +66,7 @@ def test_reservations_of_ended_steps_are_dropped(tmp_path):
 
 def test_the_command_line_reserves_what_it_picks(tmp_path):
     allowed = sorted(os.sched_getaffinity(0))
-    cmd = [sys.executable, str(CHERIMOYA / "pick_cores.py"), "1", "--sample", "0.01",
+    cmd = [sys.executable, str(WORKFLOWS / "downstream" / "pick_cores.py"), "1", "--sample", "0.01",
            "--reserve", str(tmp_path), "--owner", str(os.getpid())]  # fmt: skip
     first = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
     assert int(first) in allowed

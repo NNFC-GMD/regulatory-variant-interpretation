@@ -96,7 +96,9 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("tangermeme")
 pytest.importorskip("cherimoya")
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "workflows" / "cherimoya"))
+sys.path[:0] = [
+    str(Path(__file__).resolve().parents[1] / "workflows" / d) for d in ("train", "attribution", "downstream")
+]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cheri_dls  # noqa: E402

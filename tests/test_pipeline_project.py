@@ -191,7 +191,7 @@ def test_fetch_one_keeps_a_file_in_place_and_refuses_a_wrong_md5(tmp_path, monke
 
 
 def test_main_links_a_local_bgzf_file_and_writes_the_manifest(tmp_path, monkeypatch):
-    path = _yaml(tmp_path, samples=[{"stem": "b", "fragments": str(tmp_path / "b.fragments.tsv.gz")}])
+    path = _yaml(tmp_path, samples=[{"stem": "b", "fragments": str(tmp_path / "b.fragments.tsv.gz")}], cooperativity={})
     _bgzf(tmp_path / "b.fragments.tsv.gz")
     assert fi.main([str(path)]) == 0
     link = tmp_path / "root" / "fragments" / "b.fragments.tsv.gz"

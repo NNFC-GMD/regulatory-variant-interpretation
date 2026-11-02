@@ -113,6 +113,7 @@ def test_combine_ours_finds_the_switch(tmp_path):
 
 def test_combine_official_is_the_package_on_our_tables(tmp_path):
     pytest.importorskip("deepISA.score.aggregate_isa")
+    import combine
     from deepISA.score import aggregate_isa as dag
 
     w = _world(tmp_path)
@@ -128,14 +129,15 @@ def test_combine_official_is_the_package_on_our_tables(tmp_path):
     single = pd.read_csv(off / "ds_1" / "motif_single_isa.csv")
     single.to_csv(direct / "single.csv", index=False)
     combi.drop(columns=["interaction_t0"]).to_csv(direct / "combi.csv", index=False)
-    dag.calc_interaction(str(direct / "combi.csv"), tracks=[0], isa_thresh_quantile=0.1,
-                         single_isa_path=str(direct / "single.csv"), normalize=False)  # fmt: skip
-    for level, name in (("tf_pair", "coop_tf_pair_t0.csv"), ("tf", "coop_tf_t0.csv")):
-        want = dag.calc_coop_score(str(direct / "combi.csv"), str(direct / name), level=level, min_count=10,
-                                   q_val_thresh=0.1)  # fmt: skip
-        got = pd.read_csv(off / "ds_1" / name)
-        pd.testing.assert_frame_equal(got, pd.read_csv(direct / name), check_exact=False, rtol=1e-6)
-        assert len(want) == len(got)
+    with combine._object_strings():  # as combine.py runs the package (written for pandas 2)
+        dag.calc_interaction(str(direct / "combi.csv"), tracks=[0], isa_thresh_quantile=0.1,
+                             single_isa_path=str(direct / "single.csv"), normalize=False)  # fmt: skip
+        for level, name in (("tf_pair", "coop_tf_pair_t0.csv"), ("tf", "coop_tf_t0.csv")):
+            want = dag.calc_coop_score(str(direct / "combi.csv"), str(direct / name), level=level, min_count=10,
+                                       q_val_thresh=0.1)  # fmt: skip
+            got = pd.read_csv(off / "ds_1" / name)
+            pd.testing.assert_frame_equal(got, pd.read_csv(direct / name), check_exact=False, rtol=1e-6)
+            assert len(want) == len(got) > 0
     # A + B's interactions are all positive in ds_1 and negative in ds_2: coop +1 and -1, a change of -2
     ch = pd.read_csv(off / "changes_pairs.tsv", sep="\t").set_index("pair")
     ab = ch.loc["A + B"]

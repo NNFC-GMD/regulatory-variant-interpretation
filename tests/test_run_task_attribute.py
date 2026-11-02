@@ -198,7 +198,8 @@ def test_the_cherimoya_engine_needs_no_pin_and_writes_the_stock_record(stage, tm
     assert (fold / "attribute.log").exists() and (fold / "attribute.time").read_text().count("\t") == 1
     r = run(CHERI_ATTR_ENGINE="cherimoya")
     assert r.returncode == 0 and "attribute done, skipped" in r.stdout
-    assert log.read_text().count("cherimoya attribute -p") == 1
+    fake_runs = [line for line in log.read_text().splitlines() if line.startswith("cherimoya attribute")]
+    assert len(fake_runs) == 1  # the rerun ran nothing
 
 
 def test_the_cherimoya_engine_records_a_fallback_and_refuses_non_finite_scores(stage, tmp_path):

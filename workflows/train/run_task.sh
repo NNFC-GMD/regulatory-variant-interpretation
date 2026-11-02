@@ -14,29 +14,46 @@
 #            ChromBPNet's measures on ChromBPNet's test peaks for the fold. It
 #            needs ChromBPNet's full model for that fold; until it exists the
 #            stage exits 3 ("waiting"), not 1, and a later run picks it up.
-#   attribute  attribute_fast.py -p attribute.json (make_downstream.py):
-#            DeepLIFT/SHAP on the counts head over every peak, computed by
-#            cheri_dls and audited against the stock deep_lift_shap. Run only
-#            when asked for (not part of `all`). It waits (exit 3) until the fit
-#            is done, and skips a fold attr_status.py calls DONE. Before a run
-#            it checks that the engine's files hash to the pin
-#            (attr_status.py --write-pin), and removes the fold's earlier
-#            attribution files. A failed audit (attribute_fast.py's exit 3)
-#            exits 1 and keeps the outputs for inspection; a later run leaves
-#            such a fold alone unless CHERI_ATTR_RERUN_FAILED=1. The outputs
-#            are named by attribute.json, outside cherimoya.fold_<k>.*, so a
-#            refit does not delete them: the refit makes them stale instead.
+#   attribute  DeepLIFT/SHAP on the counts head over every peak, by the
+#            engine CHERI_ATTR_ENGINE names, from attribute.json
+#            (make_downstream.py --engine, which must match):
+#              rvi        attribute_fast.py -p attribute.json: computed by
+#                         cheri_dls and audited against the stock
+#                         deep_lift_shap, in the cherimoya-030 env (the engine
+#                         refuses other Cherimoya/tangermeme versions). Before a
+#                         run it checks that the engine's files hash to the pin
+#                         (attr_status.py --write-pin). A failed audit
+#                         (attribute_fast.py's exit 3) exits 1 and keeps the
+#                         outputs for inspection.
+#              cherimoya  `cherimoya attribute -p attribute.json` (Cherimoya
+#                         >= 0.3.1, whose fast path is this repo's engine
+#                         upstream), then stock_record.py writes the fold's
+#                         <attr>.stock.json, the record attr_status.py's DONE
+#                         rule reads for a stock run. No pin: the code is the
+#                         installed package, recorded in the record's versions.
+#            Run only when asked for (not part of `all`). It waits (exit 3)
+#            until the fit is done, skips a fold attr_status.py calls DONE, and
+#            removes the fold's earlier attribution files before a run. A later
+#            run leaves a failed fold alone unless CHERI_ATTR_RERUN_FAILED=1.
+#            The outputs are named by attribute.json, outside
+#            cherimoya.fold_<k>.*, so a refit does not delete them: the refit
+#            makes them stale instead.
 #   A fold directory another run is working on is skipped with exit 4.
 #
 # Knobs (environment):
-#   CHERI_PIXI_MANIFEST   the pixi.toml whose cherimoya env runs everything
+#   CHERI_PIXI_MANIFEST   the pixi.toml whose environments run everything
 #                         (default: this checkout's; a worktree without
 #                         installed environments points it at the main checkout)
-#   CHERI_ATTRIBUTE_FAST  attribute_fast.py to run (default: this checkout's);
+#   CHERI_PIXI_ENV        the environment of fit and compare (default cherimoya)
+#   CHERI_ATTR_ENGINE     rvi (default: attribute_fast.py) or cherimoya
+#                         (`cherimoya attribute`)
+#   CHERI_ATTR_PIXI_ENV   the environment of the attribute stage (default
+#                         cherimoya-030 for rvi, CHERI_PIXI_ENV for cherimoya)
+#   CHERI_ATTRIBUTE_FAST  rvi: attribute_fast.py to run (default: this checkout's);
 #                         its directory's cheri_dls.py and dls_refs.py are what
 #                         the pin is checked against
-#   CHERI_ATTR_ARGS       extra attribute_fast.py flags, e.g. "--seqs-per-step 4"
-#   CHERI_ATTR_PIN        the engine pin (default: <workdir>/../../attribution_engine.json)
+#   CHERI_ATTR_ARGS       rvi: extra attribute_fast.py flags, e.g. "--seqs-per-step 4"
+#   CHERI_ATTR_PIN        rvi: the engine pin (default: <workdir>/../../attribution_engine.json)
 #   CHERI_ATTR_RERUN_FAILED  1: rerun a fold whose earlier attribution failed
 #
 # Input:  <workdir>/fit.json, <workdir>/compare.json (make_jobs.py);
@@ -44,14 +61,16 @@
 # Output: <workdir>/cherimoya.fold_<k>.{torch,final.torch,log,detailed.log},
 #         cherimoya.fold_<k>.{validation,test}.performance.tsv and .evaluate.json,
 #         compare.tsv, compare_counts.npz; the files attribute.json names and
-#         attribute_fast.py's sidecars; fit.time / compare.time / attribute.time
+#         attribute_fast.py's sidecars (rvi) or the stock record and
+#         attribute.log (cherimoya); fit.time / compare.time / attribute.time
 #         (wall s, max RSS kB)
 # Usage:  bash workflows/train/run_task.sh <workdir> [fit|compare|attribute|all]
 #         (default all = fit,compare; stages combine, e.g. fit,attribute)
 #         with CUDA_VISIBLE_DEVICES set to the GPU to use. run_box.sh calls it.
-# Prerequisites: `pixi install -e cherimoya` (here, or in CHERI_PIXI_MANIFEST's
-#         checkout); the ChromBPNet pipeline's 00.0, 00.1 and 01.0 outputs for
-#         the dataset (04.0 for compare).
+# Prerequisites: `pixi install -e cherimoya` (and -e cherimoya-030 for the rvi
+#         engine), here or in CHERI_PIXI_MANIFEST's checkout; the ChromBPNet
+#         pipeline's 00.0, 00.1 and 01.0 outputs for the dataset (04.0 for
+#         compare).
 
 set -uo pipefail
 
@@ -70,7 +89,16 @@ flock -n 9 || { echo "[$(date)] ${workdir}: another run holds it, skipped"; exit
 fold="${workdir%/}"
 fold="${fold##*/fold_}"
 name="cherimoya.fold_${fold}"
-pixi_run=( pixi run --frozen --manifest-path "${CHERI_PIXI_MANIFEST:-${repo_root}/pixi.toml}" -e cherimoya )
+manifest="${CHERI_PIXI_MANIFEST:-${repo_root}/pixi.toml}"
+pixi_env="${CHERI_PIXI_ENV:-cherimoya}"
+pixi_run=( pixi run --frozen --manifest-path "${manifest}" -e "${pixi_env}" )
+attr_engine="${CHERI_ATTR_ENGINE:-rvi}"
+case "${attr_engine}" in
+    rvi) attr_env="${CHERI_ATTR_PIXI_ENV:-cherimoya-030}" ;;
+    cherimoya) attr_env="${CHERI_ATTR_PIXI_ENV:-${pixi_env}}" ;;
+    *) echo "ERROR: CHERI_ATTR_ENGINE is ${attr_engine}, not rvi or cherimoya" >&2; exit 1 ;;
+esac
+pixi_attr=( pixi run --frozen --manifest-path "${manifest}" -e "${attr_env}" )
 
 # Compiles and caches on the node, never on the shared filesystem: inductor's
 # max-autotune benchmarks kernels in temp files and keeps an FX/Triton cache.
@@ -152,29 +180,47 @@ if [[ ",${stages}," == *",attribute,"* ]]; then
         echo "ERROR: ${workdir}: attr_status.py --check gave no state" >&2
         exit 1
     else
-        if ! "${attr_status[@]}" --check-engine "$(dirname "${attribute_fast}")"; then
+        if [[ "${attr_engine}" == rvi ]] && ! "${attr_status[@]}" --check-engine "$(dirname "${attribute_fast}")"; then
             echo "ERROR: ${workdir}: refusing to attribute with an engine other than the pinned one" >&2
             exit 1
         fi
         mapfile -t attr_files < <("${attr_status[@]}" --files .)
         (( ${#attr_files[@]} > 0 )) || { echo "ERROR: ${workdir}: attr_status.py --files listed nothing" >&2; exit 1; }
-        echo "[$(date)] ${workdir}: attribute (${state}: $(cut -f4 <<< "${state_line}")) on GPU ${CUDA_VISIBLE_DEVICES:-?}"
-        rm -f -- "${attr_files[@]}" attribute.time
+        echo "[$(date)] ${workdir}: attribute (${state}: $(cut -f4 <<< "${state_line}")) with ${attr_engine}" \
+             "on GPU ${CUDA_VISIBLE_DEVICES:-?}"
+        rm -f -- "${attr_files[@]}" attribute.time attribute.log
         for f in "${attr_files[@]}"; do mkdir -p "$(dirname "${f}")"; done
-        read -r -a attr_args <<< "${CHERI_ATTR_ARGS:-}"
-        # One compile thread: the process and its 3 reference workers are the 4 a slot has.
-        TORCHINDUCTOR_COMPILE_THREADS=1 timed attribute "${pixi_run[@]}" python "${attribute_fast}" \
-            -p attribute.json ${attr_args[@]+"${attr_args[@]}"}
-        rc=$?
-        if (( rc == 3 )); then
-            echo "ERROR: ${workdir}: attribute_fast.py's audit failed; the outputs are kept for inspection" >&2
-            exit 1
-        elif (( rc != 0 )); then
-            echo "ERROR: ${workdir}: attribute_fast.py failed (exit ${rc})" >&2
-            exit 1
+        if [[ "${attr_engine}" == rvi ]]; then
+            read -r -a attr_args <<< "${CHERI_ATTR_ARGS:-}"
+            # One compile thread: the process and its 3 reference workers are the 4 a slot has.
+            TORCHINDUCTOR_COMPILE_THREADS=1 timed attribute "${pixi_attr[@]}" python "${attribute_fast}" \
+                -p attribute.json ${attr_args[@]+"${attr_args[@]}"}
+            rc=$?
+            if (( rc == 3 )); then
+                echo "ERROR: ${workdir}: attribute_fast.py's audit failed; the outputs are kept for inspection" >&2
+                exit 1
+            elif (( rc != 0 )); then
+                echo "ERROR: ${workdir}: attribute_fast.py failed (exit ${rc})" >&2
+                exit 1
+            fi
+        else
+            # The log is kept: stock_record.py reads whether the fast path ran or fell back.
+            timed attribute "${pixi_attr[@]}" cherimoya attribute -p attribute.json > attribute.log 2>&1
+            rc=$?
+            cat attribute.log
+            if (( rc != 0 )); then
+                echo "ERROR: ${workdir}: cherimoya attribute failed (exit ${rc})" >&2
+                exit 1
+            fi
+            if ! "${pixi_attr[@]}" python "${repo_root}/workflows/attribution/stock_record.py" \
+                    --fold . --log attribute.log --exit "${rc}"; then
+                echo "ERROR: ${workdir}: stock_record.py refused the attribution" >&2
+                exit 1
+            fi
         fi
         if ! state_line="$("${attr_status[@]}" --check .)"; then
-            echo "ERROR: ${workdir}: attribute_fast.py exited 0 but the fold is not DONE: $(cut -f3- <<< "${state_line}")" >&2
+            echo "ERROR: ${workdir}: the ${attr_engine} attribution exited 0 but the fold is not DONE:" \
+                 "$(cut -f3- <<< "${state_line}")" >&2
             exit 1
         fi
         echo "[$(date)] ${workdir}: attribute done"

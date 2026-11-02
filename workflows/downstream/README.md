@@ -3,26 +3,41 @@
 After training, every fold goes through the steps igvf_tf_chrombpnet runs
 after ChromBPNet's: DeepLIFT/SHAP on the counts head over every peak, the
 fold average (06.0), the bigwig (07.0), TF-MoDISco (08.0), the cross-dataset
-compendium (09.0), Fi-NeMo (10.0) and its report (11.0). The attributions come
-from `attribute_fast.py` (`cherimoya attribute` computed by `cheri_dls`, each
-run audited against the stock `deep_lift_shap` on 8 peaks); 06.0-11.0 are
-igvf_tf_chrombpnet's own step files, run on the attributions converted to
-its 05.0 layout.
+compendium (09.0), Fi-NeMo (10.0) and its report (11.0). 06.0-11.0 are
+igvf_tf_chrombpnet's own step files, run on the attributions converted to its
+05.0 layout. The attributions come from one of two engines, chosen by
+`make_downstream.py --engine` and run by `run_task.sh` with the same
+`CHERI_ATTR_ENGINE`:
+
+- `cherimoya` (new projects): `cherimoya attribute`, Cherimoya 0.3.1's fast
+  DeepLIFT/SHAP path (this repository's engine, moved upstream). It checks
+  itself against tangermeme's `deep_lift_shap` on its first sequences and falls
+  back to it when they disagree; `../attribution/stock_record.py` records
+  which path ran. Runs in the `cherimoya` environment.
+- `rvi` (the default; the AMSC campaign): `attribute_fast.py`, computed by
+  `cheri_dls` and each run audited against the stock `deep_lift_shap` on 8
+  peaks. Runs in the `cherimoya-030` environment, since it refuses other
+  Cherimoya and tangermeme versions, and needs the engine pin.
+
+`../pipeline/` runs all of this for a project, with the `cherimoya` engine
+(`docs/pipeline.md`).
 
 ```bash
 # once: each fold's attribute.json, each dataset's igvf config, the compendium lists
 python workflows/downstream/make_downstream.py \
     --cheri-root <out-root> \
     --chrombpnet-configs <chrombpnet configs>/*/config.yaml \
-    --shared <datasets compared with ChromBPNet, one per line> \
-    --compendia <compendia root>
-
-# sign the engine off once (after a full fold is checked): the sha256 of its three files
-python workflows/attribution/attr_status.py --write-pin workflows/attribution --root <out-root>
+    --shared <datasets compared with ChromBPNet, one per line; may be empty> \
+    --compendia <compendia root> \
+    --engine cherimoya            # or rvi (the default): see above
 
 # attribute every trained fold; repeat passes until every fold is done or failed
-CHERI_ROOT=<out-root> CHERI_STAGES=attribute CHERI_SLOTS_PER_GPU=1 CHERI_CORES_PER_SLOT=4 \
+CHERI_ROOT=<out-root> CHERI_STAGES=attribute CHERI_ATTR_ENGINE=cherimoya \
+    CHERI_SLOTS_PER_GPU=4 CHERI_CORES_PER_SLOT=4 \
     srun --jobid <job> --overlap bash workflows/train/run_box.sh
+
+# with the rvi engine instead: sign it off once (after a full fold is checked), then CHERI_ATTR_ENGINE=rvi
+python workflows/attribution/attr_status.py --write-pin workflows/attribution --root <out-root>
 python workflows/attribution/attr_status.py --root <out-root> --summary [--settled]
 ```
 
@@ -45,10 +60,14 @@ What `make_downstream.py` writes, per fold, in `<out-root>/<dataset>/fold_<k>/at
   `cherimoya attribute` rerun of the JSON must set `batch_size` 20: stock at 64
   needs about 15.5 GB of GPU memory;
 - the outputs `attr.ohe.npz`, `attr.attr.npz` and `attr.idx.npy` in the fold
-  directory, plus attribute_fast.py's `attr.attr.deltas.npy` and
-  `attr.attr.meta.json`;
-- the `fast` block: reference precision, `mem_budget_gb` 7.5 (about 7 GB of GPU
-  memory), 3 reference workers (4 cores per process), audit 8.
+  directory, plus, with the rvi engine, attribute_fast.py's
+  `attr.attr.deltas.npy` and `attr.attr.meta.json`, and with the cherimoya
+  engine, `stock_record.py`'s `attr.attr.stock.json`;
+- `fast`: with `--engine cherimoya`, `true` (0.3.1 refuses anything but a
+  bool); with `--engine rvi`, attribute_fast.py's block: reference precision,
+  `mem_budget_gb` 7.5 (about 7 GB of GPU memory), 3 reference workers (4 cores
+  per process), audit 8. `output` stays `counts` for both: 0.3.1 reads it as
+  `logcounts` with a FutureWarning, and the converted files are named by it.
 
 It also writes `<out-root>/configs/<dataset>/config.yaml`, the minimal igvf
 config for 06.0-11.0 (`output_dir` `<out-root>/<dataset>/downstream`, counts
@@ -57,14 +76,25 @@ lists and the `label<TAB>config.yaml` lists of each compendium (`cbp_` and
 `cheri_` labels).
 
 `run_task.sh <fold> attribute` (not part of `all`) waits (exit 3) until the
-fit is done, skips a fold `attr_status.py` calls DONE, refuses an engine whose
-files do not hash to the pin, clears the fold's earlier attribution files and
-runs `attribute_fast.py`. A failed audit exits 1 and keeps the outputs; later
-runs leave that fold alone unless `CHERI_ATTR_RERUN_FAILED=1`. From a worktree
-without installed environments, set `CHERI_PIXI_MANIFEST` to the main
-checkout's `pixi.toml`; `CHERI_ATTRIBUTE_FAST` names the engine to run and
-`CHERI_ATTR_ARGS` adds flags (e.g. `--seqs-per-step 4` for a second process on
-a GPU).
+fit is done, skips a fold `attr_status.py` calls DONE, clears the fold's
+earlier attribution files, and runs the engine `CHERI_ATTR_ENGINE` names:
+
+- `cherimoya`: `cherimoya attribute -p attribute.json`, its output kept in
+  the fold's `attribute.log`, then `stock_record.py --fold . --log
+  attribute.log --exit <status>`. That writes `attr.attr.stock.json`: the
+  attribute.json as written, the package versions, and `fast_path` (false when
+  the log has Cherimoya's fallback warning). It refuses non-finite
+  attributions. No pin is needed.
+- `rvi`: it refuses an engine whose files do not hash to the pin, then runs
+  `attribute_fast.py`. A failed audit exits 1 and keeps the outputs; later runs
+  leave that fold alone unless `CHERI_ATTR_RERUN_FAILED=1`.
+  `CHERI_ATTRIBUTE_FAST` names the engine to run and `CHERI_ATTR_ARGS` adds
+  flags (e.g. `--seqs-per-step 4` for a second process on a GPU).
+
+The attribute stage runs in `CHERI_ATTR_PIXI_ENV` (default `cherimoya-030`
+for rvi, `CHERI_PIXI_ENV`, itself `cherimoya` by default, for cherimoya). From
+a worktree without installed environments, set `CHERI_PIXI_MANIFEST` to the
+main checkout's `pixi.toml`.
 
 `attr_status.py` is the one definition of DONE: the four outputs and the meta,
 the meta newer than the model (a refit makes the attribution stale), a passed
@@ -72,7 +102,9 @@ audit, finite outputs of shape (kept, 4, W) that agree with the idx mask, one
 mask entry per peak, the parameters and seeds of `attribute.json`, and the
 engine's sha256 equal to the pin `<out-root>/attribution_engine.json`. States:
 done, running, waiting, stale, failed, missing. A fold attributed by the stock
-command instead is accepted through `attr.attr.stock.json` (see its doc).
+command instead (the cherimoya engine, or a stock rerun after a failed audit)
+is accepted through `attr.attr.stock.json`, which `stock_record.py` writes (see
+both docs).
 
 `to_chrombpnet_scores.py` converts a DONE fold for 06.0-11.0. Run it in the
 cherimoya environment, inside a box, under the fold's lock

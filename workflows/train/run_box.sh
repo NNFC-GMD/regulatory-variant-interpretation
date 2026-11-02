@@ -163,10 +163,12 @@ sampler &
 sampler_pid=$!
 trap 'kill "${sampler_pid}" 2>/dev/null; rm -rf "${scratch}"' EXIT
 
+# Workers start slot by slot across the GPUs (the first slot of every GPU, then the second, ...), so a queue
+# shorter than the slots spreads over every GPU instead of filling the first ones.
 pids=()
 slot=0
-for gpu in "${gpus[@]}"; do
-    for (( s = 0; s < slots_per_gpu; s++ )); do
+for (( s = 0; s < slots_per_gpu; s++ )); do
+    for gpu in "${gpus[@]}"; do
         first=$(( core_offset + slot * cores_per_slot ))
         worker "${gpu}" "$(IFS=,; echo "${allowed[*]:${first}:${cores_per_slot}}")" &
         pids+=( $! )

@@ -1,7 +1,8 @@
-"""run_task.sh's attribute stage (CPU only), with a fake `pixi` and a fake attribute_fast.py.
+"""run_task.sh's attribute stage (CPU only), with a fake `pixi`, a fake attribute_fast.py and a fake `cherimoya`.
 
-The fake engine writes the files the real one writes (test_attr_status._write_outputs), so the stage's waiting,
-skipping, refusing, cleaning and exit codes are checked without a GPU.
+The fake engine writes the files the real one writes (test_attr_status._write_outputs), and the fake `cherimoya
+attribute` the three the stock command writes, so the stage's waiting, skipping, refusing, cleaning and exit codes
+are checked without a GPU, for both engines (CHERI_ATTR_ENGINE=rvi|cherimoya).
 """
 
 from __future__ import annotations
@@ -47,6 +48,34 @@ t._write_outputs(params, Path(__file__).parent, meta_extra={"audit": {"pass": no
 sys.exit(3 if fail else 0)
 """
 
+FAKE_CHERIMOYA = """#!/bin/bash
+# cherimoya attribute -p attribute.json: the stock command's three files (stock_record.py writes the record)
+exec "${FAKE_PYTHON}" - "$@" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["FAKE_TESTS"])
+import numpy as np
+from pathlib import Path
+import test_attr_status as t
+assert sys.argv[1] == "attribute", sys.argv
+params = json.loads(Path(sys.argv[sys.argv.index("-p") + 1]).read_text())
+with open(os.environ["FAKE_LOG"], "a") as fh:
+    fh.write("cherimoya " + " ".join(sys.argv[1:]) + "\\n")
+idx = np.ones(t.N_ROWS, dtype=bool)
+idx[list(t.DROPPED)] = False
+attr = np.ones((t.KEPT, 4, t.W), np.float32)
+if os.environ.get("FAKE_NAN") == "1":
+    attr[0, 0, 0] = np.nan
+np.savez_compressed(params["ohe_filename"], np.zeros((t.KEPT, 4, t.W), np.int8))
+np.savez_compressed(params["attr_filename"], attr)
+np.save(params["idx_filename"], idx)
+if os.environ.get("FAKE_FALLBACK") == "1":
+    print("x.py:1: RuntimeWarning: deep_lift_shap is using the default path because the fast path disagreed "
+          "with tangermeme's on the first sequences. Pass fast=False to skip the fast path.", file=sys.stderr)
+print("x.py:2: RuntimeWarning: 1 convergence deltas above 0.001", file=sys.stderr)
+sys.exit(int(os.environ.get("FAKE_EXIT", "0")))
+PY
+"""
+
 
 @pytest.fixture
 def stage(tmp_path):
@@ -58,8 +87,9 @@ def stage(tmp_path):
     (engine / "attribute_fast.py").write_text(FAKE_ENGINE)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "pixi").write_text(FAKE_PIXI)
-    (bin_dir / "pixi").chmod(0o755)
+    for name, text in (("pixi", FAKE_PIXI), ("cherimoya", FAKE_CHERIMOYA)):
+        (bin_dir / name).write_text(text)
+        (bin_dir / name).chmod(0o755)
     log = tmp_path / "calls.log"
     env = dict(
         os.environ,
@@ -72,7 +102,8 @@ def stage(tmp_path):
         CUDA_VISIBLE_DEVICES="",
         TMPDIR=str(tmp_path / "tmp"),
     )
-    env.pop("CHERI_ATTR_ARGS", None)
+    for knob in ("CHERI_ATTR_ARGS", "CHERI_ATTR_ENGINE", "CHERI_PIXI_ENV", "CHERI_ATTR_PIXI_ENV"):
+        env.pop(knob, None)
 
     def run(**extra):
         return subprocess.run(
@@ -106,6 +137,9 @@ def test_stage_runs_skips_and_keeps_a_failed_audit(stage, tmp_path):
     assert "attribute done" in r.stdout and st.check_fold(fold) == ("done", [])
     engine_calls = [line for line in log.read_text().splitlines() if line.startswith("engine ")]
     assert engine_calls == ["engine -p attribute.json --seqs-per-step 4 --audit 8 threads=1"]
+    # the engine refuses Cherimoya 0.3.1, so it runs in the env that keeps 0.3.0; the status checks do not
+    assert "-e cherimoya-030 python " + str(tmp_path / "engine" / "attribute_fast.py") in log.read_text()
+    assert "-e cherimoya python " in log.read_text()
     assert (fold / "attribute.time").read_text().count("\t") == 1
     r = run()
     assert r.returncode == 0 and "attribute done, skipped" in r.stdout
@@ -136,3 +170,56 @@ def test_stage_refuses_an_engine_that_differs_from_the_pin(stage, tmp_path):
     assert st.write_pin(other, tmp_path / "root" / st.PIN_NAME)[0] == "written"
     r = run()
     assert r.returncode == 1 and "attribute_fast.py in" in r.stderr and not Path(params["idx_filename"]).exists()
+
+
+def _stock_record(params: dict) -> dict:
+    import json
+
+    return json.loads(st.fold_files(params)["stock"].read_text())
+
+
+def test_the_cherimoya_engine_needs_no_pin_and_writes_the_stock_record(stage, tmp_path):
+    run, fold, params, log = stage  # the fixture's fold has no pin: the rvi engine would refuse it
+    r = run(CHERI_ATTR_ENGINE="cherimoya")
+    assert r.returncode == 0, r.stderr
+    assert "with cherimoya" in r.stdout and "attribute done" in r.stdout and "(fast path;" in r.stdout
+    assert st.check_fold(fold) == ("done", [])
+    record = _stock_record(params)
+    assert (record["engine"], record["tool"], record["exit"], record["attr_finite"]) == (
+        "stock",
+        "cherimoya attribute",
+        0,
+        True,
+    )
+    assert record["fast_path"] is True and record["fallback"] is None and record["convergence_warnings"] == 1
+    assert record["parameters"] == __import__("json").loads((fold / "attribute.json").read_text())
+    calls = log.read_text()
+    assert "-e cherimoya cherimoya attribute -p attribute.json" in calls and "cherimoya-030" not in calls
+    assert (fold / "attribute.log").exists() and (fold / "attribute.time").read_text().count("\t") == 1
+    r = run(CHERI_ATTR_ENGINE="cherimoya")
+    assert r.returncode == 0 and "attribute done, skipped" in r.stdout
+    assert log.read_text().count("cherimoya attribute -p") == 1
+
+
+def test_the_cherimoya_engine_records_a_fallback_and_refuses_non_finite_scores(stage, tmp_path):
+    run, fold, params, log = stage
+    r = run(CHERI_ATTR_ENGINE="cherimoya", FAKE_FALLBACK="1")
+    assert r.returncode == 0, r.stderr
+    assert "FELL BACK to tangermeme's path" in r.stdout and st.check_fold(fold)[0] == "done"
+    record = _stock_record(params)
+    assert record["fast_path"] is False and "disagreed with tangermeme's" in record["fallback"]
+
+    _refit(params)
+    r = run(CHERI_ATTR_ENGINE="cherimoya", FAKE_NAN="1")
+    assert r.returncode == 1 and "non-finite attributions" in r.stderr and "stock_record.py refused" in r.stderr
+    assert not st.fold_files(params)["stock"].exists() and st.check_fold(fold)[0] == "missing"
+
+    r = run(CHERI_ATTR_ENGINE="cherimoya", FAKE_EXIT="2")
+    assert r.returncode == 1 and "cherimoya attribute failed (exit 2)" in r.stderr
+    assert not st.fold_files(params)["stock"].exists()
+
+
+def test_an_unknown_engine_is_refused(stage):
+    run, fold, params, log = stage
+    r = run(CHERI_ATTR_ENGINE="other")
+    assert r.returncode == 1 and "CHERI_ATTR_ENGINE is other, not rvi or cherimoya" in r.stderr

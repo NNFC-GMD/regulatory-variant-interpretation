@@ -160,6 +160,7 @@ def test_paired_same_sites_under_every_model(tmp_path):
     assert summary["comparisons"]["m0_m2"]["pairs_open"] == summary["pairs"] - 2 * 10
     assert summary["comparisons"]["m0_m1"]["pairs_open"] == summary["pairs"]  # m2's closed windows do not matter
     ch = pd.read_csv(out / "changes_pairs.tsv", sep="\t")
+    assert not [c for c in ch.columns if c.endswith(("_x", "_y", "_di"))]  # one mean_i_a, mean_i_b
     ab = ch[(ch["comparison"] == "m0_m2") & (ch["pair"] == "A + B")].iloc[0]
     cd = ch[(ch["comparison"] == "m0_m2") & (ch["pair"] == "C + D")].iloc[0]
     assert ab["delta_i"] > 0.3 and ab["delta_i_significant"] and ab["delta_i_robust"] and ab["delta_i_folds_agree"] == 5

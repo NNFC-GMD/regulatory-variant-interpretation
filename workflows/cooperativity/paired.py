@@ -229,7 +229,14 @@ def main(argv: list[str] | None = None) -> int:
             base = ident[mask].reset_index(drop=True)
             syn = cb.changes(sub, groups, [(name, ga, gb)], key, t, args.n_boot, args.min_n, fdr=args.fdr, units=units)
             di = delta_i(sub, base, groups[ga], groups[gb], key, units, args)
-            m = di if syn is None else syn.merge(di, on=key, how="outer")
+            if syn is None:
+                m = di
+            else:
+                # Both give each group's mean i (every pair once per model, so pooling the group's tables or averaging
+                # its models is the same mean): one column each.
+                m = syn.merge(di, on=key, how="outer", suffixes=("", "_di"))
+                for c in ("mean_i_a", "mean_i_b"):
+                    m[c] = m[c].fillna(m.pop(f"{c}_di"))
             for c, v in (("comparison", name), ("group_a", ga), ("group_b", gb)):
                 m[c] = v
             rows.append(m)

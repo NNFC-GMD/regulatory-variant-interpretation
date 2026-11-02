@@ -38,8 +38,9 @@ busy="$(squeue -u "${USER}" -h -o '%i %j %T' 2> /dev/null)"
 [[ -z "${busy}" ]] || die "a box is already running or pending (one at a time): ${busy}"
 
 mkdir -p "${PROJECT_BOX}"
+# No --export: on DCAI it gets the job cancelled by root as it starts (docs/cluster.md). The checkout goes as an argument.
 out="$(sbatch --parsable --chdir "${PROJECT_BOX}" --output "${PROJECT_BOX}/slurm_%j.log" \
-    --export "ALL,RVI_ROOT=${repo_root}" "${here}/run_project.sbatch" "${project_file}" "$@")" || die "sbatch failed"
+    "${here}/run_project.sbatch" "${repo_root}" "${project_file}" "$@")" || die "sbatch failed"
 job="${out%%;*}"
 log "submitted job ${job} for ${PROJECT} (RVI ${state}); log ${PROJECT_BOX}/slurm_${job}.log, box dir ${PROJECT_BOX}/${job}"
 sleep 2

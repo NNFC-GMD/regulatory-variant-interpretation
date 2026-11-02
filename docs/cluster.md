@@ -14,6 +14,9 @@ The rules every run here follows, and why. They apply to people and agents alike
   in flight. `defq`'s default is 8 h. `run_project.sbatch` asks for 2 days and ends when the work does.
 - **Users cannot raise a running job's time limit.** A pending job's limit can still be changed with `scontrol
   update`.
+- **Don't pass `sbatch --export`.** A job submitted with it is cancelled by root (sacct: `CANCELLED by 0`) a second
+  after it starts, before its script runs, so it leaves no log. This happened three times, each with
+  `--export=ALL,<name>=<value>`. Pass values as script arguments instead, as `submit.sh` does.
 
 ## The login node is tiny
 

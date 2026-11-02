@@ -38,9 +38,10 @@ def _pairs(fracs: dict, n: int = 200, prefix: str = "peak", start0: int = 0, a: 
         for j, ((ta, tb), frac) in enumerate(fracs.items()):
             i = 0.3 if k < round(frac * n) else -0.3
             s = start0 + 1000 * k + 100 * j
+            gap = 200 if ta == "C" else 20  # C + D beyond 150 bp: the official package's null (calc_coop_score)
             row = {"peak_id": f"{prefix}_{k}", "chr": "chr1", "motif_a": MOTIF[ta], "motif_b": MOTIF[tb], "tf_a": ta,
-                   "tf_b": tb, "distance": 30.0, "gap": 20, "e_a": 0.6, "e_b": 0.5, "isa_both": 1.1 - i, "i": i,
-                   "start_a": s, "start_b": s + 40, "a": a}  # fmt: skip
+                   "tf_b": tb, "distance": gap + 10.0, "gap": gap, "e_a": 0.6, "e_b": 0.5, "isa_both": 1.1 - i,
+                   "i": i, "start_a": s, "start_b": s + gap + 10, "a": a}  # fmt: skip
             row.update({f"i_f{f}": i + off for f, off in enumerate(OFFSETS)})
             rows.append(row)
     return pd.DataFrame(rows)

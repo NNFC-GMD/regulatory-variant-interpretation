@@ -187,7 +187,7 @@ def build(p: dict) -> str:
             m = ms.get(level) or {}
             cells = [sig_cell(comb.get(f"trend_{level}")), sig_cell(off_summary.get(f"trend_{level}")),
                      sig_cell(m.get("synergy")), sig_cell(m.get("slope_i"), "slope_i_significant", "slope_i_robust")]  # fmt: skip
-            lines.append(f"| TF {level} | " + " | ".join(cells) + " |")
+            lines.append(f"| {'TF pairs' if level == 'pairs' else 'TFs'} | " + " | ".join(cells) + " |")
     if matrix.get("comparisons"):
         lines += ["", "## DeepISA: changes between groups, the same sites under both groups' models", "",
                   "Every dataset's sites, the pairs whose window is open under both groups' models, a paired "

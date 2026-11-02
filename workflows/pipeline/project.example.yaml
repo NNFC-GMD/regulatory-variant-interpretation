@@ -1,0 +1,58 @@
+# project.example.yaml -- every key of a project.yaml, with its default. A project.yaml lives in its project's root
+# (never in this repository) and is the one input of workflows/pipeline/: fetch_igvf.py, submit.sh, run_project.sh,
+# status.py. docs/new_project.md walks through starting one. Names here are placeholders.
+
+project: example_course            # [A-Za-z0-9_]+; names the project in logs and STATUS.md
+root: /dcai/projects/iu_0109/datasets/example_course   # every output goes under it (project.py lists the layout)
+prefix: ex_                        # dataset name = prefix + stem (ex_t0, ...): igvf's dataset_name, every folder name
+compendium: ex3                    # the tag of the project's motif compendium (09.0), [A-Za-z0-9_]+: Fi-NeMo calls
+                                   # every dataset's hits against this one compendium, so a motif's name
+                                   # (pos_patterns.<n>) means the same motif in every dataset
+
+samples:
+  # fragments: an IGVF file accession (fetch_igvf.py downloads and md5-checks it), or the absolute path of a BGZF
+  #   fragments file named <stem>.fragments.tsv.gz. All fragments are used: a pseudobulk's file is already its cells.
+  # md5: optional; checked against the file (and against the portal's, for an accession)
+  # index: optional accession of the fragments' .tbi; extra: optional accessions kept in <root>/portal/ for the record
+  # label: optional, for reports
+  - {stem: t0, fragments: IGVFFI0000AAAA, md5: 00000000000000000000000000000000, index: IGVFFI0000AAAB,
+     extra: [IGVFFI0000AAAC], label: "time point 0"}
+  - {stem: t1, fragments: IGVFFI0000BBBA}
+  - {stem: t2, fragments: /path/to/t2.fragments.tsv.gz}
+
+# The stages run_project.sh runs, in this order whatever the order here (fetch runs before, on the login node):
+stages: [prep, train, attribute, downstream, motifs, cooperativity]
+
+# DeepISA (workflows/cooperativity/): groups of datasets pooled as one cell state, by stem (default: one group per
+# sample, named by its stem), and comparisons [name, group_a, group_b]: the change b - a per TF pair and TF.
+cooperativity:
+  groups:
+    t0: [t0]
+    t1: [t1]
+    t2: [t2]
+  comparisons:
+    - [t0_t1, t0, t1]
+    - [t1_t2, t1, t2]
+    - [t0_t2, t0, t2]
+
+# References and the two checkouts the steps come from (the defaults on Gefion):
+genome: /dcai/projects/iu_0109/annotations/hg38/Sequence/IGVFFI0653VCGH.fasta   # GRCh38 no-alt (IGVF), with .fai
+igvf: /dcai/users/mateug/git/igvf_tf_chrombpnet    # at workflows/pipeline/igvf.pin
+folds_dir: /dcai/users/mateug/git/igvf_tf_chrombpnet/folds   # fold_<k>.json: train/valid/test chromosomes
+folds: ["0", "1", "2", "3", "4"]
+chrombpnet: /dcai/users/mateug/git/chrombpnet      # its env runs 01.0 (background regions), 06.0 and 07.0
+chrombpnet_env: cuda13                             # cuda12 on a node whose NVIDIA driver is below 580
+
+# Box settings (defaults; docs/pipeline.md says where each comes from):
+slots:
+  train_per_gpu: 4        # Cherimoya fits per H100 (training is CPU/launch-bound)
+  train_cores: 6
+  attribute_per_gpu: 4    # `cherimoya attribute` processes per H100 (at most ~12 GB each)
+  attribute_cores: 4
+  modisco_max: 5          # TF-MoDISco (08.0) runs at once
+  modisco_threads: 24
+  finemo_slots: 5         # Fi-NeMo (10.0) runs at once, one GPU each
+  finemo_batch: 200       # below 200 for a compendium of more than ~450 patterns (10.0's header)
+  coop_cores: 16          # CPUs per DeepISA lane
+hold_minutes: 60          # how long a box waits for a fix after a failed stage
+shift_every: 100          # detect_shifts.py keeps every Nth fragment; ~100 for a 10-30 M-fragment file

@@ -46,5 +46,6 @@ log "submitted job ${job} for ${PROJECT} (RVI ${state}); log ${PROJECT_BOX}/slur
 sleep 2
 start="$(scontrol show job "${job}" 2> /dev/null | sed -n 's/.*StartTime=\([^ ]*\).*/\1/p' | head -n 1)"
 if [[ "${start}" =~ ^[0-9]{4}- ]]; then
-    log "Slurm's expected start: $(TZ=America/New_York date -d "${start}" '+%F %H:%M %Z' 2> /dev/null || echo "${start}") (optimistic)"
+    # Slurm's time is the cluster's local time; through the epoch so TZ converts it instead of relabelling it.
+    log "Slurm's expected start: $(TZ=America/New_York date -d "@$(date -d "${start}" +%s)" '+%F %H:%M %Z' 2> /dev/null || echo "${start}") (optimistic)"
 fi

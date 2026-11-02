@@ -4,7 +4,10 @@ This folder runs DeepISA's in-silico ablation (ISA) cooperativity analysis, with
 DeepISA's own CNN:
 - **Paper:** He et al. 2025, "Genome-wide rules of transcription factor cooperativity revealed through in silico
   binding site ablation", bioRxiv 10.1101/2025.06.19.660093.
-- **Code:** github.com/anderssonlab/DeepCompARE.
+- **Code:** the paper's scripts are in github.com/anderssonlab/DeepCompARE (`Scripts_python/tf_cooperativity.py`).
+  The official package is github.com/anderssonlab/deepISA (deepISA 0.1.0, pinned at `179091c` in `pixi.toml`'s
+  cherimoya environment). `combine.py --official` applies the package's current rules to these ablations with the
+  package's own functions (section 4).
 
 Each motif site in a peak is ablated alone and together with every other site, and each pair's interaction is the
 departure from additivity. The scripts:
@@ -12,7 +15,11 @@ departure from additivity. The scripts:
   and pair tables.
 - `lane.sh` runs `coop_isa.py` on one GPU for several datasets in turn.
 - `combine.py` works across datasets. It computes synergy scores with intervals, the changes between cell states and
-  the distance profile.
+  the distance profile; with `--official`, the official package's scores and labels too.
+- `motif_names.py` names each Fi-NeMo motif (`pos_patterns.<cluster>`) from the compendium the hits were called with.
+
+To run it on a new project, use the pipeline (`workflows/pipeline/`, stage `cooperativity`; docs/pipeline.md): it
+writes the inputs below from the project's own Fi-NeMo hits and compendium (section 8).
 
 The rest of this page documents the one run so far, on 20 October 2026 (ET). It covers the AMSC adipocyte ATAC-seq
 datasets, on Gefion. It lists every input file and says why each choice was made.
@@ -202,11 +209,12 @@ i_AB    = e_A − e_A|-B = a − a_-A − a_-B + a_-AB    > 0 synergy, < 0 redun
   Cherimoya counts, so the two scales are not the same.
 - A 0.1 change in log2 counts is a 7% change in predicted accessibility.
 
-### Where this differs from DeepISA's code
+### Where this differs from DeepISA's paper code
 
-Checked against `Scripts_python/tf_cooperativity.py` (`read_cooperativity`, `calculate_tf_pair_synergy_score`):
+Checked against the paper's `Scripts_python/tf_cooperativity.py` in anderssonlab/DeepCompARE (`read_cooperativity`,
+`calculate_tf_pair_synergy_score`). The official package's current rules differ again; the next table compares those.
 
-| | DeepISA | here |
+| | DeepISA paper code | here |
 |---|---|---|
 | interaction i | isa2 − (isa_both − isa1) | the same, a − a_-A − a_-B + a_-AB |
 | independent | \|i\| ≤ 0.01; 0.01 < \|i\| ≤ 0.1 is a "gray zone", left out of both counts | \|i\| ≤ 0.1 (gray zone counted as independent) |
@@ -218,6 +226,37 @@ Checked against `Scripts_python/tf_cooperativity.py` (`read_cooperativity`, `cal
 | rounding | predictions and ISA values to 3 decimals, the TF-pair table to 2 | none |
 | TF-pair synergy score, i_sum, labels | as in the code | the same |
 | TF scores | from the TF-pair table after `assign_cooperativity`: only labelled TF pairs with more than 10 pairs, and the i sums leave out TF pairs labelled Independent | from every site pair the TF is in |
+
+### The official deepISA package's rules (`combine.py --official`)
+
+Read in deepISA 0.1.0 at `179091c` (`score/aggregate_isa.py`, `score/combi_isa.py`, `quickstart.py`). The package
+runs its own model, sites and predictions; `--official` gives its aggregate stage this folder's ablations instead.
+
+| | official package | here (ours) |
+|---|---|---|
+| interaction i | isa1 + isa2 − isa_both | the same quantity |
+| ablated site | N (an all-zero column) | the same |
+| model output | any scalar the model returns, one model, one strand | log2 counts, both strands, the 5-fold mean |
+| sites | every Fi-NeMo hit (its own discovery run) | at most 12 non-overlapping `pos_` sites per peak, strongest first, in 50k sampled peaks |
+| pair filter | both single effects ≥ the 10th percentile of the non-negative ones, and both effects given the other ablated ≥ 0 | none |
+| distance | edge to edge, 1–255 bp (`make_pairs_for_region`, receptive field 255) | centre to centre, no cap |
+| score | coop_score = Σi / Σ\|i\| over the qualified pairs | synergy = Σ(i > 0.1) / Σ(\|i\| > 0.1) |
+| labels | Mann–Whitney test against the pairs > 150 bp apart, BH (q < 0.1), then Synergistic above the 70th percentile of the significant scores, Redundant below the 30th, Intermediate between, Independent otherwise (coop_score set to NaN); min_count 10 | absolute: the bars above |
+| across datasets | nothing | changes per comparison, Poisson bootstrap over peaks |
+
+What `--official` does, per dataset (`<root>/official/<dataset>/`):
+1. writes the package's two input tables: `motif_single_isa.csv` (each site's `isa_t0` = e) and
+   `motif_combi_isa.csv` (`tf1`, `tf2`, `distance` = the edge-to-edge gap, `isa1_t0`, `isa2_t0`, `isa_both_t0`),
+   keeping only pairs with a gap of 1–255 bp, as `make_pairs_for_region` does;
+2. calls `calc_interaction(isa_thresh_quantile=0.1, normalize=False)` and `calc_coop_score` at `tf_pair` and `tf`
+   (`min_count=10`, `q_val_thresh=0.1`), exactly as QuickStart's aggregate stage does, writing
+   `coop_tf_pair_t0.csv` and `coop_tf_t0.csv`.
+
+Then, across datasets (`<root>/official/`): the changes per comparison use coop = Σi / Σ|i| recomputed from the
+qualified pairs' `interaction_t0`, with the same bootstrap as ours. The package's labels are relative within a
+dataset and its coop_score is NaN wherever the label is Independent, so neither is compared across datasets. The 10th
+percentile comes from our sites, not from every hit. The package was written for pandas 2, so its functions run with
+pandas' object strings (`future.infer_string` off).
 
 `coop_isa.py` also writes quick per-dataset tables: `tf_pairs.tsv`, `tfs.tsv`, and `independence_all` in `run.json`.
 - There, independence is the share of all pairs with |i| ≤ 0.01.
@@ -361,3 +400,19 @@ numbers, except the counts tested in the last table (section 6):
 
   - The intervals are per TF and are not corrected for multiple testing; about 5% would fall outside by chance.
   - The low-glucose comparison also crosses villages (section 4).
+
+## 8. Running it in a project
+
+The pipeline's `cooperativity` stage (`workflows/pipeline/run_project.sh`) runs this folder on any project whose
+Fi-NeMo hits were called against one compendium (its `motifs` stage), so that `pos_patterns.<n>` is the same motif
+in every dataset:
+1. `motif_names.py --compendium <root>/compendia/<tag> --out <root>/cherimoya/cooperativity/motifs.tsv`: each cluster
+   named by the most frequent annotation at or above the compendium's `min_annotation_score`, as the comparison
+   names them. (The AMSC run above took this table from the ChromBPNet comparison instead.)
+2. `project.py <project.yaml> coop-inputs`: one args file per dataset (models, Fi-NeMo directory, motifs, genome,
+   folds), and `groups.tsv` and `comparisons.tsv` from project.yaml's `cooperativity` block (by default one group per
+   dataset).
+3. `lane.sh`, one dataset per GPU, then `combine.py --official`.
+
+`pairs.tsv.gz` from this version of `coop_isa.py` also holds `gap` and `isa_both`, which `--official` needs; the AMSC
+run's tables predate them.

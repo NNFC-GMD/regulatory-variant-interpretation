@@ -20,6 +20,9 @@ partners):
   log-scale outputs (0.01 and 0.1); here they are on log2 counts. combine.py holds the definitions for the results.
 
 Out (--out-dir/<dataset>/): sites.tsv.gz, pairs.tsv.gz (one row per site pair), tf_pairs.tsv, tfs.tsv, run.json.
+pairs.tsv.gz also holds what the official deepISA package's rules read (combine.py --official): gap, the
+edge-to-edge distance in bp (the later site's start minus the earlier site's end; `distance` is centre to centre),
+and isa_both = a - a_-AB, the pair's joint effect; e_a and e_b are its isa1 and isa2.
 
     coop_isa.py --dataset <name> --models <dir>/fold_{fold}/cherimoya.fold_{fold}.torch --finemo-dir <dir>
         --motifs <motifs.tsv> --fasta <genome.fa> --out-dir <dir>
@@ -171,12 +174,15 @@ def main():
         for (p, q), j in pair_idx.items():
             i = a - lc[single[p]] - lc[single[q]] + lc[j]
             dist = abs((starts[q] + ends[q]) / 2 - (starts[p] + ends[p]) / 2)
+            gap = starts[q] - ends[p]  # sites are in start order and do not overlap (greedy_sites)
             u, v = (q, p) if tfs[q] < tfs[p] else (p, q)  # sides in TF-name order, each column with its own site
-            pair_rows.append((pid, chrom, motifs[u], motifs[v], tfs[u], tfs[v], dist, e[u], e[v], i))
+            pair_rows.append((pid, chrom, motifs[u], motifs[v], tfs[u], tfs[v], dist, gap, e[u], e[v], a - lc[j], i))
     sites = pd.DataFrame(site_rows, columns=["peak_id", "chr", "start", "end", "motif", "tf", "e", "a"])
     pairs = pd.DataFrame(
-        pair_rows, columns=["peak_id", "chr", "motif_a", "motif_b", "tf_a", "tf_b", "distance", "e_a", "e_b", "i"]
-    )
+        pair_rows,
+        columns=["peak_id", "chr", "motif_a", "motif_b", "tf_a", "tf_b", "distance", "gap", "e_a", "e_b", "isa_both",
+                 "i"],
+    )  # fmt: skip
     sites.to_csv(out / "sites.tsv.gz", sep="\t", index=False, float_format="%.5g")
     pairs.to_csv(out / "pairs.tsv.gz", sep="\t", index=False, float_format="%.5g")
     tfp = aggregate(pairs, ["tf_a", "tf_b"], args.t_ind, args.t_coop, args.min_n)

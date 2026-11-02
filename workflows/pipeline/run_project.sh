@@ -14,6 +14,8 @@
 #   downstream    downstream/downstream.sh: convert -> check -> 06.0 -> V2 -> 07.0 -> 08.0 (TF-MoDISco)
 #   motifs        igvf_tf_chrombpnet motif_chain.sh: 09.0 (the project's compendium) -> 10.0 (Fi-NeMo) -> 11.0
 #   cooperativity motif_names.py, coop_isa.py per dataset (one GPU each, lane.sh), combine.py (ours + --official)
+#   coop_matrix   (optional: only when project.yaml lists it) cooperativity/matrix.py: every dataset's sites under
+#                 every dataset's models, the trends along the series, the paired changes (paired.py)
 #   summary       status.py: <root>/STATUS.md
 #
 # A stage is skipped when project.py check <stage> finds its outputs complete, and is done only when it does after
@@ -243,6 +245,18 @@ stage_cooperativity() {
         --motifs "${PROJECT_COOP}/motifs.tsv" --groups "${PROJECT_COOP}/groups.tsv" \
         --comparisons "${PROJECT_COOP}/comparisons.tsv" --official > "${logs}/combine.log" 2>&1 \
         || { log "ERROR: combine.py: ${logs}/combine.log"; return 1; }
+    # STATUS.md now, so the results are summarised even if a later stage holds the box
+    run rvi_run default python "${here}/status.py" "${project_file}" --out "${PROJECT_ROOT}/STATUS.md" \
+        > "${logs}/status_cooperativity.log" 2>&1 || true
+}
+
+stage_coop_matrix() {
+    # One call: everything else is in matrix.py, which can be fixed while the box runs (this file cannot).
+    log "coop_matrix: every dataset's sites under every dataset's models, then trends and paired changes;" \
+        "RVI $(code_state "${repo_root}")"
+    run rvi_run cherimoya python "${repo_root}/workflows/cooperativity/matrix.py" --root "${PROJECT_COOP}" \
+        --cores "${SLOT_COOP_CORES}" --official > "${logs}/coop_matrix.log" 2>&1 \
+        || { log "ERROR: matrix.py: ${logs}/coop_matrix.log"; return 1; }
 }
 
 stage_summary() {

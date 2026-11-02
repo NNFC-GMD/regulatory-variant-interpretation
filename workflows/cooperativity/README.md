@@ -14,9 +14,12 @@ departure from additivity. The scripts:
 - `coop_isa.py` handles one dataset: it builds the sequences, predicts them with every fold model, and writes the site
   and pair tables.
 - `lane.sh` runs `coop_isa.py` on one GPU for several datasets in turn.
-- `combine.py` works across datasets. It computes synergy scores with intervals, the changes between cell states and
-  the distance profile; with `--official`, the official package's scores and labels too.
+- `combine.py` works across datasets. It computes synergy scores with intervals, the changes between cell states
+  (with BH-corrected p-values and a fold check), the trends along a series of groups, and the distance profile; with
+  `--official`, the official package's scores and labels too.
 - `motif_names.py` names each Fi-NeMo motif (`pos_patterns.<cluster>`) from the compendium the hits were called with.
+- `matrix.py` and `paired.py` score every dataset's sites under every dataset's models and compare the models on the
+  same site pairs (section 9).
 
 To run it on a new project, use the pipeline (`workflows/pipeline/`, stage `cooperativity`; docs/pipeline.md): it
 writes the inputs below from the project's own Fi-NeMo hits and compendium (section 8).
@@ -414,5 +417,50 @@ in every dataset:
    dataset).
 3. `lane.sh`, one dataset per GPU, then `combine.py --official`.
 
-`pairs.tsv.gz` from this version of `coop_isa.py` also holds `gap` and `isa_both`, which `--official` needs; the AMSC
-run's tables predate them.
+`pairs.tsv.gz` from this version of `coop_isa.py` also holds `gap` and `isa_both`, which `--official` needs, and
+`start_a`, `start_b`, `a` and the per-fold `i_f<k>`, which the fold check and section 9 need. The AMSC run's tables
+predate them all; `combine.py` reads them without the fold check.
+
+What `combine.py` reports has changed since the AMSC run (section 7):
+- **`significant`** is now Benjamini–Hochberg q < 0.05 within each comparison. Each change's p comes from its
+  bootstrap SE (normal approximation): 200 replicates are too few to count p-values from. The AMSC run's criterion,
+  the 95% interval excluding 0 without correction, is kept as `ci_excludes_0`.
+- **The fold check:** each change computed again from each fold's models alone (fold k of both groups; the folds are
+  the same chromosome splits in every dataset). `folds_agree` counts the folds whose change has the fold-mean
+  change's sign, and `robust` = significant and all of them agree. The bootstrap resamples peaks only, so it misses
+  the noise of training a separate model per dataset; the fold check covers part of it.
+- **Trends** (`--series`, project.yaml's `cooperativity.series`): per TF pair and TF with at least `--min-n` pairs in
+  every group, the score in each group, the least-squares slope along the series with its CI, p and q, and a
+  heterogeneity test for any change along it (a Wald test of the consecutive differences, their covariance from the
+  bootstrap, chi-square with G − 1 df). `trend_pairs.tsv` and `trend_tfs.tsv`, in `combined/` and `official/`.
+- **Effect sizes** in `summary.json`: per dataset the median intact prediction a and the median |e| and |i|. A weaker
+  model (a dataset with fewer reads) predicts smaller effects, so fewer of its pairs pass 0.1 and it looks more
+  independent; read the synergy beside them and beside the model's test accuracy (STATUS.md has both).
+
+## 9. The same sites under every model (`coop_matrix`)
+
+A change between two datasets in sections 4–8 compares each dataset's own sites under its own models. It mixes two
+things: a change in how the model reads a pair of sites (the grammar), and a change in which sites are bound, in
+which peaks. The models are inputs to an in-silico experiment, so every dataset's models can score every dataset's
+sites. The pipeline's optional `coop_matrix` stage does this (`matrix.py`):
+1. `coop_isa.py` with every dataset's sites (`--finemo-dir`) under every dataset's models (`--models`), into
+   `<coop>/matrix/<sites>/<model>/`. The sites depend only on the Fi-NeMo directory, `--n-peaks`, `--max-sites` and
+   `--seed`, so one dataset's sites give the same rows under every model. D datasets make D × D runs.
+2. With a series, `combine.py --series --official` on the datasets' own sites, for the trends above.
+3. `paired.py` on the matrix:
+   - **Rows:** the union of every dataset's site pairs. A pair in several datasets' sites (same chromosome, starts
+     and motifs) is kept once.
+   - **Open windows:** a window counts for a model when its intact prediction a reaches the 10th percentile of a over
+     that model's own windows (`--open-quantile`). In a window the model sees as closed every effect is small, and the
+     pair would look independent whatever the grammar. A comparison uses the windows open under all of its models;
+     the series, under all of the series' models. `open.tsv` has each model's threshold and counts.
+   - **Paired bootstrap:** one set of Poisson weights per window and replicate, the same for every model. The pairs
+     are the same, so most of their noise cancels in a difference.
+   - **Per comparison** (`changes_pairs.tsv`, `changes_tfs.tsv`): the paired change in synergy (as in section 4), and
+     delta i, the mean over the pairs of i(b) − i(a). delta i has no threshold, so smaller effects under a weaker
+     model do not push pairs under 0.1. Both have p, q, the fold check and `robust`.
+   - **Per series** (`trend_pairs.tsv`, `trend_tfs.tsv`): the paired trend of the synergy, and the slope of the mean
+     i, each with p, q and the fold check.
+
+Out: `<coop>/matrix/combined/`, and `summary.json` with the counts per comparison and for the series. Cost: about
+6–7 GPU-minutes per run; 5 datasets are 25 runs, ~25 min on 8 GPUs.

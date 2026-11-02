@@ -22,7 +22,12 @@ partners):
 Out (--out-dir/<dataset>/): sites.tsv.gz, pairs.tsv.gz (one row per site pair), tf_pairs.tsv, tfs.tsv, run.json.
 pairs.tsv.gz also holds what the official deepISA package's rules read (combine.py --official): gap, the
 edge-to-edge distance in bp (the later site's start minus the earlier site's end; `distance` is centre to centre),
-and isa_both = a - a_-AB, the pair's joint effect; e_a and e_b are its isa1 and isa2.
+and isa_both = a - a_-AB, the pair's joint effect; e_a and e_b are its isa1 and isa2. And, for the checks across
+models (matrix.py, paired.py): start_a and start_b (each side's genomic start), a (the intact window's prediction)
+and i_f<k>, the pair's i under fold k's model alone (i is their mean: every quantity is linear in the log counts).
+
+The sites depend only on --finemo-dir, --n-peaks, --max-sites and --seed, not on the models: one dataset's sites
+predicted by another dataset's models (matrix.py) give the same rows in the same order.
 
     coop_isa.py --dataset <name> --models <dir>/fold_{fold}/cherimoya.fold_{fold}.torch --finemo-dir <dir>
         --motifs <motifs.tsv> --fasta <genome.fa> --out-dir <dir>
@@ -154,16 +159,17 @@ def main():
     print(f"{ds}: {len(peak_rows)} peaks, {len(X):,} sequences", flush=True)
 
     pcm.set_precision("default")
-    acc = np.zeros(len(X), dtype=np.float64)
-    for fold in args.folds:
+    per_fold = np.zeros((len(args.folds), len(X)), dtype=np.float64)  # log2 counts, one row per fold model
+    for f, fold in enumerate(args.folds):
         t1 = time.time()
         model = pcm.load_model(Path(args.models.format(fold=fold)), "cuda")
         pr = pcm.CountPredictor(model, "cuda").predict(X, args.batch)
-        acc += ps.strand_mean(pr["fwd"], pr["rev"])
+        per_fold[f] = ps.strand_mean(pr["fwd"], pr["rev"]) / LN2
         del model
         print(f"{ds}: fold {fold} in {time.time() - t1:.0f} s", flush=True)
-    lc = acc / len(args.folds) / LN2  # log2 counts, fold mean
+    lc = per_fold.mean(axis=0)  # log2 counts, fold mean
 
+    idx = []  # per pair: its rows of X, intact, A ablated, B ablated, both ablated
     for pid, chrom, _w0, i0, single, pair_idx, s in peak_rows:
         a = lc[i0]
         tfs, motifs, starts = s["tf"].tolist(), s["motif_name"].tolist(), s["start"].tolist()
@@ -172,17 +178,27 @@ def main():
         for k in range(len(single)):
             site_rows.append((pid, chrom, starts[k], ends[k], motifs[k], tfs[k], e[k], a))
         for (p, q), j in pair_idx.items():
-            i = a - lc[single[p]] - lc[single[q]] + lc[j]
             dist = abs((starts[q] + ends[q]) / 2 - (starts[p] + ends[p]) / 2)
             gap = starts[q] - ends[p]  # sites are in start order and do not overlap (greedy_sites)
             u, v = (q, p) if tfs[q] < tfs[p] else (p, q)  # sides in TF-name order, each column with its own site
-            pair_rows.append((pid, chrom, motifs[u], motifs[v], tfs[u], tfs[v], dist, gap, e[u], e[v], a - lc[j], i))
+            pair_rows.append((pid, chrom, motifs[u], motifs[v], tfs[u], tfs[v], dist, gap, e[u], e[v], a - lc[j],
+                              starts[u], starts[v]))  # fmt: skip
+            idx.append((i0, single[p], single[q], j))
+    idx = np.asarray(idx, dtype=np.int64).reshape(-1, 4)
+
+    def interaction(v: np.ndarray) -> np.ndarray:  # i = a - a_-A - a_-B + a_-AB, for every pair at once
+        return v[..., idx[:, 0]] - v[..., idx[:, 1]] - v[..., idx[:, 2]] + v[..., idx[:, 3]]
+
     sites = pd.DataFrame(site_rows, columns=["peak_id", "chr", "start", "end", "motif", "tf", "e", "a"])
     pairs = pd.DataFrame(
         pair_rows,
         columns=["peak_id", "chr", "motif_a", "motif_b", "tf_a", "tf_b", "distance", "gap", "e_a", "e_b", "isa_both",
-                 "i"],
+                 "start_a", "start_b"],
     )  # fmt: skip
+    pairs.insert(pairs.columns.get_loc("isa_both") + 1, "i", interaction(lc))
+    pairs["a"] = lc[idx[:, 0]]
+    for f, fold in enumerate(args.folds):
+        pairs[f"i_f{fold}"] = interaction(per_fold[f])
     sites.to_csv(out / "sites.tsv.gz", sep="\t", index=False, float_format="%.5g")
     pairs.to_csv(out / "pairs.tsv.gz", sep="\t", index=False, float_format="%.5g")
     tfp = aggregate(pairs, ["tf_a", "tf_b"], args.t_ind, args.t_coop, args.min_n)

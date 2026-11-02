@@ -20,11 +20,15 @@ samples:
   - {stem: t1, fragments: IGVFFI0000BBBA}
   - {stem: t2, fragments: /path/to/t2.fragments.tsv.gz}
 
-# The stages run_project.sh runs, in this order whatever the order here (fetch runs before, on the login node):
-stages: [prep, train, attribute, downstream, motifs, cooperativity]
+# The stages run_project.sh runs, in this order whatever the order here (fetch runs before, on the login node). The
+# default is the first six; coop_matrix (every dataset's DeepISA sites under every dataset's models: D x D coop_isa.py
+# runs, ~6 GPU-min each) runs only when listed:
+stages: [prep, train, attribute, downstream, motifs, cooperativity, coop_matrix]
 
 # DeepISA (workflows/cooperativity/): groups of datasets pooled as one cell state, by stem (default: one group per
 # sample, named by its stem), and comparisons [name, group_a, group_b]: the change b - a per TF pair and TF.
+# series (optional): 3 or more groups in order (positions 0, 1, ...), e.g. the days of a time course: the trend of each
+# TF pair and TF along them (combine.py and paired.py --series), computed in the coop_matrix stage.
 cooperativity:
   groups:
     t0: [t0]
@@ -34,6 +38,7 @@ cooperativity:
     - [t0_t1, t0, t1]
     - [t1_t2, t1, t2]
     - [t0_t2, t0, t2]
+  series: [t0, t1, t2]
 
 # References and the two checkouts the steps come from (the defaults on Gefion):
 genome: /dcai/projects/iu_0109/annotations/hg38/Sequence/IGVFFI0653VCGH.fasta   # GRCh38 no-alt (IGVF), with .fai

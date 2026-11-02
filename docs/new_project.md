@@ -24,7 +24,9 @@ Edit it. `project.example.yaml` documents every key; the ones that matter first:
   files to keep) and `label`.
 - **`cooperativity`:** `groups` (by stem; by default one per sample) and `comparisons`, `[name, group_a, group_b]`,
   where a change is b − a. Write out every comparison you want, e.g. each time point against the first and each
-  against the next.
+  against the next. For a time course, add `series`: the groups in order, for the trends along them.
+- **`stages`:** leave it out to run the default stages. Add `coop_matrix` to the list to also score every dataset's
+  DeepISA sites under every dataset's models (paired changes and trends; docs/pipeline.md).
 
 Check that it loads:
 ```bash
@@ -131,7 +133,8 @@ Under `<root>`, as `workflows/pipeline/project.py`'s docstring lays them out. Wh
 | TF-MoDISco | `cherimoya/<ds>/downstream/contrib_scores/<ds>/modisco/` (results h5 and report) |
 | the compendium | `compendia/<tag>/` (`modisco_compendium_meta.tsv` names each cluster) |
 | motif hits | `cherimoya/<ds>/downstream/finemo_<tag>/<ds>_all/` (`hits_unique.tsv`, `finemo_report/`) |
-| cooperativity | `cherimoya/cooperativity/`: per dataset `<ds>/`; ours `combined/` (`changes_pairs.tsv`, `changes_tfs.tsv`); the official rules `official/` |
+| cooperativity | `cherimoya/cooperativity/`: per dataset `<ds>/`; ours `combined/` (`changes_pairs.tsv`, `changes_tfs.tsv`, with a series `trend_*.tsv`); the official rules `official/` |
+| coop_matrix | `cherimoya/cooperativity/matrix/`: `<sites>/<model>/` per run; `combined/` the paired changes and trends |
 
 Write down anything particular to the project, such as decisions, problems and dates (in ET), in a `NOTES.md` in
 its root, not in this repository.

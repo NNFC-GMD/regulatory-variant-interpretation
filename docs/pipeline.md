@@ -15,6 +15,7 @@ agents.
 | **Attribute** (`attribute`) | DeepLIFT/SHAP on the counts head, every peak, every fold | `cherimoya attribute`, `workflows/attribution/` |
 | **Motifs** (`downstream`, `motifs`) | fold average, TF-MoDISco, one compendium, Fi-NeMo hits | `workflows/downstream/`, igvf_tf_chrombpnet 06.0–11.0 |
 | **Cooperativity** (`cooperativity`) | DeepISA: in-silico ablation of motif pairs | `workflows/cooperativity/` |
+| `coop_matrix` (optional) | DeepISA on every dataset's sites under every dataset's models: paired changes, trends | `workflows/cooperativity/matrix.py`, `paired.py` |
 | summary | `<root>/STATUS.md` | `workflows/pipeline/status.py` |
 
 Outside the driver, for projects that need them:
@@ -401,8 +402,54 @@ compendium's minimum score, as the comparison names clusters. A cluster with non
 
   Changes across datasets use Σi/Σ|i| from its qualified pairs, because its labels are relative within a dataset.
 
-`workflows/cooperativity/README.md` has the definitions and how they differ (section 4), and how the pipeline runs it
-(section 8).
+**Significance and the fold check** (both sets): a change's p comes from its bootstrap SE (a normal approximation,
+since 200 replicates are too few to count p-values from), then Benjamini–Hochberg q within each comparison
+(`scipy.stats.false_discovery_control`). `significant` is q < 0.05. `ci_excludes_0` keeps the earlier, uncorrected
+criterion. `coop_isa.py` also writes each pair's i under each fold's model alone (`i_f<k>`). A change computed from
+fold k's models in both groups shows whether the folds agree: `robust` = significant and the same sign in all 5.
+The bootstrap resamples peaks only, so it misses the noise of training a different model per dataset; the fold check
+covers part of it.
+
+`workflows/cooperativity/README.md` has the definitions and how they differ (section 4), how the pipeline runs it
+(section 8), and the coop_matrix stage (section 9).
+
+## Same sites under every model (`coop_matrix`, optional)
+
+**Command** (one call; the stage runs only when `project.yaml`'s `stages` lists it):
+```
+rvi_run cherimoya python workflows/cooperativity/matrix.py --root <coop> --cores 16 --official
+```
+
+**Why:** the cooperativity stage compares each dataset's own sites under its own models. A change there mixes a change
+of grammar with a change of which sites are bound and where. The models are inputs to an in-silico experiment, so
+any dataset's models can score any dataset's sites.
+
+**What it does:**
+1. Runs `coop_isa.py` with every dataset's sites (its Fi-NeMo hits, sampled exactly as in the cooperativity stage)
+   under every dataset's models, into `<coop>/matrix/<sites>/<model>/`: D × D runs, one lane per GPU.
+2. With a `series` in `project.yaml`'s `cooperativity` block (3 or more groups in order, e.g. the days of a time
+   course), runs `combine.py --series --official` again on the datasets' own sites. That adds the trends:
+   - the slope of each TF pair's (and TF's) score along the series, with its bootstrap CI, p and q;
+   - a heterogeneity test for any change along the series (a Wald test of the consecutive differences);
+   - the fold check.
+3. Runs `paired.py`: the union of every dataset's site pairs (a pair in several datasets' sites kept once), scored
+   by every model, with a paired bootstrap (the same weights per window for every model).
+   - **Open windows only:** a model predicts small effects in a window it sees as closed, whatever the grammar.
+     A window counts for a model when its intact prediction reaches the 10th percentile of that model's own windows,
+     and a comparison (or the series) uses the windows open under all its models.
+   - **Per comparison:** the paired change in synergy, and delta i, the mean change of the interaction itself. delta i
+     has no 0.1 threshold, so a weaker model's smaller effects do not push pairs below it.
+   - **Per series:** the paired trend of the synergy and the slope of the mean i.
+
+**Out:** `<coop>/combined/trend_*.tsv` and `<coop>/official/trend_*.tsv` (own sites); `<coop>/matrix/combined/`
+(`changes_pairs.tsv`, `changes_tfs.tsv`, `trend_pairs.tsv`, `trend_tfs.tsv`, `open.tsv`, `summary.json`).
+STATUS.md puts each dataset's model accuracy beside its effect sizes, and summarises all three.
+
+**Cost:** D × D runs of ~6–7 min on one GPU each (AMSC's per-dataset time); 5 datasets are 25 runs, about 25 min on
+8 GPUs. Then a few minutes of CPU for the two analyses.
+
+**Done when** `<coop>/matrix/combined/summary.json` exists and, with a series, `<coop>/combined/summary.json` has
+the trends.
 
 **Measured (AMSC):** about 6–7 min per dataset on one GPU (~0.7 M sequences, 5 folds), ~8 GB RSS. The per-dataset
 runs go one per GPU at once.

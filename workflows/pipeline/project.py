@@ -16,8 +16,9 @@ here, once, from root, prefix and the sample stems:
   <root>/cherimoya/configs/<ds>/config.yaml      make_downstream.py: 06.0-11.0 on the converted scores
   <root>/cherimoya/<ds>/downstream/              06.0-08.0 (.done/ markers), finemo_<tag>/<ds>_all/ (downstream, motifs)
   <root>/compendia/<tag>/                        09.0's compendium; compendia/inputs/ the lists (motifs)
-  <root>/cherimoya/cooperativity/                motifs.tsv, args/, groups.tsv, comparisons.tsv, <ds>/,
+  <root>/cherimoya/cooperativity/                motifs.tsv, args/, groups.tsv, comparisons.tsv, series.tsv, <ds>/,
                                                  combined/, official/ (cooperativity)
+  <root>/cherimoya/cooperativity/matrix/         <sites ds>/<model ds>/, combined/ (coop_matrix, optional)
   <root>/box/<job>/                              each box's logs and stages.tsv
 
 with <ds> = prefix + stem. A stage is done when its outputs are there (`check`), never because a command exited 0:
@@ -27,7 +28,7 @@ the runners it calls report per task, and some of them always exit 0.
     project.py <project.yaml> env                  shell assignments for run_project.sh (eval)
     project.py <project.yaml> check <stage>        exit 0 when the stage's outputs are complete, else 1 and what is
                                                    missing (stages: fetch prep train attribute downstream motifs
-                                                   cooperativity)
+                                                   cooperativity coop_matrix)
     project.py <project.yaml> status               every stage's state, one line each
     project.py <project.yaml> coop-inputs          write the cooperativity args files, groups.tsv, comparisons.tsv
 
@@ -48,9 +49,12 @@ import yaml
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "attribution"))
 
-STAGES = ("fetch", "prep", "train", "attribute", "downstream", "motifs", "cooperativity")
+STAGES = ("fetch", "prep", "train", "attribute", "downstream", "motifs", "cooperativity", "coop_matrix")
 """In order. fetch runs on the login node (fetch_igvf.py); run_project.sh runs the others in a box."""
-BOX_STAGES = STAGES[1:]
+OPTIONAL_STAGES = ("coop_matrix",)
+"""Box stages a project runs only when its project.yaml lists them in stages."""
+BOX_STAGES = tuple(s for s in STAGES[1:] if s not in OPTIONAL_STAGES)
+"""The box stages a project runs by default."""
 NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 ACCESSION_RE = re.compile(r"^IGVFFI[0-9]{4}[A-Z]{4}$")
 FRAGMENTS_SUFFIX = ".fragments.tsv.gz"
@@ -111,10 +115,10 @@ def load(path: Path) -> dict:
     p.setdefault("folds_dir", str(Path(p["igvf"]) / "folds"))
     p["folds"] = [str(f) for f in p.get("folds") or DEFAULT_FOLDS]
     stages = list(p["stages"])
-    bad = [s for s in stages if s not in BOX_STAGES]
+    bad = [s for s in stages if s not in STAGES[1:]]
     if bad:
-        raise ProjectError(f"{path}: unknown stages {bad}; the box stages are {list(BOX_STAGES)}")
-    p["stages"] = [s for s in BOX_STAGES if s in stages]  # always in pipeline order
+        raise ProjectError(f"{path}: unknown stages {bad}; the box stages are {list(STAGES[1:])}")
+    p["stages"] = [s for s in STAGES[1:] if s in stages]  # always in pipeline order
     p["slots"] = {**SLOTS, **(p.get("slots") or {})}
     bad = sorted(set(p["slots"]) - set(SLOTS))
     if bad:
@@ -178,8 +182,11 @@ def _cooperativity(path: Path, raw: dict, samples: list[dict]) -> dict:
     names = [c[0] for c in comparisons]
     if len(set(names)) != len(names):
         raise ProjectError(f"{path}: comparison names repeat: {names}")
-    return {"groups": groups, "comparisons": comparisons, **{k: v for k, v in raw.items()
-                                                              if k not in ("groups", "comparisons")}}  # fmt: skip
+    series = [str(x) for x in raw.get("series") or []]
+    if series and (len(series) < 3 or len(set(series)) != len(series) or not set(series) <= set(groups)):
+        raise ProjectError(f"{path}: cooperativity series must be 3 or more distinct groups, got {series}")
+    return {"groups": groups, "comparisons": comparisons, "series": series,
+            **{k: v for k, v in raw.items() if k not in ("groups", "comparisons", "series")}}  # fmt: skip
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -200,6 +207,7 @@ def paths(p: dict, ds: str | None = None) -> dict[str, Path]:
         "compendium": root / "compendia" / p["compendium"],
         "inputs": root / "compendia" / "inputs",
         "coop": root / "cherimoya" / "cooperativity",
+        "coop_matrix": root / "cherimoya" / "cooperativity" / "matrix",
         "box": root / "box",
     }
     out["motif_list"] = out["inputs"] / f"cheri{len(p['datasets'])}.tsv"  # make_downstream.py's cheri<D>.tsv
@@ -271,7 +279,13 @@ def check(p: dict, stage: str) -> list[str]:
         need.insert(0, paths(p)["compendium"] / "compendium.json")
     if stage == "cooperativity":
         need += [paths(p)["coop"] / "combined" / "summary.json", paths(p)["coop"] / "official" / "summary.json"]
+    if stage == "coop_matrix":
+        need.append(paths(p)["coop_matrix"] / "combined" / "summary.json")
     missing = _missing(need)
+    if stage == "coop_matrix" and not missing and p["cooperativity"]["series"]:
+        summary = json.loads((paths(p)["coop"] / "combined" / "summary.json").read_text())
+        if "trend_pairs" not in summary:
+            missing.append(f"{paths(p)['coop'] / 'combined' / 'summary.json'}: no trends (combine.py --series)")
     if stage == "attribute" and not missing:
         import attr_status  # stdlib only: npy/npz headers, no numpy
 
@@ -314,8 +328,8 @@ def env_lines(p: dict) -> list[str]:
 
 
 def write_coop_inputs(p: dict) -> list[Path]:
-    """Per dataset coop_isa.py's args file (lane.sh reads one argument per line), and combine.py's groups.tsv and
-    comparisons.tsv."""
+    """Per dataset coop_isa.py's args file (lane.sh reads one argument per line), and combine.py's groups.tsv,
+    comparisons.tsv and, with a series, series.tsv."""
     q = paths(p)
     written = []
     (q["coop"] / "args").mkdir(parents=True, exist_ok=True)
@@ -334,7 +348,11 @@ def write_coop_inputs(p: dict) -> list[Path]:
     (q["coop"] / "groups.tsv").write_text("\n".join(groups) + "\n")
     comparisons = ["name\tgroup_a\tgroup_b"] + ["\t".join(c) for c in p["cooperativity"]["comparisons"]]
     (q["coop"] / "comparisons.tsv").write_text("\n".join(comparisons) + "\n")
-    return written + [q["coop"] / "groups.tsv", q["coop"] / "comparisons.tsv"]
+    written += [q["coop"] / "groups.tsv", q["coop"] / "comparisons.tsv"]
+    if p["cooperativity"]["series"]:  # the groups in order, for combine.py's and paired.py's --series
+        (q["coop"] / "series.tsv").write_text("\n".join(["group", *p["cooperativity"]["series"]]) + "\n")
+        written.append(q["coop"] / "series.tsv")
+    return written
 
 
 def main(argv: list[str] | None = None) -> int:

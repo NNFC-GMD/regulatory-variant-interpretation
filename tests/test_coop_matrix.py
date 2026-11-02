@@ -135,7 +135,7 @@ def _matrix_world(tmp_path: Path, n: int = 120) -> dict:
         for m in datasets:
             pairs = _pairs({("A", "B"): frac[m], ("C", "D"): 0.5}, n=n, prefix=x, start0=10**6 * x_k)
             if x == "m1":  # the same genomic pair as m0's first A + B pair
-                pairs.loc[0, ["start_a", "start_b"]] = [0, 40]
+                pairs.loc[0, ["start_a", "start_b"]] = [0, 30]
             if x == "m0" and m == "m2":
                 pairs.loc[pairs["peak_id"].isin([f"m0_{k}" for k in range(n - 10, n)]), "a"] = 0.5
             (root / x / m).mkdir(parents=True)

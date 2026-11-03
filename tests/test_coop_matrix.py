@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COOP = ROOT / "workflows" / "cooperativity"
 sys.path[:0] = [str(COOP), str(ROOT / "workflows" / "pipeline")]
 
+import check_official as co  # noqa: E402
 import combine as cb  # noqa: E402
 import matrix as mx  # noqa: E402
 import paired as pa  # noqa: E402
@@ -123,6 +124,25 @@ def test_combine_trends_fdr_and_folds(tmp_path):
     assert off.loc["A + B", "slope"] == pytest.approx(0.5) and off.loc["A + B", "significant"]  # coop = 2 synergy - 1
 
 
+def test_check_official(tmp_path):
+    pytest.importorskip("deepISA.score.aggregate_isa")
+    w = _own_world(tmp_path)
+    r = subprocess.run(
+        [sys.executable, str(COOP / "combine.py"), "--root", str(w["root"]), "--motifs", str(w["motifs"]),
+         "--groups", str(w["groups"]), "--comparisons", str(w["comparisons"]), "--n-boot", "20", "--min-n", "20",
+         "--official"],
+        capture_output=True, text=True,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stderr
+    argv = ["--root", str(w["root"]), "--motifs", str(w["motifs"]), "--groups", str(w["groups"])]
+    assert co.main(argv) == 0
+    f = w["root"] / "official" / "coop_tf_pairs_by_dataset.tsv"
+    t = pd.read_csv(f, sep="\t")
+    t.loc[0, "abs_i_sum"] *= 1.01
+    t.to_csv(f, sep="\t", index=False)
+    assert co.main(argv) == 1
+
+
 def _matrix_world(tmp_path: Path, n: int = 120) -> dict:
     """Three datasets' sites, each under the three datasets' models. A + B's i rises with the model, on the same
     pairs; C + D's does not change. m0's last 10 windows are closed under m2's models. One pair is in two site sets."""
@@ -168,6 +188,79 @@ def test_paired_same_sites_under_every_model(tmp_path):
     assert tr.loc["A + B", "slope"] > 0.2 and tr.loc["A + B", "significant"] and tr.loc["A + B", "slope_i_significant"]
     assert not tr.loc["C + D", "slope_i_significant"]
     assert (out / "trend_tfs.tsv").is_file() and (out / "open.tsv").is_file()
+
+
+def test_paired_adjust_ratio(tmp_path):
+    w = _matrix_world(tmp_path)
+    for x in ("m0", "m1", "m2"):  # the sites' e: 0.6 and 0.5, so the package's isa_thresh is 0.5
+        _sites(pd.read_csv(w["root"] / x / x / "pairs.tsv.gz", sep="\t")).to_csv(
+            w["root"] / x / x / "sites.tsv.gz", sep="\t", index=False
+        )
+    f = w["root"] / "m0" / "m2" / "pairs.tsv.gz"  # 5 of m0's pairs unqualified under m2's models
+    df = pd.read_csv(f, sep="\t")
+    df.loc[:4, "e_a"] = -0.1
+    df.to_csv(f, sep="\t", index=False)
+    with pytest.raises(SystemExit):
+        _paired(w, "--adjust", "ratio")  # never into combined/
+    out = tmp_path / "ratio"
+    assert _paired(w, "--adjust", "ratio", "--out-dir", str(out)) == 0
+    assert not (w["root"] / "combined").exists()
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["adjust"]["isa_thresh"] == {"m0": 0.5, "m1": 0.5, "m2": 0.5}
+    c = summary["comparisons"]
+    assert c["m0_m2"]["pairs_used"] == c["m0_m2"]["pairs_open"] - 5
+    assert c["m0_m1"]["pairs_used"] == c["m0_m1"]["pairs_open"]  # m2's unqualified pairs do not matter
+    ch = pd.read_csv(out / "changes_pairs.tsv", sep="\t")
+    assert "synergy_a" not in ch.columns  # no synergy on a ratio
+    ab = ch[(ch["comparison"] == "m0_m1") & (ch["pair"] == "A + B")].iloc[0]
+    assert ab["delta_i"] == pytest.approx(0.3 * 2 * (0.5 - 0.2) / 1.1, abs=2e-3)  # i / (e_a + e_b)
+    assert ab["delta_e"] == pytest.approx(0.0) and ab["mean_e_a"] == pytest.approx(0.55)
+    assert (out / "trend_pairs.tsv").is_file()
+
+
+def _strength_world(tmp_path: Path, n: int = 400) -> dict:
+    """Every pair's i is -0.5 e_a e_b (a model that saturates), whatever the distance. A + B (20 bp apart) gets
+    stronger with the model; C + D (200 bp, distant) spans every strength under every model; E + F (20 bp) is as
+    strong under every model and gains 0.2 of synergy under m2's."""
+    datasets = ["m0", "m1", "m2"]
+    strength = {"m0": 0.2, "m1": 0.5, "m2": 0.8}
+    root = tmp_path / "matrix"
+    for x_k, x in enumerate(datasets):
+        for m in datasets:
+            p = _pairs({("A", "B"): 0.5, ("C", "D"): 0.5, ("E", "F"): 0.5}, n=n, prefix=x, start0=10**6 * x_k)
+            k = np.arange(len(p)) // 3
+            ab, cd, ef = ((p["tf_a"] == t).to_numpy() for t in "ACE")
+            p["e_a"] = np.where(ab, strength[m], np.where(cd, 0.05 + 0.9 * (k * 7919 % n) / n, 0.5))
+            p["e_b"] = np.where(cd, 0.05 + 0.9 * (k * 104729 % n) / n, p["e_a"])
+            p["i"] = -0.5 * p["e_a"] * p["e_b"] + np.where(ef & (m == "m2"), 0.2, 0.0)
+            p["isa_both"] = p["e_a"] + p["e_b"] - p["i"]
+            for f, off in enumerate(OFFSETS):
+                p[f"i_f{f}"] = p["i"] + off
+            (root / x / m).mkdir(parents=True)
+            p.to_csv(root / x / m / "pairs.tsv.gz", sep="\t", index=False)
+    return {"root": root, "n": n, **_inputs(tmp_path, datasets, [("m0_m2", "m0", "m2")])}
+
+
+def test_paired_adjust_distant(tmp_path):
+    w = _strength_world(tmp_path)
+    cells = ["--lo-bins", "10", "--hi-bins", "2", "--min-cell", "10"]
+    raw, adj = tmp_path / "raw", tmp_path / "distant"
+    assert _paired(w, "--out-dir", str(raw)) == 0
+    assert _paired(w, "--adjust", "distant", "--out-dir", str(adj), *cells) == 0
+    pick = lambda d: pd.read_csv(d / "changes_pairs.tsv", sep="\t").set_index("pair")  # noqa: E731
+    r, a = pick(raw), pick(adj)
+    assert r.loc["A + B", "delta_i"] == pytest.approx(-0.5 * (0.8**2 - 0.2**2))
+    assert r.loc["A + B", "delta_i_significant"]
+    assert abs(a.loc["A + B", "delta_i"]) < 0.05  # the stronger sites' saturation, as far pairs show it
+    assert a.loc["E + F", "delta_i"] == pytest.approx(0.2, abs=0.03) and a.loc["E + F", "delta_i_robust"]
+    assert abs(a.loc["C + D", "delta_i"]) < 0.01 and a.loc["A + B", "delta_e"] == pytest.approx(0.6)
+    curves = pd.read_csv(adj / "curves.tsv", sep="\t")
+    assert set(curves["distance_class"]) == {"near", "far"} and set(curves["model"]) == {"m0", "m1", "m2"}
+    s_raw = json.loads((raw / "summary.json").read_text())
+    s_adj = json.loads((adj / "summary.json").read_text())
+    assert s_adj["adjust"]["method"] == "distant" and s_adj["adjust"]["far_pairs"]["m0"] == 3 * w["n"]
+    assert s_raw["activity_r"]["series"]["pairs"]["slope_i"] < -0.8
+    assert s_adj["activity_r"]["series"]["pairs"]["slope_i"] > s_raw["activity_r"]["series"]["pairs"]["slope_i"]
 
 
 def test_paired_refuses_rows_that_do_not_line_up(tmp_path):

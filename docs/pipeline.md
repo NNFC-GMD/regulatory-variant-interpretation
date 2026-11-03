@@ -452,6 +452,10 @@ STATUS.md puts each dataset's model accuracy beside its effect sizes, and summar
 **Done when** `<coop>/matrix/combined/summary.json` exists and, with a series, `<coop>/combined/summary.json` has
 the trends.
 
+**After it (optional, not a stage):** `paired.py --adjust ratio|distant --out-dir <dir>` takes the sites' strength
+out of the interaction before the same statistics, and `check_official.py` checks the `--official` tables against
+the package and its rules (`workflows/cooperativity/README.md`, section 10). Both are CPU only and take minutes.
+
 **Measured (AMSC):** about 6–7 min per dataset on one GPU (~0.7 M sequences, 5 folds), ~8 GB RSS. The per-dataset
 runs go one per GPU at once.
 

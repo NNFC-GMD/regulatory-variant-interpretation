@@ -19,7 +19,10 @@ departure from additivity. The scripts:
   `--official`, the official package's scores and labels too.
 - `motif_names.py` names each Fi-NeMo motif (`pos_patterns.<cluster>`) from the compendium the hits were called with.
 - `matrix.py` and `paired.py` score every dataset's sites under every dataset's models and compare the models on the
-  same site pairs (section 9).
+  same site pairs (section 9). `paired.py --adjust` takes the sites' strength out of the interaction first (section
+  10).
+- `check_official.py` runs the official package's aggregate stage again on the tables `combine.py --official`
+  wrote, and recomputes its rules from `coop_isa.py`'s tables (section 10).
 
 To run it on a new project, use the pipeline (`workflows/pipeline/`, stage `cooperativity`; docs/pipeline.md): it
 writes the inputs below from the project's own Fi-NeMo hits and compendium (section 8).
@@ -464,3 +467,38 @@ sites. The pipeline's optional `coop_matrix` stage does this (`matrix.py`):
 
 Out: `<coop>/matrix/combined/`, and `summary.json` with the counts per comparison and for the series. Cost: about
 6–7 GPU-minutes per run; 5 datasets are 25 runs, ~25 min on 8 GPUs.
+
+Every table also has the activity beside each score: a TF's mean e over its own sites in the same pairs (a TF
+pair's, the mean of its two sites'), as `mean_e_a`, `mean_e_b` and `delta_e` (or `mean_e_<group>` and `slope_e`).
+`summary.json`'s `activity_r` is the correlation, over the tested TF pairs or TFs, of each change (or slope) with that
+of the activity.
+
+## 10. Interaction and site strength (`paired.py --adjust`, `check_official.py`)
+
+In log counts, two strong sites are sub-additive even when they are far apart: the model saturates, so the joint
+ablation removes less than the two single ones add up to. A TF whose sites get stronger then looks less synergistic,
+and a TF whose sites weaken looks more so, whatever its grammar. `--adjust` takes the strength out of i before the
+same paired statistics, into its own `--out-dir` (`combined/` is never written):
+- **`ratio`**: the official package's normalised interaction, i / (e_a + e_b + tau), on its qualified pairs (both
+  e at least the 10th percentile of the non-negative e over the model's own sites; both effects given the other
+  ablated ≥ 0). A comparison uses the pairs qualified under all its models, so a motif that is inactive under any of
+  them drops out (`pairs_used` beside `pairs_open` in `summary.json`). The package's tau is the median e_a + e_b of
+  non-motif ablations, which `coop_isa.py` does not run: `--tau`, default 0. No synergy: its 0.1 is in log counts.
+- **`distant`**: i minus the mean i of the distant pairs (gap > 150 bp, the package's null) whose two sites are as
+  strong, per model, in cells of the weaker site's e (20 quantile bins pooled over the models) and, within each, of
+  the stronger one's (4). `curves.tsv` has, per model and cell, the mean i of the pairs adjacent (gap ≤ 5 bp), near
+  (≤ 50), mid (≤ 150) and far, and the value subtracted.
+
+```
+rvi_run cherimoya python workflows/cooperativity/paired.py --matrix <coop>/matrix --motifs <coop>/motifs.tsv \
+    --groups <coop>/groups.tsv --comparisons <coop>/comparisons.tsv --series <coop>/series.tsv \
+    --adjust distant --out-dir <coop>/adjusted/distant
+```
+
+Whether an adjustment did its job shows in `activity_r`: near 0, the scores no longer follow the activity. Close
+sites can still show synergy that grows with their strength; that is the pair's grammar, not saturation.
+
+`check_official.py --root <coop> --motifs <coop>/motifs.tsv --groups <coop>/groups.tsv` checks `combine.py
+--official` four ways per dataset: the package's aggregate stage run again by hand gives the same tables; the CSVs
+it read hold the pairs' own effects; the package's rules recomputed independently give its tables; and the group
+scores of the changes are sum(i) / sum(|i|) over the qualified pairs. CPU only, a few minutes.

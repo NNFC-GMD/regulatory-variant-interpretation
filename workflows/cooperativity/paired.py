@@ -28,35 +28,11 @@ Per comparison and TF pair (or TF), with >= --min-n pairs (each group's pairs ar
 Per series and TF pair (or TF): combine.py's trend() on these rows, paired; and the slope of the mean i over the series
 (mean_i_<group>, slope_i with CI, p, q, the fold check, slope_i_significant, slope_i_robust).
 
-Activity, beside every score: a TF's mean e over its own sites in these pairs (a TF pair's: the mean of its two
-sites'), each site's e the mean over the group's models: mean_e_a, mean_e_b and delta_e per comparison, mean_e_<group>
-and slope_e per series. summary.json's activity_r: per comparison (and for the series), the correlation over the
-tested TF pairs (or TFs) of each change (or slope) with that of the activity.
-
---adjust takes the sites' strength out of i before the same statistics, into --out-dir (combined/ is never written).
-In log counts two strong sites are sub-additive even far apart (the model saturates), so a TF whose sites get stronger
-looks less synergistic, and one whose sites weaken more. Each model's i (and i_f<k>) becomes:
-  ratio    the official package's normalised interaction (deepISA calc_interaction(normalize=True)): i / (e_a + e_b +
-           tau) on its qualified pairs: both e at least the 10th percentile of the non-negative e over the model's own
-           sites (matrix.py's <model>/<model>/sites.tsv.gz), both effects given the other ablated >= 0. A comparison
-           (or the series) uses the pairs qualified under all its models, so a motif that is inactive under any of
-           them drops out. The package's tau is the median e_a + e_b of non-motif ablations, which coop_isa.py does not
-           run: --tau (default 0). No synergy: its 0.1 is in log counts. i_f<k> is divided by the fold-mean e.
-  distant  i minus what the pairs more than --far-gap (150) bp apart, the package's null, show for two sites as strong:
-           per model, a least-squares polynomial surface (--degree 3) of i over the weaker and the stronger site's e,
-           fitted on its open distant pairs, each e clipped to their 0.1-99.9th percentiles. i_f<k>: the same, fitted
-           on fold k's i. curves.tsv: per model and strength cell (--lo-bins quantiles of the weaker site's e, pooled
-           over the models; --hi-bins of the stronger one's within each), the pairs adjacent (gap <= 5 bp), near (<=
-           50), mid (<= --far-gap) and far: n, mean i, the mean value subtracted, the mean adjusted i.
-The value subtracted (or divided by) is fixed, not refitted in each bootstrap replicate. The output columns keep
-their names (mean_i_a, delta_i, slope_i, ...); summary.json's adjust says what i is.
-
-Out (--out-dir, default <matrix>/combined/): changes_pairs.tsv, changes_tfs.tsv, with --series trend_pairs.tsv and
-trend_tfs.tsv, open.tsv (per model: its threshold, its windows and how many are open), summary.json; with distant,
-curves.tsv.
+Out (<matrix>/combined/): changes_pairs.tsv, changes_tfs.tsv, with --series trend_pairs.tsv and trend_tfs.tsv,
+open.tsv (per model: its threshold, its windows and how many are open), summary.json.
 
     paired.py --matrix <dir> --motifs <motifs.tsv> --groups <groups.tsv> --comparisons <comparisons.tsv>
-        [--series <series.tsv>] [--adjust ratio|distant --out-dir <dir>]
+        [--series <series.tsv>]
 """
 
 from __future__ import annotations
@@ -74,8 +50,6 @@ import combine as cb  # noqa: E402
 
 ID = ["peak_id", "chr", "motif_a", "motif_b", "start_a", "start_b", "distance"]
 """A pair's columns that do not depend on the model: equal under every model of one dataset's sites."""
-EXTRA = ["e_a", "e_b", "isa_both", "gap"]
-"""coop_isa.py's columns kept beside i when the tables have them: the activity and --adjust read them."""
 
 
 def load(matrix: Path, datasets: list[str], names: dict, open_quantile: float):
@@ -105,17 +79,15 @@ def load(matrix: Path, datasets: list[str], names: dict, open_quantile: float):
     ident["unit"] = ident["sites"] + ":" + ident["peak_id"].astype(str)
     for x in ("a", "b"):  # each site's TF from its motif, as combine.py names them
         ident[f"tf_{x}"] = ident[f"motif_{x}"].map(names).fillna(ident[f"motif_{x}"])
-    sw = (ident["tf_a"] > ident["tf_b"]).to_numpy()
+    sw = ident["tf_a"] > ident["tf_b"]
     ident.loc[sw, ["tf_a", "tf_b"]] = ident.loc[sw, ["tf_b", "tf_a"]].to_numpy()
     ident["pair"] = ident["tf_a"] + " + " + ident["tf_b"]
     tables = {}
     for m, dfs in per_model.items():
         df = pd.concat(dfs, ignore_index=True)[keep].reset_index(drop=True)
-        cols = ["i", "a", *cb.fold_columns([df]), *[c for c in EXTRA if c in df]]
+        cols = ["i", "a", *cb.fold_columns([df])]
         tables[m] = pd.concat([ident[["unit", "sites", "peak_id", "tf_a", "tf_b", "pair", "distance"]], df[cols]],
                               axis=1)  # fmt: skip
-        if "e_a" in df:  # each side's effect beside its TF's name, which the swap above may have moved
-            tables[m].loc[sw, ["e_a", "e_b"]] = tables[m].loc[sw, ["e_b", "e_a"]].to_numpy()
         windows = df.assign(unit=ident["unit"]).drop_duplicates("unit")
         thresholds[m]["windows"] = len(windows)
         thresholds[m]["open"] = int((windows["a"] >= thresholds[m]["threshold"]).sum())
@@ -210,112 +182,6 @@ def slope_i(sub: dict, base: pd.DataFrame, groups: dict, series: list, key: str,
     return out
 
 
-def site_thresholds(matrix: Path, models: list[str], quantile: float = 0.1) -> dict:
-    """Per model: the package's isa_thresh (deepISA get_isa_thresh), the `quantile` of the non-negative e over the
-    model's own sites."""
-    out = {}
-    for m in models:
-        e = pd.read_csv(matrix / m / m / "sites.tsv.gz", sep="\t", usecols=["e"])["e"]
-        out[m] = float(e[e >= 0].quantile(quantile))
-    return out
-
-
-def adjust_ratio(tables: dict, thresholds: dict, tau: float) -> dict:
-    """In place, per model: i and i_f<k> as i / (e_a + e_b + tau) on the qualified pairs (deepISA's
-    _compute_interaction_per_track with normalize=True), NaN on the others; and the column qualified. Returns
-    {model: its qualified pairs}."""
-    n = {}
-    for m, t in tables.items():
-        ea, eb, both = (t[c].to_numpy() for c in ("e_a", "e_b", "isa_both"))
-        den = ea + eb + tau
-        q = (ea >= thresholds[m]) & (eb >= thresholds[m]) & (both - eb >= 0) & (both - ea >= 0) & (den > 0)
-        for c in ["i", *cb.fold_columns([t])]:
-            t[c] = np.where(q, t[c].to_numpy() / np.where(q, den, 1.0), np.nan)
-        t["qualified"] = q
-        n[m] = int(q.sum())
-    return n
-
-
-def quantile_edges(v: np.ndarray, k: int) -> np.ndarray:
-    """The inner edges of k quantile bins of v (fewer where values tie)."""
-    return np.unique(np.quantile(v, np.linspace(0, 1, k + 1)[1:-1])) if len(v) else np.empty(0)
-
-
-def surface(lo: np.ndarray, hi: np.ndarray, degree: int) -> np.ndarray:
-    """The monomials lo^p hi^q with p + q <= degree, one column each."""
-    return np.column_stack([lo**p * hi**q for p in range(degree + 1) for q in range(degree + 1 - p)])
-
-
-def adjust_distant(tables: dict, is_open: dict, far_gap: float, degree: int, n_lo: int, n_hi: int):
-    """In place, per model: i and i_f<k> minus what the distant pairs (gap > far_gap, open under the model) predict
-    for two sites as strong: a least-squares polynomial surface of --degree in the weaker and the stronger site's e,
-    each clipped to the distant pairs' 0.1-99.9th percentiles (the module doc). Returns (curves.tsv's table, a
-    summary)."""
-    strength = {m: np.sort(t[["e_a", "e_b"]].to_numpy(), axis=1) for m, t in tables.items()}  # weaker, stronger
-    far = {m: is_open[m] & (t["gap"].to_numpy() > far_gap) for m, t in tables.items()}
-    pooled = np.concatenate([strength[m][far[m]] for m in tables])
-    lo_edges = quantile_edges(pooled[:, 0], n_lo)  # curves.tsv's cells, the same under every model
-    pooled_bin = np.searchsorted(lo_edges, pooled[:, 0], side="right")
-    hi_edges = [quantile_edges(pooled[pooled_bin == b, 1], n_hi) for b in range(len(lo_edges) + 1)]
-    curves, fits = [], {}
-    for m, t in tables.items():
-        f = far[m]
-        lo_range = np.quantile(strength[m][f, 0], [0.001, 0.999])
-        hi_range = np.quantile(strength[m][f, 1], [0.001, 0.999])
-        lo, hi = strength[m][:, 0], strength[m][:, 1]
-        X = surface(np.clip(lo, *lo_range), np.clip(hi, *hi_range), degree)
-        raw = t["i"].to_numpy().copy()
-        for c in ["i", *cb.fold_columns([t])]:
-            v = t[c].to_numpy()
-            beta = np.linalg.lstsq(X[f], v[f], rcond=None)[0]
-            expected = X @ beta
-            t[c] = v - expected
-            if c == "i":
-                subtracted = expected
-                fits[m] = {"far_pairs": int(f.sum()), "weaker_e_range": [round(float(x), 4) for x in lo_range],
-                           "stronger_e_range": [round(float(x), 4) for x in hi_range],
-                           "far_r2": round(float(1 - np.var(v[f] - expected[f]) / np.var(v[f])), 4)}  # fmt: skip
-        b = np.searchsorted(lo_edges, lo, side="right")
-        h = np.zeros(len(t), dtype=np.int64)
-        for k, e in enumerate(hi_edges):
-            h[b == k] = np.searchsorted(e, hi[b == k], side="right")
-        gap, o = t["gap"].to_numpy(), is_open[m]
-        kind = np.select([gap <= 5, gap <= 50, gap <= far_gap], ["adjacent", "near", "mid"], "far")
-        g = (pd.DataFrame({"weaker_bin": b[o], "stronger_bin": h[o], "distance_class": kind[o], "i": raw[o],
-                           "subtracted": subtracted[o], "weaker_e": lo[o], "stronger_e": hi[o]})
-             .groupby(["weaker_bin", "stronger_bin", "distance_class"])
-             .agg(n=("i", "size"), mean_i=("i", "mean"), subtracted=("subtracted", "mean"),
-                  weaker_e=("weaker_e", "median"), stronger_e=("stronger_e", "median"))
-             .reset_index())  # fmt: skip
-        g["mean_adjusted_i"] = g["mean_i"] - g["subtracted"]
-        g.insert(0, "model", m)
-        curves.append(g)
-    info = {"far_gap": far_gap, "degree": degree, "models": fits,
-            "curves_weaker_e_edges": [round(float(x), 5) for x in lo_edges]}  # fmt: skip
-    return pd.concat(curves, ignore_index=True), info
-
-
-def mean_e(sub: dict, base: pd.DataFrame, models: list[str], key: str) -> pd.Series:
-    """Per TF (the mean e of its own sites in these pairs) or TF pair (the mean of its two sites'), each site's e the
-    mean over `models`."""
-    ea, eb = group_i(sub, models, "e_a"), group_i(sub, models, "e_b")
-    if key == "tf":
-        labels, v = np.r_[base["tf_a"].to_numpy(), base["tf_b"].to_numpy()], np.r_[ea, eb]
-    else:
-        labels, v = base[key].to_numpy(), (ea + eb) / 2
-    codes, uniq = pd.factorize(labels)
-    return pd.Series(np.bincount(codes, v) / np.bincount(codes), index=uniq)
-
-
-def corr(x, y) -> float | None:
-    """Pearson's r over the rows where both are finite (None with fewer than 3, or no spread)."""
-    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
-    ok = np.isfinite(x) & np.isfinite(y)
-    if ok.sum() < 3 or x[ok].std() == 0 or y[ok].std() == 0:
-        return None
-    return round(float(np.corrcoef(x[ok], y[ok])[0, 1]), 4)
-
-
 def counts(table: pd.DataFrame | None, cols: list[str]) -> dict:
     if table is None:
         return {"tested": 0}
@@ -334,18 +200,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-n", type=int, default=50)
     ap.add_argument("--fdr", type=float, default=0.05)
     ap.add_argument("--open-quantile", type=float, default=0.1)
-    ap.add_argument("--adjust", choices=("none", "ratio", "distant"), default="none",
-                    help="take the sites' strength out of i first (the module doc); needs --out-dir")  # fmt: skip
-    ap.add_argument("--out-dir", type=Path, help="default <matrix>/combined; required with --adjust")
-    ap.add_argument("--tau", type=float, default=0.0, help="ratio: added to e_a + e_b (deepISA's tau)")
-    ap.add_argument("--isa-quantile", type=float, default=0.1, help="ratio: the qualifying quantile of e")
-    ap.add_argument("--far-gap", type=float, default=150, help="distant: the gap (bp) beyond which a pair is distant")
-    ap.add_argument("--degree", type=int, default=3, help="distant: the degree of the strength surface")
-    ap.add_argument("--lo-bins", type=int, default=20, help="distant: curves.tsv's bins of the weaker site's e")
-    ap.add_argument("--hi-bins", type=int, default=4, help="distant: curves.tsv's bins of the stronger one's, in each")
     args = ap.parse_args(argv)
-    if args.adjust != "none" and args.out_dir is None:
-        ap.error("--adjust needs --out-dir: combined/ holds the unadjusted results")
     groups = {r["group"]: [d.strip() for d in r["datasets"].split(",")] for r in cb.read_tsv(args.groups)}
     comparisons = [(r["name"], r["group_a"], r["group_b"]) for r in cb.read_tsv(args.comparisons)]
     series = [r["group"] for r in cb.read_tsv(args.series)] if args.series else []
@@ -358,40 +213,21 @@ def main(argv: list[str] | None = None) -> int:
     tables, ident, thresholds = load(args.matrix, datasets, names, args.open_quantile)
     units = pd.Index(ident["unit"].unique())
     is_open = {m: tables[m]["a"].to_numpy() >= thresholds[m]["threshold"] for m in datasets}
-    has_e = all("e_a" in tables[m] for m in datasets)
-    if args.adjust != "none" and not all(c in tables[m] for m in datasets for c in EXTRA):
-        ap.error(f"--adjust needs coop_isa.py's {', '.join(EXTRA)} in every pairs.tsv.gz")
-    out = args.out_dir or args.matrix / "combined"
-    out.mkdir(parents=True, exist_ok=True)
-    summary = {"pairs": len(ident), "windows": len(units), "open": thresholds, "comparisons": {}, "series": {},
-               "activity_r": {"comparisons": {}, "series": {}}}  # fmt: skip
-    use = is_open
-    if args.adjust == "ratio":
-        isa_thresh = site_thresholds(args.matrix, datasets, args.isa_quantile)
-        qualified = adjust_ratio(tables, isa_thresh, args.tau)
-        use = {m: is_open[m] & tables[m]["qualified"].to_numpy() for m in datasets}
-        summary["adjust"] = {"method": "ratio", "i": "i / (e_a + e_b + tau) on the qualified pairs", "tau": args.tau,
-                             "isa_quantile": args.isa_quantile, "isa_thresh": isa_thresh, "qualified": qualified}  # fmt: skip
-    elif args.adjust == "distant":
-        curves, info = adjust_distant(tables, is_open, args.far_gap, args.degree, args.lo_bins, args.hi_bins)
-        curves.to_csv(out / "curves.tsv", sep="\t", index=False, float_format="%.5g")
-        summary["adjust"] = {"method": "distant", "i": "i minus the mean i of distant pairs as strong", **info}
+    out = args.matrix / "combined"
+    out.mkdir(exist_ok=True)
     pd.DataFrame([{"model": m, **v} for m, v in thresholds.items()]).to_csv(out / "open.tsv", sep="\t", index=False)
     print(f"{len(ident):,} site pairs in {len(units):,} windows; open windows: {thresholds}", flush=True)
+    summary = {"pairs": len(ident), "windows": len(units), "open": thresholds, "comparisons": {}, "series": {}}
     t = args.t_coop
-    with_synergy = args.adjust != "ratio"  # the ratio has no scale for t
 
     for level, key in (("pairs", "pair"), ("tfs", "tf")):
         rows = []
         for name, ga, gb in comparisons:
             models = groups[ga] + groups[gb]
-            mask = np.logical_and.reduce([use[m] for m in models])
+            mask = np.logical_and.reduce([is_open[m] for m in models])
             sub = {m: tables[m][mask].reset_index(drop=True) for m in models}
             base = ident[mask].reset_index(drop=True)
-            syn = None
-            if with_synergy:
-                syn = cb.changes(sub, groups, [(name, ga, gb)], key, t, args.n_boot, args.min_n, fdr=args.fdr,
-                                 units=units)  # fmt: skip
+            syn = cb.changes(sub, groups, [(name, ga, gb)], key, t, args.n_boot, args.min_n, fdr=args.fdr, units=units)
             di = delta_i(sub, base, groups[ga], groups[gb], key, units, args)
             if syn is None:
                 m = di
@@ -401,22 +237,11 @@ def main(argv: list[str] | None = None) -> int:
                 m = syn.merge(di, on=key, how="outer", suffixes=("", "_di"))
                 for c in ("mean_i_a", "mean_i_b"):
                     m[c] = m[c].fillna(m.pop(f"{c}_di"))
-            if has_e:
-                m["mean_e_a"] = m[key].map(mean_e(sub, base, groups[ga], key))
-                m["mean_e_b"] = m[key].map(mean_e(sub, base, groups[gb], key))
-                m["delta_e"] = m["mean_e_b"] - m["mean_e_a"]
-                r = summary["activity_r"]["comparisons"].setdefault(name, {})
-                tested = m["delta_i_q"].notna()
-                r[level] = {"delta_i": corr(m.loc[tested, "delta_i"], m.loc[tested, "delta_e"])}
-                if syn is not None:
-                    tested = m["q"].notna()
-                    r[level]["synergy"] = corr(m.loc[tested, "delta"], m.loc[tested, "delta_e"])
             for c, v in (("comparison", name), ("group_a", ga), ("group_b", gb)):
                 m[c] = v
             rows.append(m)
-            c = summary["comparisons"].setdefault(name, {
-                "pairs_open": int(np.logical_and.reduce([is_open[x] for x in models]).sum()),
-                "pairs_used": int(mask.sum()), "windows_used": int(base["unit"].nunique())})  # fmt: skip
+            c = summary["comparisons"].setdefault(name, {"pairs_open": int(mask.sum()),
+                                                         "windows_open": int(base["unit"].nunique())})  # fmt: skip
             c[level] = {
                 "synergy": counts(syn, ["significant", "robust"]),
                 "delta_i": counts(di, ["delta_i_significant", "delta_i_robust"]),
@@ -429,36 +254,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         if series:
             models = [d for g in series for d in groups[g]]
-            mask = np.logical_and.reduce([use[m] for m in models])
+            mask = np.logical_and.reduce([is_open[m] for m in models])
             sub = {m: tables[m][mask].reset_index(drop=True) for m in models}
             base = ident[mask].reset_index(drop=True)
-            tr = None
-            if with_synergy:
-                tr = cb.trend(sub, groups, series, key, t, args.n_boot, args.min_n, fdr=args.fdr, units=units)
+            tr = cb.trend(sub, groups, series, key, t, args.n_boot, args.min_n, fdr=args.fdr, units=units)
             si = slope_i(sub, base, groups, series, key, units, args)
             table = si if tr is None else tr.merge(si, on=key, how="outer")
-            if has_e:
-                x = np.arange(len(series), dtype=float)
-                w = (x - x.mean()) / ((x - x.mean()) ** 2).sum()
-                E = np.column_stack([table[key].map(mean_e(sub, base, groups[g], key)).to_numpy() for g in series])
-                for j, g in enumerate(series):
-                    table[f"mean_e_{g}"] = E[:, j]
-                table["slope_e"] = E @ w
-                tested = table["slope_i_q"].notna()
-                r = {"slope_i": corr(table.loc[tested, "slope_i"], table.loc[tested, "slope_e"])}
-                if tr is not None:
-                    tested = table["slope_q"].notna()
-                    r["synergy"] = corr(table.loc[tested, "slope"], table.loc[tested, "slope_e"])
-                summary["activity_r"]["series"][level] = r
             table.to_csv(out / f"trend_{level}.tsv", sep="\t", index=False, float_format="%.5g")
-            summary["series"]["pairs_open"] = int(np.logical_and.reduce([is_open[x] for x in models]).sum())
-            summary["series"]["pairs_used"] = int(mask.sum())
+            summary["series"]["pairs_open"] = int(mask.sum())
             summary["series"][level] = {
                 "synergy": cb.trend_counts(tr),
                 "slope_i": counts(si, ["slope_i_significant", "slope_i_robust"]),
             }
     summary["settings"] = {"t_coop": t, "n_boot": args.n_boot, "min_n": args.min_n, "fdr": args.fdr,
-                           "open_quantile": args.open_quantile, "series": series, "adjust": args.adjust}  # fmt: skip
+                           "open_quantile": args.open_quantile, "series": series}  # fmt: skip
     (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
     print(json.dumps(summary, indent=1)[:4000])
     return 0

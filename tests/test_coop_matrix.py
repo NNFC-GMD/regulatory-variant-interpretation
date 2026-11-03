@@ -138,7 +138,7 @@ def test_check_official(tmp_path):
     assert co.main(argv) == 0
     f = w["root"] / "official" / "coop_tf_pairs_by_dataset.tsv"
     t = pd.read_csv(f, sep="\t")
-    t.loc[0, "abs_i_sum"] *= 1.01
+    t.loc[0, "n"] += 1
     t.to_csv(f, sep="\t", index=False)
     assert co.main(argv) == 1
 
@@ -243,7 +243,7 @@ def _strength_world(tmp_path: Path, n: int = 400) -> dict:
 
 def test_paired_adjust_distant(tmp_path):
     w = _strength_world(tmp_path)
-    cells = ["--lo-bins", "10", "--hi-bins", "2", "--min-cell", "10"]
+    cells = ["--lo-bins", "10", "--hi-bins", "2"]
     raw, adj = tmp_path / "raw", tmp_path / "distant"
     assert _paired(w, "--out-dir", str(raw)) == 0
     assert _paired(w, "--adjust", "distant", "--out-dir", str(adj), *cells) == 0
@@ -256,9 +256,11 @@ def test_paired_adjust_distant(tmp_path):
     assert abs(a.loc["C + D", "delta_i"]) < 0.01 and a.loc["A + B", "delta_e"] == pytest.approx(0.6)
     curves = pd.read_csv(adj / "curves.tsv", sep="\t")
     assert set(curves["distance_class"]) == {"near", "far"} and set(curves["model"]) == {"m0", "m1", "m2"}
+    far = curves[curves["distance_class"] == "far"]
+    assert np.allclose(far["mean_adjusted_i"], 0, atol=1e-6)  # -0.5 e_a e_b is in the cubic surface
     s_raw = json.loads((raw / "summary.json").read_text())
     s_adj = json.loads((adj / "summary.json").read_text())
-    assert s_adj["adjust"]["method"] == "distant" and s_adj["adjust"]["far_pairs"]["m0"] == 3 * w["n"]
+    assert s_adj["adjust"]["method"] == "distant" and s_adj["adjust"]["models"]["m0"]["far_pairs"] == 3 * w["n"]
     assert s_raw["activity_r"]["series"]["pairs"]["slope_i"] < -0.8
     assert s_adj["activity_r"]["series"]["pairs"]["slope_i"] > s_raw["activity_r"]["series"]["pairs"]["slope_i"]
 

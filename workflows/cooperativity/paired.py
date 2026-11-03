@@ -42,12 +42,12 @@ looks less synergistic, and one whose sites weaken more. Each model's i (and i_f
            (or the series) uses the pairs qualified under all its models, so a motif that is inactive under any of
            them drops out. The package's tau is the median e_a + e_b of non-motif ablations, which coop_isa.py does not
            run: --tau (default 0). No synergy: its 0.1 is in log counts. i_f<k> is divided by the fold-mean e.
-  distant  i minus the mean i of the pairs more than --far-gap (150) bp apart, the package's null, whose sites are as
-           strong: per model, over its open pairs, in cells of the weaker site's e (--lo-bins quantiles, pooled over
-           the models so that a cell is the same under each) and, within each, of the stronger site's (--hi-bins
-           quantiles). A cell with fewer than --min-cell distant pairs takes its row's mean. i_f<k>: the same, with
-           fold k's i. curves.tsv: per model and cell, the mean i of the pairs adjacent (gap <= 5 bp), near (<= 50),
-           mid (<= --far-gap) and far, and the value subtracted.
+  distant  i minus what the pairs more than --far-gap (150) bp apart, the package's null, show for two sites as strong:
+           per model, a least-squares polynomial surface (--degree 3) of i over the weaker and the stronger site's e,
+           fitted on its open distant pairs, each e clipped to their 0.1-99.9th percentiles. i_f<k>: the same, fitted
+           on fold k's i. curves.tsv: per model and strength cell (--lo-bins quantiles of the weaker site's e, pooled
+           over the models; --hi-bins of the stronger one's within each), the pairs adjacent (gap <= 5 bp), near (<=
+           50), mid (<= --far-gap) and far: n, mean i, the mean value subtracted, the mean adjusted i.
 The value subtracted (or divided by) is fixed, not refitted in each bootstrap replicate. The output columns keep
 their names (mean_i_a, delta_i, slope_i, ...); summary.json's adjust says what i is.
 
@@ -241,63 +241,58 @@ def quantile_edges(v: np.ndarray, k: int) -> np.ndarray:
     return np.unique(np.quantile(v, np.linspace(0, 1, k + 1)[1:-1])) if len(v) else np.empty(0)
 
 
-def far_means(v: np.ndarray, cell: np.ndarray, b: np.ndarray, far: np.ndarray, n_hi: int, n_bins: int,
-              min_cell: int) -> np.ndarray:  # fmt: skip
-    """Per cell: the mean of v over the far rows in it; a cell with fewer than min_cell of them, its weaker-site bin's
-    mean (and a bin with fewer, every far row's)."""
-    n_bin = np.bincount(b[far], minlength=n_bins)
-    by_bin = np.where(n_bin >= min_cell, np.bincount(b[far], v[far], n_bins) / np.maximum(n_bin, 1), v[far].mean())
-    n_cell = np.bincount(cell[far], minlength=n_bins * n_hi)
-    by_cell = np.bincount(cell[far], v[far], n_bins * n_hi) / np.maximum(n_cell, 1)
-    return np.where(n_cell >= min_cell, by_cell, by_bin[np.arange(n_bins * n_hi) // n_hi])
+def surface(lo: np.ndarray, hi: np.ndarray, degree: int) -> np.ndarray:
+    """The monomials lo^p hi^q with p + q <= degree, one column each."""
+    return np.column_stack([lo**p * hi**q for p in range(degree + 1) for q in range(degree + 1 - p)])
 
 
-def adjust_distant(tables: dict, is_open: dict, far_gap: float, n_lo: int, n_hi: int, min_cell: int):
-    """In place, per model: i and i_f<k> minus the mean of the distant pairs (gap > far_gap, open under the model) in
-    the same strength cell (the module doc). Returns (curves.tsv's table, a summary)."""
+def adjust_distant(tables: dict, is_open: dict, far_gap: float, degree: int, n_lo: int, n_hi: int):
+    """In place, per model: i and i_f<k> minus what the distant pairs (gap > far_gap, open under the model) predict
+    for two sites as strong: a least-squares polynomial surface of --degree in the weaker and the stronger site's e,
+    each clipped to the distant pairs' 0.1-99.9th percentiles (the module doc). Returns (curves.tsv's table, a
+    summary)."""
     strength = {m: np.sort(t[["e_a", "e_b"]].to_numpy(), axis=1) for m, t in tables.items()}  # weaker, stronger
     far = {m: is_open[m] & (t["gap"].to_numpy() > far_gap) for m, t in tables.items()}
     pooled = np.concatenate([strength[m][far[m]] for m in tables])
-    lo_edges = quantile_edges(pooled[:, 0], n_lo)
+    lo_edges = quantile_edges(pooled[:, 0], n_lo)  # curves.tsv's cells, the same under every model
     pooled_bin = np.searchsorted(lo_edges, pooled[:, 0], side="right")
     hi_edges = [quantile_edges(pooled[pooled_bin == b, 1], n_hi) for b in range(len(lo_edges) + 1)]
-    n_bins, n_cells = len(lo_edges) + 1, (len(lo_edges) + 1) * n_hi
-    curves, fallback = [], {}
+    curves, fits = [], {}
     for m, t in tables.items():
+        f = far[m]
+        lo_range = np.quantile(strength[m][f, 0], [0.001, 0.999])
+        hi_range = np.quantile(strength[m][f, 1], [0.001, 0.999])
         lo, hi = strength[m][:, 0], strength[m][:, 1]
+        X = surface(np.clip(lo, *lo_range), np.clip(hi, *hi_range), degree)
+        raw = t["i"].to_numpy().copy()
+        for c in ["i", *cb.fold_columns([t])]:
+            v = t[c].to_numpy()
+            beta = np.linalg.lstsq(X[f], v[f], rcond=None)[0]
+            expected = X @ beta
+            t[c] = v - expected
+            if c == "i":
+                subtracted = expected
+                fits[m] = {"far_pairs": int(f.sum()), "weaker_e_range": [round(float(x), 4) for x in lo_range],
+                           "stronger_e_range": [round(float(x), 4) for x in hi_range],
+                           "far_r2": round(float(1 - np.var(v[f] - expected[f]) / np.var(v[f])), 4)}  # fmt: skip
         b = np.searchsorted(lo_edges, lo, side="right")
         h = np.zeros(len(t), dtype=np.int64)
         for k, e in enumerate(hi_edges):
             h[b == k] = np.searchsorted(e, hi[b == k], side="right")
-        cell, f = b * n_hi + h, far[m]
-        n_cell = np.bincount(cell[f], minlength=n_cells)
-        raw = t["i"].to_numpy().copy()
-        subtracted = far_means(raw, cell, b, f, n_hi, n_bins, min_cell)
-        t["i"] = raw - subtracted[cell]
-        for c in cb.fold_columns([t]):
-            v = t[c].to_numpy()
-            t[c] = v - far_means(v, cell, b, f, n_hi, n_bins, min_cell)[cell]
-        fallback[m] = int(((n_cell[cell] < min_cell) & is_open[m]).sum())
         gap, o = t["gap"].to_numpy(), is_open[m]
         kind = np.select([gap <= 5, gap <= 50, gap <= far_gap], ["adjacent", "near", "mid"], "far")
-        g = (pd.DataFrame({"cell": cell[o], "distance_class": kind[o], "i": raw[o], "weaker_e": lo[o],
-                           "stronger_e": hi[o]})
-             .groupby(["cell", "distance_class"])
-             .agg(n=("i", "size"), mean_i=("i", "mean"), weaker_e=("weaker_e", "median"),
-                  stronger_e=("stronger_e", "median"))
+        g = (pd.DataFrame({"weaker_bin": b[o], "stronger_bin": h[o], "distance_class": kind[o], "i": raw[o],
+                           "subtracted": subtracted[o], "weaker_e": lo[o], "stronger_e": hi[o]})
+             .groupby(["weaker_bin", "stronger_bin", "distance_class"])
+             .agg(n=("i", "size"), mean_i=("i", "mean"), subtracted=("subtracted", "mean"),
+                  weaker_e=("weaker_e", "median"), stronger_e=("stronger_e", "median"))
              .reset_index())  # fmt: skip
-        g["subtracted"] = subtracted[g["cell"]]
-        g["far_pairs_in_cell"] = n_cell[g["cell"]]
+        g["mean_adjusted_i"] = g["mean_i"] - g["subtracted"]
         g.insert(0, "model", m)
         curves.append(g)
-    curves = pd.concat(curves, ignore_index=True)
-    curves.insert(2, "weaker_bin", curves["cell"] // n_hi)
-    curves.insert(3, "stronger_bin", curves["cell"] % n_hi)
-    info = {"far_gap": far_gap, "lo_bins": n_bins, "hi_bins": n_hi, "min_cell": min_cell,
-            "weaker_e_edges": [round(float(x), 5) for x in lo_edges],
-            "far_pairs": {m: int(far[m].sum()) for m in tables},
-            "open_pairs_in_sparse_cells": fallback}  # fmt: skip
-    return curves.drop(columns="cell"), info
+    info = {"far_gap": far_gap, "degree": degree, "models": fits,
+            "curves_weaker_e_edges": [round(float(x), 5) for x in lo_edges]}  # fmt: skip
+    return pd.concat(curves, ignore_index=True), info
 
 
 def mean_e(sub: dict, base: pd.DataFrame, models: list[str], key: str) -> pd.Series:
@@ -345,9 +340,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tau", type=float, default=0.0, help="ratio: added to e_a + e_b (deepISA's tau)")
     ap.add_argument("--isa-quantile", type=float, default=0.1, help="ratio: the qualifying quantile of e")
     ap.add_argument("--far-gap", type=float, default=150, help="distant: the gap (bp) beyond which a pair is distant")
-    ap.add_argument("--lo-bins", type=int, default=20, help="distant: quantile bins of the weaker site's e")
-    ap.add_argument("--hi-bins", type=int, default=4, help="distant: quantile bins of the stronger one's, in each")
-    ap.add_argument("--min-cell", type=int, default=50, help="distant: the distant pairs a cell needs for its mean")
+    ap.add_argument("--degree", type=int, default=3, help="distant: the degree of the strength surface")
+    ap.add_argument("--lo-bins", type=int, default=20, help="distant: curves.tsv's bins of the weaker site's e")
+    ap.add_argument("--hi-bins", type=int, default=4, help="distant: curves.tsv's bins of the stronger one's, in each")
     args = ap.parse_args(argv)
     if args.adjust != "none" and args.out_dir is None:
         ap.error("--adjust needs --out-dir: combined/ holds the unadjusted results")
@@ -378,7 +373,7 @@ def main(argv: list[str] | None = None) -> int:
         summary["adjust"] = {"method": "ratio", "i": "i / (e_a + e_b + tau) on the qualified pairs", "tau": args.tau,
                              "isa_quantile": args.isa_quantile, "isa_thresh": isa_thresh, "qualified": qualified}  # fmt: skip
     elif args.adjust == "distant":
-        curves, info = adjust_distant(tables, is_open, args.far_gap, args.lo_bins, args.hi_bins, args.min_cell)
+        curves, info = adjust_distant(tables, is_open, args.far_gap, args.degree, args.lo_bins, args.hi_bins)
         curves.to_csv(out / "curves.tsv", sep="\t", index=False, float_format="%.5g")
         summary["adjust"] = {"method": "distant", "i": "i minus the mean i of distant pairs as strong", **info}
     pd.DataFrame([{"model": m, **v} for m, v in thresholds.items()]).to_csv(out / "open.tsv", sep="\t", index=False)

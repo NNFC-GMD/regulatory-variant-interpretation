@@ -484,10 +484,11 @@ same paired statistics, into its own `--out-dir` (`combined/` is never written):
   ablated ≥ 0). A comparison uses the pairs qualified under all its models, so a motif that is inactive under any of
   them drops out (`pairs_used` beside `pairs_open` in `summary.json`). The package's tau is the median e_a + e_b of
   non-motif ablations, which `coop_isa.py` does not run: `--tau`, default 0. No synergy: its 0.1 is in log counts.
-- **`distant`**: i minus the mean i of the distant pairs (gap > 150 bp, the package's null) whose two sites are as
-  strong, per model, in cells of the weaker site's e (20 quantile bins pooled over the models) and, within each, of
-  the stronger one's (4). `curves.tsv` has, per model and cell, the mean i of the pairs adjacent (gap ≤ 5 bp), near
-  (≤ 50), mid (≤ 150) and far, and the value subtracted.
+- **`distant`**: i minus what the distant pairs (gap > 150 bp, the package's null) show for two sites as strong:
+  per model, a cubic least-squares surface of i over the weaker and the stronger site's e, fitted on its open distant
+  pairs. `curves.tsv` has, per model and strength cell, the mean i of the pairs adjacent (gap ≤ 5 bp), near (≤ 50),
+  mid (≤ 150) and far, the mean value subtracted and the mean adjusted i (about 0 for the far pairs when the surface
+  fits).
 
 ```
 rvi_run cherimoya python workflows/cooperativity/paired.py --matrix <coop>/matrix --motifs <coop>/motifs.tsv \

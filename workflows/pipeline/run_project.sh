@@ -190,7 +190,9 @@ stage_attribute() {
         CHERI_SLOTS_PER_GPU="${SLOT_ATTRIBUTE_PER_GPU}" CHERI_CORES_PER_SLOT="${SLOT_ATTRIBUTE_CORES}" \
         CHERI_PIXI_MANIFEST="${repo_root}/pixi.toml" \
         bash "${repo_root}/workflows/train/run_box.sh" > "${logs}/attribute.log" 2>&1
+    # The tasks that fell back to the default path, if any (none is the expected case, not a failure).
     (( dry )) || grep -h "FELL BACK" "${PROJECT_CHERI_ROOT}"/box/*/logs/*.log 2> /dev/null | sed 's/^/    /' | head -n 25
+    return 0
 }
 
 stage_downstream() {

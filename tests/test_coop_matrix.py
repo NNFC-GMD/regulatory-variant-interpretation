@@ -1,7 +1,5 @@
 """DeepISA's significance, fold check and trends (combine.py), the same sites under every model (paired.py,
-matrix.py), and the coop_matrix stage's project settings, on toy tables. CPU only.
-
-Not in test-pipeline yet (the preflight's required tests): it joins them once it has passed in a box."""
+matrix.py), and the coop_matrix stage's project settings, on toy tables. CPU only. In test-pipeline."""
 
 from __future__ import annotations
 

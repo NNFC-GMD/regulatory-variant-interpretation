@@ -46,7 +46,8 @@ path from root, prefix and the sample stems; a dataset is `<ds>` = prefix + stem
 - **The preflight** checks that both checkouts are clean and igvf is at its pin, that every environment and input
   exists, and runs the tests: `pixi run check` (lint, shellcheck, the CPU tests) and `pixi run -e cherimoya
   test-pipeline` (the tests of what the driver runs) are required; every other test in the cherimoya environment
-  (`test-cherimoya`) runs beside the stages and is reported in STATUS.md, not required.
+  (`test-cherimoya`, which leaves out the frozen engine's `tests/test_dls_*.py`: those need cherimoya 0.3.0 and run
+  as `pixi run -e cherimoya-030 test-engine`) runs beside the stages and is reported in STATUS.md, not required.
 - **Outputs decide what is done.** A stage is skipped when `project.py check <stage>` finds its outputs complete,
   and counts as done only when the check passes after it ran. Exit codes are not trusted: `train/run_box.sh` always
   exits 0, and the runners report per task. So a resubmitted box resumes where the last one stopped.

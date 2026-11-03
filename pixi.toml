@@ -51,10 +51,12 @@ torch = "==2.14.0"
 deepisa = { git = "https://github.com/anderssonlab/deepISA", rev = "179091c3c272d3a5543e058827b95ff7839d03de" }
 
 [feature.cherimoya.tasks]
-test-cherimoya = "pytest -q tests"
+# Every test but the frozen engine's (tests/test_dls_*.py: test-engine, in cherimoya-030; they import names only
+# cherimoya 0.3.0 has).
+test-cherimoya = "pytest -q tests --ignore-glob='tests/test_dls_*.py'"
 # The tests of what workflows/pipeline/run_project.sh runs; its preflight requires them (and runs test-cherimoya
 # beside, reported in STATUS.md).
-test-pipeline = "pytest -q tests/test_pipeline_project.py tests/test_cooperativity.py tests/test_run_task_attribute.py tests/test_make_downstream.py tests/test_make_jobs.py tests/test_attr_status.py tests/test_to_chrombpnet_scores.py tests/test_check_dataset.py tests/test_downstream.py"
+test-pipeline = "pytest -q tests/test_pipeline_project.py tests/test_cooperativity.py tests/test_coop_matrix.py tests/test_run_task_attribute.py tests/test_make_downstream.py tests/test_make_jobs.py tests/test_attr_status.py tests/test_to_chrombpnet_scores.py tests/test_check_dataset.py tests/test_downstream.py"
 
 # The environment the AMSC campaign attributed with, kept as it was solved
 # (plus pytest, for the engine's own tests).

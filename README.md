@@ -1,20 +1,36 @@
 # regulatory-variant-interpretation
 
 Sequence-to-function models of chromatin accessibility, trained to interpret
-regulatory variants.
+regulatory variants. This is the reference repository of Mímir, the NNFC
+initiative to prepare datasets, train models, score variants and interpret them:
+its framework, driver and documentation live here.
+
+## Start here
+
+- [docs/pipeline.md](docs/pipeline.md): every step from fragment files to
+  models, motifs and TF cooperativity: what it does and why, its command,
+  environment and cost.
+- [docs/new_project.md](docs/new_project.md): starting and running a project.
+- [docs/cluster.md](docs/cluster.md): the rules of the Gefion (DCAI) cluster.
+- [AGENTS.md](AGENTS.md): instructions for coding agents.
 
 ## Layout
 
 `workflows/` holds one folder per stage. Each script's header says what it reads and writes.
 
+- `pipeline/`: the end-to-end driver for a project: its `project.yaml`, the
+  fetch from the IGVF portal, one box that runs every stage, and `STATUS.md`.
 - `train/` trains [Cherimoya](https://github.com/jmschrei/cherimoya) models on
   the inputs and chromosome folds the
   [igvf_tf_chrombpnet](https://github.com/IGVF/igvf_tf_chrombpnet) pipeline uses
   for ChromBPNet. It then scores both models on the same test peaks with the
   same code. See its README.
-- `attribution/`: DeepLIFT/SHAP for Cherimoya (`attribute_fast.py` and its
-  engine, `cheri_dls.py` and `dls_refs.py`), the status and engine pin of each
-  fold's attribution (`attr_status.py`), and the engine's validation harness
+- `attribution/`: DeepLIFT/SHAP for Cherimoya. New projects attribute with
+  `cherimoya attribute` (Cherimoya 0.3.1's fast path), recorded by
+  `stock_record.py`; the AMSC campaign's engine (`attribute_fast.py`,
+  `cheri_dls.py`, `dls_refs.py`) is kept frozen beside it. Also the status and
+  engine pin of each fold's attribution (`attr_status.py`), and the engine's
+  validation harness
   (`dls_*.py`). The three engine files are kept byte for byte as signed off, because
   the engine pin compares their sha256: `attribute_fast.py`'s usage line still
   names its old folder, `workflows/cherimoya/`.
@@ -30,17 +46,30 @@ regulatory variants.
   and at the QTL's peak.
 - `cooperativity/`: TF cooperativity by in-silico ablation of motif sites
   (DeepISA's definitions) with Cherimoya models. See its README.
-- `tests/`: `pixi run test`. These tests need no GPU and no data.
+- `docs/`: the pipeline reference, the new-project guide, the cluster rules.
+- `tests/`: the tests. They need no data; some need torch, pandas or a GPU, so
+  they run in a box (`docs/cluster.md`).
 - `pixi.toml` / `pixi.lock`: environments.
-  - `default`: lint and tests.
-  - `cherimoya`: training and scoring, CUDA 13 torch.
+  - `default`: lint, the CPU tests, and the driver's helpers.
+  - `cherimoya`: Cherimoya 0.3.1 (training, `cherimoya attribute`, scoring),
+    the official deepISA package, CUDA 13 torch.
+  - `cherimoya-030`: Cherimoya 0.3.0 and tangermeme 1.5.0, only for the frozen
+    `attribute_fast.py` engine and its tests.
 
 ## Commands
 
 ```bash
-pixi install                 # default environment: lint and tests
-pixi install -e cherimoya    # training (NVIDIA driver >= 580)
-pixi run check               # bash -n + shellcheck, ruff, pytest
+pixi install                      # default environment: lint, tests, the driver's helpers
+pixi install -e cherimoya         # Cherimoya 0.3.1 (NVIDIA driver >= 580)
+pixi install -e cherimoya-030     # the frozen attribution engine (AMSC)
+
+# login node: lint only
+pixi run lint && pixi run check-bash && pixi run ruff format --check workflows tests
+# in a box: the tests
+pixi run check                            # bash -n + shellcheck, ruff, pytest (default env)
+pixi run -e cherimoya test-pipeline      # the tests of what workflows/pipeline/ runs (a box's preflight)
+pixi run -e cherimoya test-cherimoya      # the tests that need torch, pandas or deepISA
+pixi run -e cherimoya-030 test-engine     # the frozen engine's tests
 ```
 
 No data or results are tracked. Datasets, their configurations and every

@@ -244,3 +244,23 @@ def test_lists_refuse_unknown_and_bad_names(tmp_path):
 def test_chromosome_order():
     names = ["chrX", "chr10", "chrM", "chr2", "chrY", "chr1", "chr22"]
     assert sorted(names, key=md.chrom_key) == ["chr1", "chr2", "chr10", "chr22", "chrM", "chrX", "chrY"]
+
+
+def test_engine_cherimoya_and_an_empty_shared_list(tmp_path):
+    """--engine cherimoya: `cherimoya attribute` (>= 0.3.1) refuses anything but a bool in "fast"; the rest of the
+    JSON is the rvi engine's. A project without ChromBPNet passes an empty --shared and gets cheri<D>.tsv."""
+    argv = _tree(tmp_path, shared=())
+    assert md.main([*argv, "--engine", "cherimoya"]) == 0
+    rvi = tmp_path / "rvi"
+    assert md.main(_tree(rvi, shared=())) == 0
+    for fold in "01":
+        p, q = _attribute(tmp_path, "ds_a", fold), _attribute(rvi, "ds_a", fold)
+        assert p["fast"] is True and isinstance(q["fast"], dict)
+        assert p["output"] == "counts"  # the converted scores' names and the downstream configs are keyed on it
+        same = {k: v for k, v in p.items() if k != "fast"}
+        other = {k: str(v).replace(str(rvi), str(tmp_path)) for k, v in q.items() if k != "fast"}
+        assert {k: str(v) for k, v in same.items()} == other
+    inputs = tmp_path / "compendia" / "inputs"
+    assert (inputs / "shared0.txt").read_text() == ""
+    rows = (inputs / "cheri2.tsv").read_text().splitlines()
+    assert [r.split("\t")[0] for r in rows] == ["cheri_ds_a", "cheri_ds_b"]

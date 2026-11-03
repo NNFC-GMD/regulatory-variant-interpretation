@@ -1,7 +1,8 @@
 # Cherimoya, trained beside ChromBPNet
 
 [Cherimoya](https://github.com/jmschrei/cherimoya) (Jacob Schreiber; pinned at
-0.3.0 in `pixi.toml`) is a compact sequence-to-function model that builds on
+0.3.1 in `pixi.toml`'s `cherimoya` environment, 0.3.0 in `cherimoya-030`; the
+model code is the same in both) is a compact sequence-to-function model that builds on
 ChromBPNet. It predicts a base-resolution profile and a total count from 2,114 bp
 of sequence, like ChromBPNet, but it has no separate bias model: it learns the
 observed signal, Tn5 preference included.
@@ -27,8 +28,9 @@ writes one Cherimoya `fit.json` per fold:
 | `random_state` | 1234 + fold | the default 0 would start all five folds identically |
 
 Everything else is Cherimoya's default (`cherimoya_cli/defaults.py`): 9 layers,
-128 filters, batch 64, float32, at least 20 epochs and 20,000 steps, no early
-stopping, `torch.compile` with max-autotune. `--set KEY=VALUE` overrides a fit
+128 filters, batch 64, float32, 20 epochs raised until at least 20,000 steps
+(so fewer peaks means more epochs), no early stopping, `torch.compile` with
+max-autotune, and in 0.3.1 `num_threads` 4 (PyTorch's CPU threads per fit). `--set KEY=VALUE` overrides a fit
 parameter, but not one that would change the data being compared. Cherimoya's
 own ENCODE atlas (CATv1) trained in bfloat16 (`--set dtype=bfloat16`), which is
 the obvious knob to try if training time matters.
@@ -88,6 +90,19 @@ pixi run -e cherimoya python workflows/train/summarize.py --root <out-root> --ou
 pixi run -e cherimoya python workflows/train/plot_comparison.py \
     --paired <dir>/comparison_paired.tsv --out <dir>/comparison_counts
 ```
+
+`run_box.sh` starts its workers slot by slot across the GPUs (the first slot
+of every GPU, then the second, ...), so a queue shorter than the slots still
+spreads over every GPU. Each worker runs `run_task.sh <fold> <stages>`:
+`fit`, `compare` and `attribute` (not part of `all`; see
+`../downstream/README.md`). `CHERI_PIXI_ENV` names the environment of fit and
+compare (default `cherimoya`); `CHERI_ATTR_ENGINE` picks the attribution engine
+(`rvi`, the default: `attribute_fast.py` in `cherimoya-030`; `cherimoya`:
+`cherimoya attribute`), and `CHERI_ATTR_PIXI_ENV` overrides its environment.
+
+For a whole project (preprocessing, training, attribution, motifs and
+cooperativity in one box), use `../pipeline/` instead of calling these by hand
+(`docs/pipeline.md`).
 
 `plot_comparison.py` draws one scatter panel per measure, ChromBPNet on x and
 Cherimoya on y. The default measures are counts Pearson and Spearman. There is

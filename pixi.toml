@@ -6,9 +6,18 @@ platforms = ["linux-64"]
 
 # Environments:
 #
-#   default     lint and tests; no torch, no GPU
-#   cherimoya   training, attribution, variant scoring and the ChromBPNet comparison
-#               (workflows/); CUDA 13 torch, NVIDIA driver >= 580
+#   default        lint and tests; no torch, no GPU
+#   cherimoya      Cherimoya 0.3.1: training, `cherimoya attribute` (its fast
+#                  DeepLIFT/SHAP path), variant scoring, the comparison, and
+#                  DeepISA (official package, for its cooperativity rules);
+#                  CUDA 13 torch, NVIDIA driver >= 580. The default for every
+#                  project, and pytest for the tests that need torch or pandas
+#                  (`pixi run -e cherimoya test-cherimoya`).
+#   cherimoya-030  Cherimoya 0.3.0 with tangermeme 1.5.0, only for
+#                  workflows/attribution/attribute_fast.py: its engine refuses
+#                  any other versions (its tests: `pixi run -e cherimoya-030
+#                  test-engine`). Cherimoya's model code is the same in 0.3.0
+#                  and 0.3.1, so both load every model.
 #
 # Each tool environment has its own solve group, so one tool's pins cannot move
 # another's.
@@ -31,13 +40,42 @@ shellcheck = ">=0.10"
 [feature.cherimoya.dependencies]
 python = ">=3.12,<3.13"
 pyyaml = ">=6.0"
+pytest = ">=8"
 
+# deepISA (anderssonlab/deepISA, He et al. 2025), pinned to a commit: it has
+# no release yet. Only its score/ functions are used (cooperativity/combine.py
+# --official); they import neither captum nor h5py.
 [feature.cherimoya.pypi-dependencies]
+cherimoya = "==0.3.1"
+torch = "==2.14.0"
+deepisa = { git = "https://github.com/anderssonlab/deepISA", rev = "179091c3c272d3a5543e058827b95ff7839d03de" }
+
+[feature.cherimoya.tasks]
+# Every test but the frozen engine's (tests/test_dls_*.py: test-engine, in cherimoya-030; they import names only
+# cherimoya 0.3.0 has).
+test-cherimoya = "pytest -q tests --ignore-glob='tests/test_dls_*.py'"
+# The tests of what workflows/pipeline/run_project.sh runs; its preflight requires them (and runs test-cherimoya
+# beside, reported in STATUS.md).
+test-pipeline = "pytest -q tests/test_pipeline_project.py tests/test_cooperativity.py tests/test_coop_matrix.py tests/test_run_task_attribute.py tests/test_make_downstream.py tests/test_make_jobs.py tests/test_attr_status.py tests/test_to_chrombpnet_scores.py tests/test_check_dataset.py tests/test_downstream.py"
+
+# The environment the AMSC campaign attributed with, kept as it was solved
+# (plus pytest, for the engine's own tests).
+[feature.cherimoya-030.dependencies]
+python = ">=3.12,<3.13"
+pyyaml = ">=6.0"
+pytest = ">=8"
+
+[feature.cherimoya-030.pypi-dependencies]
 cherimoya = "==0.3.0"
+tangermeme = "==1.5.0"
 torch = "==2.14.0"
 
+[feature.cherimoya-030.tasks]
+test-engine = "pytest -q tests/test_dls_cli.py tests/test_dls_engine.py tests/test_dls_refs.py tests/test_dls_rules.py tests/test_dls_gpu.py tests/test_dls_ab.py tests/test_dls_validate.py tests/test_dls_e2e.py"
+
 [environments]
-cherimoya = { features = ["cherimoya"], no-default-feature = true, solve-group = "cherimoya" }
+cherimoya = { features = ["cherimoya"], no-default-feature = true, solve-group = "cherimoya-031" }
+cherimoya-030 = { features = ["cherimoya-030"], no-default-feature = true, solve-group = "cherimoya" }
 
 [tasks]
 lint = "ruff check workflows tests"

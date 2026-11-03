@@ -33,9 +33,16 @@ For every dataset and fold under --cheri-root (make_jobs.py's --out-root):
       outputs    attr.ohe.npz, attr.attr.npz and attr.idx.npy in the fold directory; attribute_fast.py adds
                  attr.attr.deltas.npy and attr.attr.meta.json. A refit's cleanup (cherimoya.fold_<k>.*) does not
                  reach them; attr_status.py calls them stale once the model is newer than the meta.
-      "fast"     precision reference, mem_budget_gb 7.5 (about 7 GB of GPU memory at 8 peaks per step),
-                 ref_workers 3 (4 cores per process), audit 8 (each run re-checked against the stock
-                 deep_lift_shap on 8 peaks). The stock command ignores the block.
+      "fast"     the engine's settings, by --engine (run_task.sh's CHERI_ATTR_ENGINE must name the same one):
+                 rvi        attribute_fast.py's block: precision reference, mem_budget_gb 7.5 (about 7 GB of GPU
+                            memory at 8 peaks per step), ref_workers 3 (4 cores per process), audit 8 (each run
+                            re-checked against the stock deep_lift_shap on 8 peaks). Cherimoya 0.3.0's stock
+                            command ignores the block; 0.3.1's refuses it.
+                 cherimoya  true: `cherimoya attribute` (Cherimoya >= 0.3.1) with its fast path, this repo's
+                            engine upstream. It checks itself against tangermeme's path on the first sequences
+                            and falls back to that path when they disagree (stock_record.py records which ran).
+                            "output" stays "counts", which 0.3.1 takes as "logcounts" with a FutureWarning:
+                            the converted scores' file names and the downstream configs are keyed on it.
   configs/<dataset>/config.yaml       an igvf_tf_chrombpnet dataset config for 06.0-11.0 on the converted scores
                                       (DATASET_CONFIG=). output_dir is <cheri-root>/<dataset>/downstream, a tree of
                                       its own, so no step skips on ChromBPNet's outputs. signal_path, assay,
@@ -180,7 +187,9 @@ def attribute_parameters(fold_dir: Path, fold: str, fit: dict, chroms: list[str]
         "compile": False,
         "verbose": False,
         **{key: str(fold_dir / name) for key, name in OUTPUT_NAMES.items()},
-        "fast": {
+        "fast": True
+        if args.engine == "cherimoya"
+        else {
             "precision": args.precision,
             "mem_budget_gb": args.mem_budget_gb,
             "ref_workers": args.ref_workers,
@@ -286,6 +295,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--batch-size", type=int, default=64, help="sets the engine's head_rows (2 x); default 64")
     ap.add_argument("--warning-threshold", type=float, default=0.001)
     ap.add_argument("--output", choices=("counts",), default="counts", help="the head attributed (counts)")
+    ap.add_argument("--engine", choices=("rvi", "cherimoya"), default="rvi",
+                    help="attribute_fast.py's settings block (rvi, default) or `cherimoya attribute`'s fast path "
+                         "(cherimoya, Cherimoya >= 0.3.1)")  # fmt: skip
     ap.add_argument("--precision", choices=("reference", "fp32"), default="reference")
     ap.add_argument("--mem-budget-gb", type=float, default=7.5)
     ap.add_argument("--ref-workers", type=int, default=3)

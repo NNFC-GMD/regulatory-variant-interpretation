@@ -1,0 +1,5 @@
+# The igvf_tf_chrombpnet commit this pipeline runs (IGVF/igvf_tf_chrombpnet, branch chrombpnet2): its steps 00.0-02.0
+# and 06.0-11.0, and workflows/dcai/{env.sh,detect_shifts.py,make_configs.py,run_chain.sh,motif_chain.sh}.
+# run_project.sh's preflight refuses a checkout at another commit or with uncommitted changes. Change it only
+# together with the docs (docs/pipeline.md) and a run that passes on the new commit.
+2446d6f616e5f12e5f99a1c53ed2442f60629f0c

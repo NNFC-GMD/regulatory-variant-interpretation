@@ -17,6 +17,7 @@ agents.
 | **Cooperativity** (`cooperativity`) | DeepISA: in-silico ablation of motif pairs | `workflows/cooperativity/` |
 | `coop_matrix` (optional) | DeepISA on every dataset's sites under every dataset's models: paired changes, trends | `workflows/cooperativity/matrix.py`, `paired.py` |
 | summary | `<root>/STATUS.md` | `workflows/pipeline/status.py` |
+| prune, share (after) | delete the derived intermediates, from a reviewed manifest; pack the results in a tar | `workflows/pipeline/prune.py`, `share.py` (login node) |
 
 Outside the driver, for projects that need them:
 - **Score:** variant effects (`workflows/variant_scoring/`, `workflows/nulls/`) and QTL checks (`workflows/qtl/`).
@@ -457,6 +458,33 @@ rules (`workflows/cooperativity/README.md`, section 10). CPU only, about a minut
 
 **Measured (AMSC):** about 6–7 min per dataset on one GPU (~0.7 M sequences, 5 folds), ~8 GB RSS. The per-dataset
 runs go one per GPU at once.
+
+## When a project is finished: prune and share
+
+Not stages: run by hand on the login node, after the last box.
+
+**Prune.** About half of a finished project is copies: each fold's attribution is kept twice (the float32 npz and a
+float16 copy in ChromBPNet's 05.0 layout), Fi-NeMo keeps its input arrays, MACS3 and 01.0 leave their intermediates.
+```
+nice -n 19 ionice -c3 pixi run -e default python workflows/pipeline/project.py <project.yaml> prune
+pixi run -e default python workflows/pipeline/project.py <project.yaml> prune --apply <root>/prune/manifest.<stamp>.tsv
+```
+- **The dry run** writes `<root>/prune/manifest.<stamp>.tsv` (every file it would delete: path, bytes, rule),
+  `summary.<stamp>.tsv` (files and bytes per rule) and `unclassified.<stamp>.tsv` (files no rule names, kept), and
+  prints the totals. It deletes nothing.
+- **Read the manifest, then apply it.** `--apply` deletes that manifest's files and no others, then the directories
+  left empty, and logs `deleted.<stamp>.tsv`. It refuses a manifest of another root, a path outside the root and
+  any file a stage check reads, and skips a file whose size changed since the dry run.
+- **The rules** are in `prune.py`: what each file is, why it can go, and how to get it back (docs/results.md, "What
+  prune removes"). Every project gets the `pipeline` set. A project with trained ChromBPNet models or variant
+  scores adds the `chrombpnet` or `variant_scoring` set, and its own rules, in project.yaml's `prune:` block.
+- **Why it is safe to resume afterwards:** nothing a stage's `project.py check` reads is ever deleted (the fold
+  attribution files included), so every stage still checks as done and a resubmitted box redoes nothing.
+- **Measured:** a 5-dataset project, 64 GiB of 139; a 39-dataset pilot with ChromBPNet models and variant scoring,
+  2.9 TiB of ~5 TiB. The dry run takes seconds to a minute: directories kept whole are not walked.
+
+**Share.** `project.py <project.yaml> share --out <file.tar> [--datasets ...] [--with-signal] [--list]` packs the
+results someone without cluster access needs (docs/results.md, "Getting the files"), with an md5 of each file.
 
 ## Changing a pinned version
 

@@ -25,8 +25,11 @@ if [[ "${SUBMIT_FORCE:-0}" != 1 ]]; then
     [[ -n "$(git -C "${repo_root}" branch -r --contains HEAD 2> /dev/null)" ]] \
         || die "HEAD ${state} is on no remote branch; push it first"
 fi
-eval "$(pixi run --frozen --manifest-path "${repo_root}/pixi.toml" -e default python "${here}/project.py" "${project_file}" env)" \
-    || die "project.yaml does not load"
+# Captured first: `eval "$(cmd)" || die` would never die (eval of an empty string succeeds). project.py env refuses a
+# project marked driver: false, and says why on stderr.
+project_env="$(pixi run --frozen --manifest-path "${repo_root}/pixi.toml" -e default python "${here}/project.py" "${project_file}" env)" \
+    || die "project.yaml does not load, or is not for the driver (driver: false)"
+eval "${project_env}"
 want="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' "${here}/igvf.pin")"
 have="$(git -C "${PROJECT_IGVF}" rev-parse HEAD 2> /dev/null)"
 [[ "${have}" == "${want}" ]] || die "${PROJECT_IGVF} is at ${have:-?}; workflows/pipeline/igvf.pin wants ${want}"

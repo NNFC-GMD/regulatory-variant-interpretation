@@ -9,9 +9,11 @@ documentation. If something about how to run the pipeline is not written down he
 
 - `docs/pipeline.md`: every step, what it does and why, its command, environment and cost.
 - `docs/new_project.md`: starting and running a project, step by step.
+- `docs/results.md`: what a finished project's files hold and how to read them; prune and share.
 - `docs/cluster.md`: the rules of the Gefion (DCAI) cluster.
 - `workflows/pipeline/`: the driver: `project.py` (the layout and the stage checks), `fetch_igvf.py`, `submit.sh`,
-  `run_project.sh`, `status.py`, `project.example.yaml`.
+  `run_project.sh`, `status.py`, `project.example.yaml`; and for finished projects `prune.py` (what may be deleted,
+  by rule, from a reviewed manifest) and `share.py` (the results in one tar).
 
 ## Map
 

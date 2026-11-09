@@ -61,3 +61,14 @@ slots:
   coop_cores: 16          # CPUs per DeepISA lane
 hold_minutes: 60          # how long a box waits for a fix after a failed stage
 shift_every: 100          # detect_shifts.py keeps every Nth fragment; ~100 for a 10-30 M-fragment file
+
+# driver (default true): false marks a project set up by hand before the driver, kept for its results. project.py's
+# check, status, prune and share work on it; env and coop-inputs refuse it, so run_project.sh and submit.sh do too.
+driver: true
+
+# prune (optional; docs/pipeline.md, "When a project is finished"): which of prune.py's rule sets apply (default
+# [pipeline]; add chrombpnet for trained ChromBPNet models, variant_scoring for workflows/variant_scoring/ runs), the
+# datasets <shared> stands for (a list or a file of names, relative to root), and the project's own keep and delete
+# patterns, relative to root. A keep always wins, and nothing a stage check reads is ever deleted.
+prune:
+  rulesets: [pipeline]

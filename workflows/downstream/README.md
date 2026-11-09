@@ -134,6 +134,13 @@ instead):
   float16 cast did (non-zero values that became 0, flagged above 1e-3;
   subnormals; max |value|).
 
+The h5 is a copy of the fold's npz files, needed only while 06.0 and the
+checks run: a finished project's prune deletes it and keeps the bed and the
+provenance (docs/results.md, "What prune removes"). To redo 06.0 later,
+convert the folds again first; the provenance no longer matches a missing h5,
+so the converter writes it again. downstream.sh would skip the steps whose
+`.done/` markers are there.
+
 It refuses a fold that is not DONE, an ohe that is not one-hot, attributions
 that are not finite or exceed float16's 65504, and rows that differ from those
 of a sibling fold already converted. Each file goes through `.partial` and a

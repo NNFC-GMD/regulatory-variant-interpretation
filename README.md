@@ -11,6 +11,8 @@ its framework, driver and documentation live here.
   models, motifs and TF cooperativity: what it does and why, its command,
   environment and cost.
 - [docs/new_project.md](docs/new_project.md): starting and running a project.
+- [docs/results.md](docs/results.md): using a project's results: what each file holds and how to read it,
+  pruning a finished project, and packing its results for someone outside the cluster.
 - [docs/cluster.md](docs/cluster.md): the rules of the Gefion (DCAI) cluster.
 - [AGENTS.md](AGENTS.md): instructions for coding agents.
 

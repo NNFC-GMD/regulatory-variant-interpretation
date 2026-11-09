@@ -121,7 +121,8 @@ commit and push, and resubmit.
 
 ## 8. The results
 
-Under `<root>`, as `workflows/pipeline/project.py`'s docstring lays them out. What to look at first:
+Under `<root>`, as `workflows/pipeline/project.py`'s docstring lays them out; `docs/results.md` says what each
+file holds and how to read it. What to look at first:
 
 | what | where |
 |---|---|
@@ -138,3 +139,19 @@ Under `<root>`, as `workflows/pipeline/project.py`'s docstring lays them out. Wh
 
 Write down anything particular to the project, such as decisions, problems and dates (in ET), in a `NOTES.md` in
 its root, not in this repository.
+
+## 9. When the project is finished
+
+1. **Write its `README.md`** in the root, for the people who will use it: what the datasets are, the compendium,
+   where any report is, known issues, and what is particular to it. `docs/results.md` covers what every project
+   has, so link to it rather than repeat it.
+2. **Prune it** (docs/pipeline.md, "When a project is finished"): the dry run writes a manifest; read it, check
+   the totals per rule and the unclassified list, then apply it.
+   ```bash
+   nice -n 19 ionice -c3 pixi run -e default python workflows/pipeline/project.py <root>/project.yaml prune
+   pixi run -e default python workflows/pipeline/project.py <root>/project.yaml prune --apply <root>/prune/manifest.<stamp>.tsv
+   ```
+   `project.py <root>/project.yaml status` should still show every stage done afterwards.
+3. **Note it in `NOTES.md`:** the date, the manifest and what it freed.
+4. **To share it** with someone without cluster access: `project.py <root>/project.yaml share --out <file.tar>`
+   (ask first if the data are unpublished).

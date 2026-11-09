@@ -31,6 +31,16 @@ the runners it calls report per task, and some of them always exit 0.
                                                    cooperativity coop_matrix)
     project.py <project.yaml> status               every stage's state, one line each
     project.py <project.yaml> coop-inputs          write the cooperativity args files, groups.tsv, comparisons.tsv
+    project.py <project.yaml> prune [--apply <manifest>]
+                                                   the dry run writes <root>/prune/manifest.<stamp>.tsv, the
+                                                   derived intermediates a finished project can lose; --apply
+                                                   deletes exactly that manifest's files (prune.py)
+    project.py <project.yaml> share --out <file.tar> [--datasets a,b] [--with-signal] [--list]
+                                                   the results, packed for someone without cluster access (share.py)
+
+`driver: false` in project.yaml marks a project the driver must not run (one set up by hand before the driver
+existed, kept for its results): env and coop-inputs refuse it, so run_project.sh and submit.sh do too, while
+show, check, status, prune and share still work.
 
 Needs only the standard library and PyYAML (the default pixi env), so it runs on the login node.
 """
@@ -78,7 +88,10 @@ DEFAULTS = {
     "stages": list(BOX_STAGES),
     "hold_minutes": 60,
     "shift_every": 100,
+    "driver": True,
 }
+DRIVER_REFUSED = 3
+"""project.py's exit code when a driver command meets a project marked driver: false."""
 
 
 class ProjectError(ValueError):
@@ -96,7 +109,7 @@ def load(path: Path) -> dict:
     if not isinstance(raw, dict):
         raise ProjectError(f"{path}: not a mapping")
     known = {"project", "root", "prefix", "samples", "compendium", "cooperativity", "slots", "folds", "folds_dir",
-             *DEFAULTS}  # fmt: skip
+             "prune", *DEFAULTS}  # fmt: skip
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ProjectError(f"{path}: unknown keys {unknown}")
@@ -108,6 +121,8 @@ def load(path: Path) -> dict:
         raise ProjectError(f"{path}: project and compendium must match {NAME_RE.pattern}")
     if p["prefix"] and not NAME_RE.match(p["prefix"]):
         raise ProjectError(f"{path}: prefix must match {NAME_RE.pattern}")
+    if not isinstance(p["driver"], bool):
+        raise ProjectError(f"{path}: driver must be true or false")
     root = Path(p["root"])
     if not root.is_absolute():
         raise ProjectError(f"{path}: root must be an absolute path")
@@ -250,8 +265,9 @@ def _missing(files) -> list[str]:
     return out
 
 
-def check(p: dict, stage: str) -> list[str]:
-    """What the stage has not produced yet ([] when done)."""
+def needed(p: dict, stage: str) -> list[Path]:
+    """The files and directories the stage's check reads. For attribute, check also has attr_status read each fold's
+    attribution files through its attribute.json; prune.needed adds those. prune.py deletes none of them."""
     if stage not in STAGES:
         raise ProjectError(f"unknown stage {stage}; stages are {list(STAGES)}")
     need: list = []
@@ -281,7 +297,12 @@ def check(p: dict, stage: str) -> list[str]:
         need += [paths(p)["coop"] / "combined" / "summary.json", paths(p)["coop"] / "official" / "summary.json"]
     if stage == "coop_matrix":
         need.append(paths(p)["coop_matrix"] / "combined" / "summary.json")
-    missing = _missing(need)
+    return [Path(x) for x in need]
+
+
+def check(p: dict, stage: str) -> list[str]:
+    """What the stage has not produced yet ([] when done)."""
+    missing = _missing(needed(p, stage))
     if stage == "coop_matrix" and not missing and p["cooperativity"]["series"]:
         summary = json.loads((paths(p)["coop"] / "combined" / "summary.json").read_text())
         if "trend_pairs" not in summary:
@@ -365,12 +386,65 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("stage", choices=STAGES)
     sub.add_parser("status")
     sub.add_parser("coop-inputs")
+    pr = sub.add_parser("prune", help="dry run: the manifest of what would be deleted; --apply deletes it")
+    pr.add_argument("--apply", type=Path, metavar="MANIFEST", help="a manifest a dry run wrote, read by a person")
+    sh = sub.add_parser("share", help="pack the results into one tar")
+    sh.add_argument("--out", type=Path, help="the tar to write (required unless --list)")
+    sh.add_argument("--datasets", help="comma-separated (default: every dataset)")
+    sh.add_argument("--with-signal", action="store_true", help="add each dataset's observed signal bigWig")
+    sh.add_argument("--list", action="store_true", help="print what would go in, and write nothing")
     args = ap.parse_args(argv)
     try:
         p = load(args.project)
     except (ProjectError, OSError, yaml.YAMLError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    if args.cmd in ("env", "coop-inputs") and not p["driver"]:
+        print(f"ERROR: {p['file']} says driver: false: this project is not run by the driver (run_project.sh, "
+              "submit.sh); its README says how it was made", file=sys.stderr)  # fmt: skip
+        return DRIVER_REFUSED
+    if args.cmd == "prune":
+        import prune
+
+        try:
+            if args.apply:
+                c = prune.apply(p, args.apply)
+                print(f"deleted {c['deleted']:,} files ({c['bytes'] / 2**30:,.1f} GiB) and {c['dirs']:,} empty "
+                      f"directories; gone already {c['gone']}, changed since the dry run {c['changed']}, refused "
+                      f"{c['refused']}; log {c['log']}")  # fmt: skip
+                return 0 if not (c["changed"] or c["refused"]) else 1
+            pl = prune.plan(p)
+            prune.print_plan(pl, prune.write_plan(p, pl))
+        except (prune.PruneError, OSError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        return 0
+    if args.cmd == "share":
+        import share
+
+        datasets = p["datasets"] if not args.datasets else args.datasets.split(",")
+        unknown = sorted(set(datasets) - set(p["datasets"]))
+        if unknown:
+            print(f"ERROR: not datasets of this project: {unknown}", file=sys.stderr)
+            return 2
+        files = share.share_set(p, datasets, args.with_signal)
+        if args.list:
+            root = Path(p["root"])
+            size = 0
+            for f in files:
+                there = f.is_file()
+                size += f.stat().st_size if there else 0
+                print(f"{'' if there else 'MISSING '}{f.relative_to(root)}")
+            print(f"{sum(f.is_file() for f in files)} files, {size / 2**30:,.2f} GiB")
+            return 0
+        if not args.out:
+            print("ERROR: share needs --out <file.tar> (or --list)", file=sys.stderr)
+            return 2
+        r = share.write_share(p, files, args.out)
+        print(f"wrote {r['out']}: {r['files']} files, {r['bytes'] / 2**30:,.2f} GiB; missing {len(r['missing'])}")
+        for m in r["missing"][:20]:
+            print(f"  missing: {m}")
+        return 0
     if args.cmd == "show":
         print(json.dumps(p, indent=1))
     elif args.cmd == "env":

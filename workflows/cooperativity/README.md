@@ -26,11 +26,14 @@ departure from additivity. The scripts:
 To run it on a new project, use the pipeline (`workflows/pipeline/`, stage `cooperativity`; docs/pipeline.md): it
 writes the inputs below from the project's own Fi-NeMo hits and compendium (section 8).
 
-The rest of this page documents the one run so far, on 20 October 2026 (ET). It covers the AMSC adipocyte ATAC-seq
-datasets, on Gefion. It lists every input file and says why each choice was made.
+The rest of this page documents the AMSC run, on 10 of the AMSC adipocyte ATAC-seq datasets, on Gefion. It ran first
+on 20 October 2026 (ET), with copies of these scripts, and again on 9 November 2026 with this folder's scripts
+(section 5). The ablations are the same in both; the rerun names every TF correctly and adds the official package's
+rules and the fold check, so its tables are the ones to use. The page lists every input file and says why each choice
+was made.
 
-`$AMSC` stands for `/dcai/projects/iu_0109/datasets/amsc`. The run's outputs, logs and the exact script copies that
-ran are in `$AMSC/cherimoya/cooperativity/`.
+`$AMSC` stands for `/dcai/projects/iu_0109/datasets/amsc`. The October run's outputs, logs and the exact script copies
+that ran are in `$AMSC/cherimoya/cooperativity/`; the rerun's outputs and logs are in its `rerun/`.
 
 ## 1. The models
 
@@ -269,7 +272,7 @@ pandas' object strings (`future.infer_string` off).
 
 ## 5. How it ran
 
-The run used Slurm job 528519 on Gefion: one whole node with 8 H100s, on GPUs 2–6.
+The October run used Slurm job 528519 on Gefion: one whole node with 8 H100s, on GPUs 2–6.
 - **Start:** five lanes started at 20:22 ET on 20 October, two datasets each.
 - **End:** the last dataset finished at 20:35:55 ET. `combine.py` was done at 20:38 ET.
 - **First attempt:** five lane steps started at 20:21:55 ET and failed within 4 s (exit code 2). They were started
@@ -308,20 +311,31 @@ Size and time per dataset:
 
 Over the 10 datasets: 7.3 M sequences and 4.6 M site pairs.
 
-### To run it again with this folder's scripts
+### The rerun of 9 November 2026
 
-`$AMSC/cherimoya/cooperativity/args/<dataset>.args` lists each dataset's inputs, one argument per line. They are the
-inputs above: `--models`, `--finemo-dir`, `--motifs` and `--fasta`. Their `--out-dir` is a new folder, `rerun/`, so the
-run's outputs are not touched.
+The rerun used Slurm job 538202 on Gefion, one whole node with 8 H100s, shared with other work. It ran this folder's
+scripts at commit 0b5bf32.
+- **Inputs:** `$AMSC/cherimoya/cooperativity/args/<dataset>.args` lists each dataset's inputs, one argument per line.
+  They are the inputs above: `--models`, `--finemo-dir`, `--motifs` and `--fasta`. Their `--out-dir` is `rerun/`, so
+  the October outputs are not touched. The settings are the defaults, as in October.
+- **Lanes:** eight, one per GPU and 16 CPUs each, started at 14:57 ET; GPUs 0 and 1 took two datasets. The last
+  dataset finished at 15:12 ET, 379–539 s each.
+- **Across datasets:** `combine.py --official` was done at 15:15 ET, and `check_official.py` (section 10) at 15:17 ET,
+  with 0 checks failed.
+- **The ablations are October's.** For amsc_village1_d0, the 429,772 site pairs are the same, with the same e and i to
+  the last digit; over the 10 datasets, the same 4.6 M pairs and the same shares by distance. Only the TF names and
+  what `combine.py` reports (section 8) differ.
 
 ```bash
 RUN=$AMSC/cherimoya/cooperativity
 export COOP_PYTHON=<the cherimoya environment's python>
-# one dataset on GPU 0
-bash workflows/cooperativity/lane.sh 0 0-31 $RUN/rerun/logs $RUN/args/amsc_village1_d0.args
+# one lane per GPU, e.g. GPU 0 with two datasets
+bash workflows/cooperativity/lane.sh 0 0-15 $RUN/rerun/logs $RUN/args/amsc_village1_d0.args $RUN/args/amsc_village4_d0_2.args
 # all ten, after the coop_isa.py runs
 python workflows/cooperativity/combine.py --root $RUN/rerun --motifs $AMSC/comparison/finemo/motifs.tsv \
-    --groups $RUN/groups.tsv --comparisons $RUN/comparisons.tsv
+    --groups $RUN/groups.tsv --comparisons $RUN/comparisons.tsv --official
+python workflows/cooperativity/check_official.py --root $RUN/rerun --motifs $AMSC/comparison/finemo/motifs.tsv \
+    --groups $RUN/groups.tsv
 ```
 
 ## 6. Outputs
@@ -330,8 +344,9 @@ Per dataset, in `<dataset>/`:
 - **`sites.tsv.gz`:** one row per site: `peak_id, chr, start, end, motif, tf, e` (the site's effect), `a` (the intact
   prediction).
 - **`pairs.tsv.gz`:** one row per site pair: `peak_id, chr, motif_a, motif_b, tf_a, tf_b, distance, e_a, e_b, i`.
-  This is the table to start from, but in the 20 October outputs name the sites from `motif_a` and `motif_b`, not
-  from `tf_a` and `tf_b` (see below).
+  This is the table to start from. The rerun's also has `gap`, `isa_both`, `start_a`, `start_b`, `a` and the per-fold
+  `i_f<k>` (section 8), and its sides are in TF-name order. In the 20 October outputs, name the sites from `motif_a`
+  and `motif_b`, not from `tf_a` and `tf_b` (see below).
 - **`tf_pairs.tsv`, `tfs.tsv`:** the quick per-dataset tables (independence at 0.01).
 - **`run.json`:** arguments, counts, run time.
 
@@ -343,11 +358,15 @@ In `combined/`:
 - **`distance.tsv`:** shares of synergistic, redundant and independent pairs by distance bin, per dataset.
 - **`summary.json`:** per-dataset totals and label counts, and the number of significant changes.
 
-Logs: `logs/<dataset>.log`, `logs/lane_<gpu>.log`, `logs/combine.log`.
+In the rerun's `official/` (section 4): `<dataset>/` with the package's two input tables and its two output tables,
+`coop_tf_pairs_by_dataset.tsv`, `coop_tfs_by_dataset.tsv`, `changes_pairs.tsv`, `changes_tfs.tsv` and `summary.json`.
+
+Logs: `logs/<dataset>.log`, `logs/lane_<gpu>.log`, `logs/combine.log`; the rerun's also `logs/check_official.log`.
 
 ### Known issue in the 20 October outputs: TF names
 
-The run's copy of `coop_isa.py` named the TFs in two wrong ways. The scripts in this folder fix both.
+The run's copy of `coop_isa.py` named the TFs in two wrong ways. The scripts in this folder fix both, and the rerun's
+tables (`rerun/`) are right.
 1. **Unannotated motifs got an empty name.** The 9 `pos_` motifs without an annotation (section 3) were given the
    TF name "" instead of their own name. In each dataset, 5–8 of them were ablated, at 125–298 sites.
 2. **The TF columns don't line up with the motif columns.** In `pairs.tsv.gz`, `tf_a` and `tf_b` were sorted by
@@ -367,20 +386,12 @@ that took the partner's motif ID about half the time. For example, a CEBP + pos_
 - **Annotated TFs:** each pair is still counted once under the annotated TF's own name, so their rows are right.
 - **Unannotated motifs:** their own rows hold only part of their pairs.
 
-To correct the combined tables without new predictions, run this folder's `combine.py` on the run's outputs. It
-names every site from its motif with `--motifs`. It needs CPU only.
-
-```bash
-python workflows/cooperativity/combine.py --root $RUN --motifs $AMSC/comparison/finemo/motifs.tsv \
-    --groups $RUN/groups.tsv --comparisons $RUN/comparisons.tsv
-```
-
-This overwrites `$RUN/combined/`. To keep the original, copy the per-dataset folders and run it on the copy.
+Use `rerun/combined/` instead: the same ablations, with every site named from its motif with `--motifs`.
 
 ## 7. Results in brief
 
-From `combined/summary.json` and `combined/distance.tsv` of the 20 October run. TF names don't enter these
-numbers, except the counts tested in the last table (section 6):
+From `rerun/combined/` and `rerun/official/` (9 November). The shares and the distance profile are also the October
+run's, to the digit, since the ablations are the same.
 
 - **Most pairs are independent:** 72–81% per dataset. Synergistic pairs are 8–12%, redundant 10–16%.
 - **Synergy is short-range.** Over all 10 datasets:
@@ -395,16 +406,31 @@ numbers, except the counts tested in the last table (section 6):
   | 500–1,000 bp | 0.1% | 7% | 93% |
 
   Redundancy reaches several hundred bp.
-- **Changes in synergy score outside the 95% interval:**
+- **Changes in synergy score** (`rerun/combined/`, tested / significant / robust; section 8 has the definitions):
 
   | comparison | TFs | TF pairs |
   |---|---|---|
-  | differentiation | 25 of 55 | 67 of 369 |
-  | FFA | 19 of 55 | 51 of 279 |
-  | low glucose | 14 of 57 | 52 of 314 |
+  | differentiation | 53 / 24 / 12 | 371 / 47 / 40 |
+  | FFA | 54 / 12 / 6 | 280 / 21 / 18 |
+  | low glucose | 56 / 7 / 5 | 314 / 15 / 14 |
 
-  - The intervals are per TF and are not corrected for multiple testing; about 5% would fall outside by chance.
+  - significant = BH q < 0.05 within the comparison; robust = significant, and every fold's models alone give a
+    change of the same sign.
+  - The October criterion, the 95% interval excluding 0 without correction (`ci_excludes_0`): TFs 25 / 19 / 14, TF
+    pairs 68 / 51 / 52. October reported 25 of 55, 19 of 55, 14 of 57 and 67 of 369, 51 of 279, 52 of 314; the
+    numbers tested moved with the TF names.
   - The low-glucose comparison also crosses villages (section 4).
+- **The official package's rules** (`rerun/official/`, coop = Σi / Σ|i| over its qualified pairs; tested / significant
+  / robust):
+
+  | comparison | TFs | TF pairs |
+  |---|---|---|
+  | differentiation | 50 / 15 / 8 | 283 / 45 / 41 |
+  | FFA | 49 / 13 / 8 | 206 / 22 / 19 |
+  | low glucose | 48 / 6 / 4 | 232 / 12 / 11 |
+
+  Fewer TF pairs are tested than with DeepISA's definitions: the package keeps only pairs 1–255 bp apart, edge to
+  edge, that pass its filters (section 4).
 
 ## 8. Running it in a project
 
@@ -420,10 +446,10 @@ in every dataset:
 3. `lane.sh`, one dataset per GPU, then `combine.py --official`.
 
 `pairs.tsv.gz` from this version of `coop_isa.py` also holds `gap` and `isa_both`, which `--official` needs, and
-`start_a`, `start_b`, `a` and the per-fold `i_f<k>`, which the fold check and section 9 need. The AMSC run's tables
-predate them all; `combine.py` reads them without the fold check.
+`start_a`, `start_b`, `a` and the per-fold `i_f<k>`, which the fold check and section 9 need. The October AMSC
+run's tables predate them all (`combine.py` reads them without the fold check); the 9 November rerun has them.
 
-What `combine.py` reports has changed since the AMSC run (section 7):
+What `combine.py` reports has changed since the October AMSC run (section 7 gives the rerun's numbers):
 - **`significant`** is now Benjamini–Hochberg q < 0.05 within each comparison. Each change's p comes from its
   bootstrap SE (normal approximation): 200 replicates are too few to count p-values from. The AMSC run's criterion,
   the 95% interval excluding 0 without correction, is kept as `ci_excludes_0`.

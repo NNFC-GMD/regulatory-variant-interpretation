@@ -615,7 +615,9 @@ class RangeForwarder:
         start, end = 0, info["size"] - 1
         ranged = handler.headers.get("Range")
         if ranged:
-            m = re.fullmatch(r"\s*bytes=(\d+)-(\d*)\s*", ranged)
+            # strip() rather than \s* around the pattern: CodeQL (py/polynomial-redos) flags a leading \s* on this
+            # client header, as it is quadratic on a run of spaces unless anchored. This form is linear either way.
+            m = re.fullmatch(r"bytes=(\d+)-(\d*)", ranged.strip())
             if not m or int(m.group(1)) >= size:
                 handler.send_response(416)
                 handler.send_header("Content-Range", f"bytes */{size}")

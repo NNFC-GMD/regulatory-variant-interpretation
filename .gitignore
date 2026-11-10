@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# vendor/igvf_tf_chrombpnet/ is a byte-for-byte copy of igvf_tf_chrombpnet's files (its VENDORED.md): its lib/ is
+# code, not the build directory ignored above.
+!vendor/igvf_tf_chrombpnet/lib/

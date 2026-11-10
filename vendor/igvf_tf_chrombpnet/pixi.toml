@@ -1,0 +1,254 @@
+[workspace]
+name = "igvf-tf-chrombpnet"
+description = "ChromBPNet pipeline for the IGVF TF collaboration"
+channels = ["conda-forge", "bioconda"]
+platforms = ["linux-64", "osx-arm64"]
+
+# Every environment the pipeline runs in, except chrombpnet itself:
+#
+#   default / qc   local lint, tests and plotting
+#   preprocess     steps 00.0, 00.1, 02.0 and `cli.py download-references`
+#   peaks          step 00.0.call_peaks (preprocess + MACS3 PR #756 build)
+#   finemo         steps 10, 11 (Fi-NeMo on torch; finemo-cu126 for old drivers)
+#   motif-compendium  step 09
+#
+# chrombpnet 2.x (steps 01 and 03-08) comes from a pinned chrombpnet checkout
+# installed from that repo's own lock file, the one the Keras 3 / JAX port was
+# validated with, rather than being re-solved here. See "Software environments"
+# in lib/bash/common.sh and CLAUDE.md, "Environments".
+#
+# Each tool environment has its own solve group, so their pins cannot move one
+# another: Fi-NeMo's torch and MotifCompendium's stack never meet.
+
+[dependencies]
+python = ">=3.12,<3.14"
+
+[feature.dev.dependencies]
+ruff = "*"
+shellcheck = "*"
+pre-commit = "*"
+bash = ">=5.2.37,<6"
+pytest = ">=9.1.1,<10"
+
+[feature.qc.dependencies]
+pytest = "*"
+numpy = ">=1.23"
+pandas = ">=2.0"
+scipy = ">=1.10"
+matplotlib = ">=3.7"
+h5py = ">=3.8"
+pysam = ">=0.24.1,<0.25"
+duckdb = ">=1.5.5,<2"
+click = ">=8.5.0,<9"
+pyyaml = ">=6.0.3,<7"
+bedtools = ">=2.31.1,<3"
+ucsc-bedgraphtobigwig = ">=482,<483"
+pybigwig = ">=0.3.26,<0.4"
+pybigtools = ">=0.3.0,<0.4"
+pyfaidx = ">=0.9.0.4,<0.10"
+htslib = ">=1.21"         # bgzip, for tests/test_peakcall.py
+mawk = "*"                # the insertion stream tests/test_peakcall.py checks
+
+[feature.qc.pypi-dependencies]
+pyranges1 = ">=1.4"
+figwig = { version = "==0.1.0", extras = ["bam2bw", "fast"] }  # tests/test_pileup.py's figwig engine check
+
+# Steps 00.0/00.1/02.0 and the reference builder: interval, table and bigwig
+# work only, with no deep-learning stack and no CUDA wheels. pyranges1 needs
+# Python >= 3.12.
+[feature.preprocess.dependencies]
+python = ">=3.12,<3.14"
+pandas = ">=2.0"
+numpy = ">=1.23"
+pybigtools = ">=0.3"      # Rust bigWig writer for the cut-site pileup
+pysam = ">=0.22"          # bgzip writing + tabix indexing
+pyfaidx = ">=0.7"         # utils/shift.py, Tn5 shift auto-detection
+matplotlib-base = ">=3.7" # utils/plotting.py; -base on purpose, Agg backend
+pybigwig = ">=0.3"        # utils/qc.py READS bigwigs (distinct from pybigtools)
+click = ">=8.1"           # the src/cli.py command group
+pyyaml = ">=6"            # full YAML for config.py
+
+[feature.preprocess.pypi-dependencies]
+pyranges1 = ">=1.4"       # not on conda-forge/bioconda; conda's is the 0.x line
+# 00.0's `bigwig_engine: figwig`: the same per-base cut counts as utils/pileup.py,
+# read on threads from BGZF. bam2bw = the `figwig bam2bw` CLI; fast = deflate writer.
+figwig = { version = "==0.1.0", extras = ["bam2bw", "fast"] }
+
+# Peak calling (00.0.call_peaks): MACS3 callpeak from jmschrei's PR #756
+# (macs3-project/MACS), which moves callpeak's parsing, pileup, scoring and peak
+# writing into C loops with per-chromosome fork pools and threaded BGZF inflate,
+# with byte-identical outputs. The PR is open, so the build is pinned to its head
+# commit. Built from source: its build-system asks for an unbounded Cython>=3.0
+# while the code wants <3.1, so the build runs without isolation, against the
+# cython/numpy/setuptools/compiler below. linux-64 only (the cluster).
+[feature.peaks]
+platforms = ["linux-64"]
+
+[feature.peaks.dependencies]
+cython = ">=3.0,<3.1"
+setuptools = ">=80"
+numpy = ">=1.25"
+scipy = ">=1.12"
+scikit-learn = ">=1.3"
+hmmlearn = ">=0.3.2"
+anndata = ">=0.10"
+c-compiler = "*"
+zlib = "*"                # MACS3 compiles fermi-lite, which includes zlib.h
+htslib = ">=1.21"         # bgzip -dc -@N: threaded BGZF decompression of the fragments
+mawk = "*"                # the fragments -> insertion-window stream
+
+[feature.peaks.pypi-dependencies]
+macs3 = { git = "https://github.com/jmschrei/MACS.git", rev = "fa52988d5f3313804f56bf9906354fd68ca7fda8" }
+
+[feature.peaks.pypi-options]
+no-build-isolation = ["macs3"]
+
+# TF-MoDISco for 08.0 alone: modisco 2.5.2 from NNFC-GMD/tfmodisco's
+# parallel-leiden-seeds branch, which adds `modisco motifs --n_leiden_jobs N`:
+# the Leiden restarts of each clustering call run in parallel processes, with
+# the clustering unchanged (the branch tests it against 2.5.2's function). Every
+# package that computes is pinned to the version chrombpnet's cuda13
+# environment has, where 03.3/04.5 run stock 2.5.2, so 08.0's motifs differ from
+# a stock run by that branch alone. meme: the tomtom `modisco report-simple`
+# calls.
+[feature.modisco]
+platforms = ["linux-64"]
+
+[feature.modisco.dependencies]
+python = "==3.13.15"
+numpy = "==2.5.3"
+libblas = { version = "*", build = "*openblas" }
+meme = "==5.5.9"
+
+[feature.modisco.pypi-dependencies]
+modisco = { git = "https://github.com/NNFC-GMD/tfmodisco.git", rev = "91367a96799c127e27979a9d544538a4b55c1161" }
+numba = "==0.67.0"
+llvmlite = "==0.49.0"
+scipy = "==1.18.1"
+scikit-learn = "==1.9.1"
+h5py = "==3.16.0"
+hdf5plugin = "==7.1.0"
+igraph = "==1.0.0"
+leidenalg = "==0.12.0"
+memelite = "==0.4.0"
+pandas = "==3.0.6"
+matplotlib = "==3.11.2"
+logomaker = "==0.8.7"
+
+# Fi-NeMo (steps 10, 11). finemo is pure Python on PyPI; everything it
+# imports at `import finemo` has to be here (pyfaidx, hdf5plugin, numba), and
+# htslib provides the bgzip/tabix that 10.0 compresses hits with. pyBigWig
+# comes from PyPI (finemo requires it by that name, and bioconda's pybigwig has
+# no PyPI mapping, so listing it here too would install both).
+# 0.41 is the last release; main's later commits only touch `finemo report`,
+# and break its HTML image links.
+[feature.finemo]
+platforms = ["linux-64"]    # CUDA torch wheels
+
+[feature.finemo.dependencies]
+python = ">=3.13,<3.14"
+numpy = ">=2.2"
+scipy = ">=1.14"
+numba = ">=0.61"
+polars = ">=1.44.2,<2"      # 2.0 makes lazy collect() streaming, with no row-order guarantee
+matplotlib-base = ">=3.10"
+h5py = ">=3.12"
+hdf5plugin = ">=5.0"
+tqdm = "*"
+jinja2 = ">=3.1"
+jaxtyping = ">=0.3.2"
+pyfaidx = ">=0.9"
+htslib = ">=1.21"
+
+[feature.finemo.pypi-dependencies]
+finemo = "==0.41"
+
+# torch from PyPI, not conda-forge (which stops at 2.13). The default Linux
+# wheel of 2.14.0 IS the CUDA 13.0 build: sm_75-sm_120 (RTX PRO 6000 included),
+# NVIDIA driver >= 580, glibc >= 2.28.
+[feature.torch-cu130.pypi-dependencies]
+torch = "==2.14.0"
+
+# For drivers below 580 or GPU_CC 7.0: sm_50-sm_90, so NOT for Blackwell.
+[feature.torch-cu126.pypi-dependencies]
+torch = { version = "==2.14.0", index = "https://download.pytorch.org/whl/cu126" }
+
+# MotifCompendium (step 09). Not on PyPI or conda-forge, hence the git pin;
+# v1.0.19. CPU only: it imports cupy only for set_compute_options(use_gpu=True),
+# which src/motif_compendium.py never calls, so there is no cupy here.
+[feature.motif-compendium.dependencies]
+python = ">=3.13,<3.14"
+numpy = ">=2.0"
+pandas = ">=2.2,<3"         # upstream runs pandas 2; 3.x is untested there
+h5py = ">=3.8"
+hdf5plugin = ">=4.0"
+pytables = ">=3.10"
+scikit-learn = ">=1.3"
+scipy = ">=1.10"
+python-igraph = ">=0.10"
+leidenalg = ">=0.10"
+seaborn = ">=0.13"
+matplotlib-base = ">=3.7"
+logomaker = ">=0.8"
+upsetplot = ">=0.9"
+beautifulsoup4 = ">=4.12"
+jinja2 = ">=3.1"
+tqdm = ">=4.60"
+
+[feature.motif-compendium.pypi-dependencies]
+motifcompendium = { git = "https://github.com/kundajelab/MotifCompendium.git", rev = "7e9d1c2f932ea7f53fd36e174affef26eaf086c4" }
+
+[environments]
+default = { features = ["dev"], solve-group = "main" }
+qc = { features = ["qc"], solve-group = "main" }
+preprocess = { features = ["preprocess"], solve-group = "main" }
+# preprocess + MACS3 (PR #756); own solve group so the from-source MACS3 build
+# and its numpy/scipy pins cannot move the main group.
+peaks = { features = ["preprocess", "peaks"], solve-group = "peaks" }
+modisco = { features = ["modisco"], solve-group = "modisco" }
+finemo = { features = ["finemo", "torch-cu130"], solve-group = "finemo" }
+finemo-cu126 = { features = ["finemo", "torch-cu126"], solve-group = "finemo-cu126" }
+motif-compendium = { features = ["motif-compendium"], solve-group = "motif-compendium" }
+
+[tasks.lint]
+description = "ruff check over lib/ and src/"
+cmd = "ruff check lib/python src workflows/dcai"
+
+[tasks.fmt-check]
+description = "ruff format --diff (does not write)"
+cmd = "ruff format --diff lib/python src workflows/dcai"
+
+[tasks.fmt]
+description = "ruff format (writes)"
+cmd = "ruff format lib/python src workflows/dcai"
+
+[tasks.check-bash]
+description = "bash -n + shellcheck over every workflow step and bash lib"
+cmd = """
+bash -c '
+set -e
+for f in workflows/SLURM/*.sh workflows/molab/*.sh workflows/dcai/*.sh workflows/dcai/*.sbatch lib/bash/*.sh; do bash -n "$f"; done
+echo "bash -n: OK"
+shellcheck -S warning workflows/SLURM/*.sh workflows/molab/*.sh workflows/dcai/*.sh workflows/dcai/*.sbatch lib/bash/*.sh
+'
+"""
+
+[tasks.check-py]
+description = "byte-compile every Python file (no cluster imports needed)"
+cmd = "python -m compileall -q lib/python src workflows/dcai"
+
+[tasks.test]
+description = "pytest (needs the qc env: pyranges1, Python >= 3.12)"
+cmd = "pytest tests -q"
+
+[tasks.hooks-install]
+description = "install the git pre-commit hook"
+cmd = "pre-commit install"
+
+[tasks.hooks]
+description = "run every pre-commit hook over all files"
+cmd = "pre-commit run --all-files"
+
+[tasks.check]
+description = "all local checks"
+depends-on = ["check-bash", "check-py", "lint"]

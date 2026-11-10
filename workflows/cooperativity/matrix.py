@@ -60,12 +60,18 @@ def write_matrix_args(root: Path, datasets: list[str]) -> list[tuple[str, str, P
     return runs
 
 
-def gpu_count() -> int:
+def gpu_ids() -> list[str]:
+    """The GPUs to run lanes on: CHERI_GPUS (run_project.sh exports the machine's), else every GPU nvidia-smi lists,
+    else GPU 0."""
+    given = os.environ.get("CHERI_GPUS", "").strip()
+    if given:
+        return [g.strip() for g in given.split(",") if g.strip()]
     try:
-        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=False).stdout
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], capture_output=True,
+                             text=True, check=False).stdout  # fmt: skip
     except OSError:
-        return 1
-    return max(1, sum(1 for line in out.splitlines() if line.startswith("GPU ")))
+        return ["0"]
+    return [x.strip() for x in out.splitlines() if x.strip().isdigit()] or ["0"]
 
 
 def cpu_blocks(n: int, size: int) -> list[str]:
@@ -79,18 +85,18 @@ def cpu_blocks(n: int, size: int) -> list[str]:
     return blocks
 
 
-def run_lanes(root: Path, todo: list[tuple[str, str, Path]], n_gpus: int, cores: int) -> None:
+def run_lanes(root: Path, todo: list[tuple[str, str, Path]], gpus: list[str], cores: int) -> None:
     logs = root / "matrix" / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    n = min(n_gpus, len(todo))
+    n = min(len(gpus), len(todo))
     lanes = [todo[k::n] for k in range(n)]
     env = {**os.environ, "COOP_PYTHON": sys.executable}
     procs = []
-    for gpu, (lane, cpus) in enumerate(zip(lanes, cpu_blocks(n, cores))):
+    for k, (gpu, lane, cpus) in enumerate(zip(gpus, lanes, cpu_blocks(n, cores))):
         files = [str(f) for _, _, f in lane]
-        log = open(logs / f"lane_{gpu}.log", "w")  # closed after the wait
-        print(f"lane {gpu}: CPUs {cpus}: {', '.join(Path(f).stem for f in files)}", flush=True)
-        procs.append((subprocess.Popen(["bash", str(HERE / "lane.sh"), str(gpu), cpus, str(logs), *files],
+        log = open(logs / f"lane_{k}.log", "w")  # closed after the wait
+        print(f"lane {k}: GPU {gpu}, CPUs {cpus}: {', '.join(Path(f).stem for f in files)}", flush=True)
+        procs.append((subprocess.Popen(["bash", str(HERE / "lane.sh"), gpu, cpus, str(logs), *files],
                                        stdout=log, stderr=subprocess.STDOUT, env=env), log))  # fmt: skip
     for p, log in procs:
         p.wait()
@@ -101,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", type=Path, required=True, help="coop_isa.py's --out-dir of the cooperativity stage")
     ap.add_argument("--cores", type=int, default=16, help="CPUs per lane")
-    ap.add_argument("--gpus", type=int, help="lanes (default: the GPUs nvidia-smi lists)")
+    ap.add_argument("--gpus", type=int, help="lanes, on the first N GPUs (default: CHERI_GPUS, else nvidia-smi)")
     ap.add_argument("--official", action="store_true", help="combine.py's --official in step 3")
     args = ap.parse_args(argv)
     root = args.root
@@ -111,7 +117,8 @@ def main(argv: list[str] | None = None) -> int:
     todo = [r for r in runs if not (root / "matrix" / r[0] / r[1] / "run.json").is_file()]
     print(f"{len(runs)} runs ({len(datasets)} datasets' sites x their models), {len(todo)} to do", flush=True)
     if todo:
-        run_lanes(root, todo, args.gpus or gpu_count(), args.cores)
+        gpus = gpu_ids()
+        run_lanes(root, todo, gpus[: args.gpus] if args.gpus else gpus, args.cores)
     missing = [f"{x} under {m}" for x, m, _ in runs if not (root / "matrix" / x / m / "run.json").is_file()]
     if missing:
         print(f"ERROR: {len(missing)} runs have no run.json: {', '.join(missing)}; see {root / 'matrix' / 'logs'}")

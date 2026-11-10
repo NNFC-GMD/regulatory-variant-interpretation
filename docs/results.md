@@ -49,7 +49,7 @@ want to use the models, attributions, motifs, hits and cooperativity tables, on 
 ## The models
 
 One Cherimoya model per dataset and fold: `cherimoya/<ds>/fold_<k>/cherimoya.fold_<k>.torch` (2.5 MB).
-- **Folds:** ChromBPNet's five chromosome folds (`<igvf>/folds/fold_<k>.json`). Fold 0, for example, is tested on
+- **Folds:** ChromBPNet's five chromosome folds (`vendor/igvf_tf_chrombpnet/folds/fold_<k>.json`). Fold 0, for example, is tested on
   chr1, chr3 and chr6, validated on chr8 and chr20, and trained on the rest. Each fold's `fit.json` lists its exact
   inputs and settings.
 - **The checkpoint** is the best-validation (EMA) one. `cherimoya.fold_<k>.final.torch` is the last epoch's; it is

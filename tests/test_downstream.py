@@ -447,7 +447,6 @@ def test_bad_arguments_and_environment_are_refused(box, tmp_path):
     assert no_list.returncode == 2
     unknown = b.run("nope")
     assert unknown.returncode == 1 and "no " in unknown.stderr and "nope/config.yaml" in unknown.stderr
-    env = dict(b.env)
-    env.pop("REPO_ROOT")
+    env = dict(b.env, REPO_ROOT=str(tmp_path / "not_igvf"))  # unset, it is vendor/igvf_tf_chrombpnet
     missing = subprocess.run(b.command("ds"), env=env, capture_output=True, text=True)
-    assert missing.returncode != 0 and "REPO_ROOT" in missing.stderr
+    assert missing.returncode != 0 and "REPO_ROOT is not an igvf_tf_chrombpnet" in missing.stderr

@@ -4,21 +4,26 @@ How to take a set of fragment files through the whole pipeline: preprocessing, C
 TF-MoDISco, a compendium, Fi-NeMo and DeepISA. `docs/pipeline.md` explains each step; this page is the order to do
 things in. Names below are placeholders (`example_course`, stems `t0`, `t1`, …).
 
-Every command runs from this repository's checkout on Gefion. The login node is for these commands only; the work
-runs in one box (`docs/cluster.md`).
+Every command runs from this repository's checkout, on a machine set up once with `docs/install.md` (the
+environments, and the references in a `reference_root`). With Slurm, a login node runs these commands and the work
+runs in one box, one whole node; without Slurm, the machine runs both. On Gefion, `docs/cluster.md` has the rules.
 
 ## 1. Make the project directory and its project.yaml
 
 One project is one directory, and nothing of it goes into this repository:
 
 ```bash
-mkdir -p /dcai/projects/iu_0109/datasets/example_course
-cp workflows/pipeline/project.example.yaml /dcai/projects/iu_0109/datasets/example_course/project.yaml
+mkdir -p /data/mimir/example_course          # on Gefion: /dcai/projects/iu_0109/datasets/<project>
+cp workflows/pipeline/project.example.yaml /data/mimir/example_course/project.yaml
 ```
 
 Edit it. `project.example.yaml` documents every key; the ones that matter first:
 - **The names:** `project`, `root` (that directory) and `prefix`. A dataset is called prefix + stem, e.g. `ex_t0`.
 - **`compendium`:** the tag of the project's one motif compendium.
+- **`reference_root`:** the references directory `setup.sh --references` filled (docs/install.md). Every step and
+  Cherimoya read the genome from it.
+- **`slurm`** (only for `submit.sh`): the partition, account, GPUs, CPUs and time limit. Leave out what the cluster's
+  defaults cover. Gefion's block is in docs/cluster.md.
 - **`samples`:** for each, a `stem` and its `fragments`, either an IGVF file accession or the absolute path of a
   BGZF file named `<stem>.fragments.tsv.gz`. Optional: `md5`, `index` (the .tbi's accession), `extra` (other portal
   files to keep) and `label`.
@@ -27,13 +32,14 @@ Edit it. `project.example.yaml` documents every key; the ones that matter first:
   against the next. For a time course, add `series`: the groups in order, for the trends along them.
 - **`stages`:** leave it out to run the default stages. Add `coop_matrix` to the list to also score every dataset's
   DeepISA sites under every dataset's models (paired changes and trends; docs/pipeline.md).
+- **`slots`:** best left out. They then scale to the machine the box runs on, and the preflight logs them.
 
 Check that it loads:
 ```bash
 pixi run -e default python workflows/pipeline/project.py <root>/project.yaml show
 ```
 
-## 2. Fetch the inputs (login node)
+## 2. Fetch the inputs (login node, or the machine)
 
 ```bash
 pixi run -e default python workflows/pipeline/fetch_igvf.py <root>/project.yaml
@@ -48,7 +54,7 @@ What it does:
 - A local file is checked and linked in.
 - Controlled-access files are refused: fetch those yourself and give their paths.
 
-## 3. Dry run (login node)
+## 3. Dry run (login node, or the machine)
 
 ```bash
 bash workflows/pipeline/run_project.sh <root>/project.yaml --dry-run
@@ -62,27 +68,35 @@ It prints:
 It writes nothing under the project. Fix whatever it reports. An uncommitted change in this checkout is reported
 as an error: the box refuses to run from a dirty checkout, so the run can be reproduced.
 
-## 4. Submit the box
+## 4. Run the box
 
+**With Slurm:**
 ```bash
 bash workflows/pipeline/submit.sh <root>/project.yaml
 ```
 
 Before `sbatch`, it checks:
 1. this checkout has no uncommitted changes, and its HEAD is on a remote branch (push first);
-2. `igvf_tf_chrombpnet` is at `workflows/pipeline/igvf.pin`, unmodified (also checked in the preflight);
+2. `vendor/igvf_tf_chrombpnet` matches its `MANIFEST.tsv` (also checked in the preflight);
 3. the inputs are in place (`project.py check fetch`) and the dry run passes;
 4. no other box of yours is running or pending (one box at a time).
 
-It then submits `run_project.sbatch` (one whole node, `--time=2-00:00:00`). It prints the job ID, the log path and
-Slurm's expected start in ET. That start is optimistic: with no idle node a box can wait hours. A box costs about
-$24 per hour it runs; ask the people paying before you submit.
+It then submits `run_project.sbatch` (one whole node, with `project.yaml`'s `slurm:` options). It prints the job
+ID, the log path and Slurm's expected start in ET. That start is optimistic: with no idle node a box can wait
+hours. On Gefion a box costs about $24 per hour it runs; ask the people paying before you submit.
 
-`--stages "train attribute"` runs only those stages; done stages are skipped anyway.
+**Without Slurm**, on the machine itself:
+```bash
+nohup bash workflows/pipeline/run_project.sh <root>/project.yaml > <root>/box/run.$(date +%Y%m%d-%H%M).log 2>&1 &
+```
+The box is `<root>/box/local.<pid>/`. It uses every GPU, unless `CUDA_VISIBLE_DEVICES` names some. Run one box at a
+time per machine.
+
+Either way, `--stages "train attribute"` runs only those stages; done stages are skipped anyway.
 
 ## 5. Watch it
 
-- **The driver's log:** `tail -f <root>/box/slurm_<job>.log`. Every stage logs its start, a one-line summary, and
+- **The driver's log:** `tail -f <root>/box/slurm_<job>.log` (without Slurm, the file its output goes to). Every stage logs its start, a one-line summary, and
   done or not done.
 - **`<root>/box/<job>/stages.tsv`:** a row per stage (state, exit, seconds, start in ET).
 - **`<root>/box/<job>/logs/`:** one log per command, e.g. `prep.log`, `train.log`, `downstream.log`, `motifs.log`,
@@ -96,14 +110,15 @@ $24 per hour it runs; ask the people paying before you submit.
   pixi run -e default python workflows/pipeline/project.py <root>/project.yaml status
   pixi run -e default python workflows/pipeline/status.py <root>/project.yaml       # the STATUS.md text
   ```
-- **The queue:** `squeue -u $USER` and `scontrol show job <job>`.
+- **The queue (Slurm):** `squeue -u $USER` and `scontrol show job <job>`.
 
 ## 6. When a stage fails
 
 The box holds for `hold_minutes` (60 by default) and logs what is missing. Then:
 - **Look** at `<root>/box/<job>/logs/` and `check.<stage>.log`.
 - **Fix it.** On the login node, edit a config or remove a broken output. Inside the box, run a command there:
-  `srun --jobid <job> --overlap -N1 -n1 <cmd>` (pin it with `taskset -c <cpus>` beside running work).
+  `srun --jobid <job> --overlap -N1 -n1 <cmd>` (pin it with `taskset -c <cpus>` beside running work). Without Slurm,
+  run it from a second shell on the machine.
 - **Rerun the stage:** `touch <root>/box/<job>/retry`. Its done parts are skipped.
 - **Or end the box:** `touch <root>/box/<job>/release`. It ends anyway when the hold runs out.
 

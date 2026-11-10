@@ -3,7 +3,7 @@
 # status.py. docs/new_project.md walks through starting one. Names here are placeholders.
 
 project: example_course            # [A-Za-z0-9_]+; names the project in logs and STATUS.md
-root: /dcai/projects/iu_0109/datasets/example_course   # every output goes under it (project.py lists the layout)
+root: /data/mimir/example_course   # every output goes under it (project.py lists the layout); an absolute path
 prefix: ex_                        # dataset name = prefix + stem (ex_t0, ...): igvf's dataset_name, every folder name
 compendium: ex3                    # the tag of the project's motif compendium (09.0), [A-Za-z0-9_]+: Fi-NeMo calls
                                    # every dataset's hits against this one compendium, so a motif's name
@@ -40,25 +40,38 @@ cooperativity:
     - [t0_t2, t0, t2]
   series: [t0, t1, t2]
 
-# References and the two checkouts the steps come from (the defaults on Gefion):
-genome: /dcai/projects/iu_0109/annotations/hg38/Sequence/IGVFFI0653VCGH.fasta   # GRCh38 no-alt (IGVF), with .fai
-igvf: /dcai/users/mateug/git/igvf_tf_chrombpnet    # at workflows/pipeline/igvf.pin
-folds_dir: /dcai/users/mateug/git/igvf_tf_chrombpnet/folds   # fold_<k>.json: train/valid/test chromosomes
+# The references every step reads (required to run; no default): the directory setup.sh --references downloads
+# into, with hg38/ (the IGVF GRCh38 no-alt genome and its .fai, chrom sizes, the ENCODE blacklist, GENCODE TSSs) and
+# motif/ (the MotifCompendium database). The genome Cherimoya trains on is the one in it, the same file the steps
+# read. On Gefion: /dcai/projects/iu_0109/annotations (docs/cluster.md).
+reference_root: /data/mimir/references
+# The chromosome folds (vendor/igvf_tf_chrombpnet/folds/fold_<k>.json: train/valid/test chromosomes):
 folds: ["0", "1", "2", "3", "4"]
-chrombpnet: /dcai/users/mateug/git/chrombpnet      # its env runs 01.0 (background regions), 06.0 and 07.0
-chrombpnet_env: cuda13                             # cuda12 on a node whose NVIDIA driver is below 580
 
-# Box settings (defaults; docs/pipeline.md says where each comes from):
-slots:
-  train_per_gpu: 4        # Cherimoya fits per H100 (training is CPU/launch-bound)
-  train_cores: 6
-  attribute_per_gpu: 4    # `cherimoya attribute` processes per H100 (at most ~12 GB each)
-  attribute_cores: 4
-  modisco_max: 5          # TF-MoDISco (08.0) runs at once
-  modisco_threads: 24
-  finemo_slots: 5         # Fi-NeMo (10.0) runs at once, one GPU each
-  finemo_batch: 200       # below 200 for a compendium of more than ~450 patterns (10.0's header)
-  coop_cores: 16          # CPUs per DeepISA lane
+# Slurm (submit.sh; optional, and only for submit.sh: run_project.sh run by hand needs none). Each key becomes an
+# sbatch option; a key left out is the cluster's default. gpus is --gres=gpu:<n>, cpus --cpus-per-task, extra any
+# other options (a string or a list). On Gefion (docs/cluster.md):
+#   slurm: {partition: defq, account: iu_0109, gpus: 8, cpus: 216, time: "2-00:00:00"}
+slurm:
+  partition: gpu
+  gpus: 8
+  time: "2-00:00:00"
+
+# Box settings. Every slot is optional, and best left out: one left out is the value below scaled down to the
+# machine the box runs on (its GPUs, CPUs and memory; project.py resolve_slots, logged by the preflight). The values
+# below are what a whole Gefion node (8 H100, 216 CPUs, ~2 TB) gets; docs/pipeline.md says where each comes from. A
+# value given here is used as it is, on any machine.
+# slots:
+#   train_per_gpu: 4        # Cherimoya fits per GPU (training is CPU/launch-bound)
+#   train_cores: 6
+#   attribute_per_gpu: 4    # `cherimoya attribute` processes per GPU (at most ~12 GB each)
+#   attribute_cores: 4
+#   modisco_max: 5          # TF-MoDISco (08.0) runs at once (~55 GB each)
+#   modisco_threads: 24
+#   finemo_slots: 5         # Fi-NeMo (10.0) runs at once, one GPU each
+#   finemo_batch: 200       # below 200 for a compendium of more than ~450 patterns (10.0's header)
+#   coop_cores: 16          # CPUs per DeepISA lane
+#   prep_max: 0             # prep chains at once (~63 GB each); 0 = every dataset
 hold_minutes: 60          # how long a box waits for a fix after a failed stage
 shift_every: 100          # detect_shifts.py keeps every Nth fragment; ~100 for a 10-30 M-fragment file
 

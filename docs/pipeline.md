@@ -2,18 +2,18 @@
 
 This is the reference for how a project goes from fragment files to Cherimoya models, motifs and TF cooperativity:
 what each step does and why, what it reads and writes, the command that runs it, its environment, and how long it
-takes. `docs/new_project.md` is the how-to; `docs/cluster.md` has the Gefion (DCAI) rules; `AGENTS.md` is for coding
-agents.
+takes. `docs/install.md` sets up a machine; `docs/new_project.md` is the how-to; `docs/cluster.md` has the Gefion
+(DCAI) rules; `AGENTS.md` is for coding agents.
 
 ## Overview
 
 | stage | what | where the code is |
 |---|---|---|
 | fetch | the input fragment files, md5-checked | `workflows/pipeline/fetch_igvf.py` (login node) |
-| **Prepare** (`prep`) | Tn5 shift, peaks, signal track, background regions, QC | igvf_tf_chrombpnet 00.0–02.0 |
+| **Prepare** (`prep`) | Tn5 shift, peaks, signal track, background regions, QC | igvf_tf_chrombpnet 00.0–02.0 (`vendor/`) |
 | **Train** (`train`) | Cherimoya, one model per chromosome fold | `workflows/train/` |
 | **Attribute** (`attribute`) | DeepLIFT/SHAP on the counts head, every peak, every fold | `cherimoya attribute`, `workflows/attribution/` |
-| **Motifs** (`downstream`, `motifs`) | fold average, TF-MoDISco, one compendium, Fi-NeMo hits | `workflows/downstream/`, igvf_tf_chrombpnet 06.0–11.0 |
+| **Motifs** (`downstream`, `motifs`) | fold average, TF-MoDISco, one compendium, Fi-NeMo hits | `workflows/downstream/`, igvf_tf_chrombpnet 06.0–11.0 (`vendor/`) |
 | **Cooperativity** (`cooperativity`) | DeepISA: in-silico ablation of motif pairs | `workflows/cooperativity/` |
 | `coop_matrix` (optional) | DeepISA on every dataset's sites under every dataset's models: paired changes, trends | `workflows/cooperativity/matrix.py`, `paired.py` |
 | summary | `<root>/STATUS.md` | `workflows/pipeline/status.py` |
@@ -27,25 +27,50 @@ Outside the driver, for projects that need them:
 One project is one directory, `<root>`, and one `project.yaml` in it. `workflows/pipeline/project.py` derives every
 path from root, prefix and the sample stems; a dataset is `<ds>` = prefix + stem. Its docstring has the full layout.
 
-### Two repositories, one pinned commit
+### One repository; the steps shared with igvf_tf_chrombpnet, copied in
 
+Everything runs from this repository's checkout (`docs/install.md`):
 - **This repository (RVI)** holds everything Cherimoya-specific and the driver.
-- **[igvf_tf_chrombpnet](https://github.com/IGVF/igvf_tf_chrombpnet)**, branch `chrombpnet2`, holds the
-  preprocessing (00.0–02.0) and the motif steps (06.0–11.0). The driver runs its step files unchanged, from the
-  checkout `project.yaml`'s `igvf` names, at the commit in `workflows/pipeline/igvf.pin` (`2446d6f`). The preflight
-  refuses another commit or local changes.
-- **[chrombpnet](https://github.com/NNFC-GMD/chrombpnet)** (`stable-modern-gpu-support`) is needed only for its
-  environment: 01.0, 06.0 and 07.0 run in it, and `detect_shifts.py` uses its shift detector as a cross-check. No
-  ChromBPNet model is trained.
+- **The preprocessing (00.0–02.0) and the motif steps (06.0–11.0)** are
+  [igvf_tf_chrombpnet](https://github.com/IGVF/igvf_tf_chrombpnet)'s, the same steps its ChromBPNet runs use. They
+  are copied unchanged into `vendor/igvf_tf_chrombpnet/`, from one commit of its branch `chrombpnet2`. That folder's
+  `VENDORED.md` says what is copied and how to refresh it.
+  - `MANIFEST.tsv` names the commit (`2446d6f`) and the sha256 of every file. The preflight and `submit.sh` refuse
+    a changed byte.
+  - The copy's own `pixi.toml` and `pixi.lock` give its environments.
+- **[chrombpnet](https://github.com/NNFC-GMD/chrombpnet)** (`stable-modern-gpu-support`, at the commit the copied
+  steps name) is this repository's CPU environment `chrombpnet`, installed from git, so no checkout is needed. 01.0
+  runs `chrombpnet prep nonpeaks` in it, 07.0 imports its bigwig writer, 06.0 runs in it, and `detect_shifts.py` uses
+  its shift detector as a cross-check. No ChromBPNet model is trained.
+- **The references** (genome, chrom sizes, blacklist, motif database, TSSs) are one directory,
+  `project.yaml`'s `reference_root`. `setup.sh --references` downloads it with the copied steps' own
+  `download-references`, md5-checked.
+  - The steps read it as `REFERENCE_ROOT`. `project.py` takes the genome Cherimoya trains on from the same
+    layout, so there is one genome.
+  - The folds are the copy's `folds/`, for 01.0 and Cherimoya alike.
 
 ### The box
 
-`workflows/pipeline/submit.sh` submits one whole-node box (`run_project.sbatch`), which runs
-`workflows/pipeline/run_project.sh`:
+One box is one machine running `workflows/pipeline/run_project.sh`:
+- **With Slurm,** `workflows/pipeline/submit.sh` submits it as one whole-node job (`run_project.sbatch`). The
+  partition, account, GPUs, CPUs and time limit are `project.yaml`'s `slurm:` block.
+- **Without Slurm,** `bash workflows/pipeline/run_project.sh <project.yaml>` runs it on the machine itself (under
+  tmux or nohup).
+- **The machine** is every GPU nvidia-smi lists (or those `CUDA_VISIBLE_DEVICES` names), the CPUs the process may
+  use, and its memory. The slots `project.yaml` does not give are scaled to it (`project.py resolve_slots`). On a
+  whole Gefion node they are the values in `project.example.yaml`.
+
+Either way:
 - **Stages run one after another:** preflight, then `project.yaml`'s stages in pipeline order, then summary. Within a
   stage the work runs in parallel on the node.
-- **The preflight** checks that both checkouts are clean and igvf is at its pin, that every environment and input
-  exists, and runs the tests: `pixi run check` (lint, shellcheck, the CPU tests) and `pixi run -e cherimoya
+- **The preflight** checks, and stops on any failure:
+  - the checkout is clean and the copied steps match their `MANIFEST.tsv`;
+  - every environment, reference file and input exists;
+  - the tools the steps call are on the machine;
+  - there is a GPU, on an NVIDIA driver ≥ 580;
+  - the slots fit its CPUs.
+
+  It logs the machine and the slots, then runs the tests: `pixi run check` (lint, shellcheck, the CPU tests) and `pixi run -e cherimoya
   test-pipeline` (the tests of what the driver runs) are required; every other test in the cherimoya environment
   (`test-cherimoya`, which leaves out the frozen engine's `tests/test_dls_*.py`: those need cherimoya 0.3.0 and run
   as `pixi run -e cherimoya-030 test-engine`) runs beside the stages and is reported in STATUS.md, not required.
@@ -53,28 +78,31 @@ path from root, prefix and the sample stems; a dataset is `<ds>` = prefix + stem
   and counts as done only when the check passes after it ran. Exit codes are not trusted: `train/run_box.sh` always
   exits 0, and the runners report per task. So a resubmitted box resumes where the last one stopped.
 - **A failed stage holds the box** for `hold_minutes` (default 60). Fix it from the login node, or inside the box
-  with `srun --jobid <job> --overlap -N1 -n1 <cmd>`. Then `touch <root>/box/<job>/retry` reruns the stage, and `touch
+  with `srun --jobid <job> --overlap -N1 -n1 <cmd>` (without Slurm: from a second shell on the machine). Then `touch <root>/box/<job>/retry` reruns the stage, and `touch
   <root>/box/<job>/release` ends the box. If nobody acts, the box ends when the hold runs out.
 - **Records:**
   - `<root>/box/<job>/stages.tsv`: one row per stage (state, exit, seconds, start in ET);
   - `<root>/box/<job>/logs/`: one log per command;
-  - `<root>/box/slurm_<job>.log`: the driver's own log;
+  - `<root>/box/slurm_<job>.log`: the driver's own log (without Slurm: wherever its output was redirected; the box
+    is `local.<pid>`);
   - `<root>/STATUS.md`: the summary.
 
 ### Environments
 
-| checkout | env | runs |
+| manifest | env | runs |
 |---|---|---|
 | RVI | `default` | lint, the CPU tests, `project.py`, `fetch_igvf.py`, `make_jobs.py`, `make_downstream.py`, `status.py` |
 | RVI | `cherimoya` | Cherimoya 0.3.1, tangermeme 1.6.0, torch 2.14 (CUDA 13), deepISA 0.1.0: fit, `cherimoya attribute`, the conversion, `motif_names.py`, `coop_isa.py`, `combine.py`, `test-cherimoya` |
 | RVI | `cherimoya-030` | Cherimoya 0.3.0 and tangermeme 1.5.0: only the frozen `attribute_fast.py` engine and its tests (`test-engine`) |
-| igvf | `peaks` | MACS3 PR #756, `detect_shifts.py`, 00.0 call_peaks |
-| igvf | `preprocess` | 00.0 prepare_signal (figwig), 00.1, 02.0, `make_configs.py` |
-| igvf | `modisco` | 08.0, TF-MoDISco from NNFC-GMD/tfmodisco |
-| igvf | `motif-compendium` | 09.0, MotifCompendium 1.0.19 |
-| igvf | `finemo` | 10.0 and 11.0, Fi-NeMo 0.41 |
-| igvf | `qc` | igvf_tf_chrombpnet's own tests |
-| chrombpnet | `cuda13` | 01.0, 06.0, 07.0; `detect_shifts.py --chrombpnet-python` (`cuda12` on a driver below 580) |
+| RVI | `chrombpnet` | chrombpnet (NNFC-GMD, 05f5748) on CPU: 01.0, 06.0, 07.0; `detect_shifts.py --chrombpnet-python`. The versions that shape those outputs are pinned to chrombpnet's own `cuda13` lock, the env earlier projects ran these steps in |
+| vendor | `peaks` | MACS3 PR #756, `detect_shifts.py`, 00.0 call_peaks |
+| vendor | `preprocess` | 00.0 prepare_signal (figwig), 00.1, 02.0, `make_configs.py`, `download-references` |
+| vendor | `modisco` | 08.0, TF-MoDISco from NNFC-GMD/tfmodisco |
+| vendor | `motif-compendium` | 09.0, MotifCompendium 1.0.19 |
+| vendor | `finemo` | 10.0 and 11.0, Fi-NeMo 0.41 |
+
+"vendor" is `vendor/igvf_tf_chrombpnet/pixi.toml`, the copied steps' own manifest and lock. `setup.sh` installs
+all eight; `cherimoya-030` only with `--with-engine`.
 
 Cherimoya's model code (`cherimoya.py`, `cheri.py`, `io.py`, `wrappers.py`, `training.py`) is the same in 0.3.0 and
 0.3.1, so both environments load every model.
@@ -104,7 +132,8 @@ pseudobulk's fragment file already holds only its cells.
 **Command:**
 ```
 igvf_run peaks python workflows/dcai/detect_shifts.py --fragments-dir <root>/fragments --genome <genome> \
-    --out <root>/chrombpnet/shifts.json --jobs <n> --every <shift_every> --chrombpnet-python <chrombpnet env python>
+    --out <root>/chrombpnet/shifts.json --jobs <n> --every <shift_every> \
+    --chrombpnet-python <RVI>/.pixi/envs/chrombpnet/bin/python
 ```
 
 **What it does.** It finds the Tn5 shift already present in each file. Each file is thinned genome-wide (every Nth
@@ -202,7 +231,7 @@ fixed genome scan. Files 30–60× smaller take minutes.
 **Command:**
 ```
 rvi_run default python workflows/train/make_jobs.py --chrombpnet-configs <root>/chrombpnet/configs/*/config.yaml \
-    --folds-dir <igvf>/folds --genome <genome> --out-root <root>/cherimoya
+    --folds-dir vendor/igvf_tf_chrombpnet/folds --genome <genome> --out-root <root>/cherimoya
 env CHERI_ROOT=<root>/cherimoya CHERI_STAGES=fit CHERI_SLOTS_PER_GPU=<train_per_gpu> CHERI_CORES_PER_SLOT=<train_cores> \
     bash workflows/train/run_box.sh
 ```
@@ -216,8 +245,10 @@ The inputs are igvf's:
 - the 00.0 bigwig, already +4/−4;
 - the 00.1 summit windows;
 - the 01.0 negatives of the fold;
-- the chromosome split of `<igvf>/folds/fold_<k>.json`. These are the same five chromosome folds ChromBPNet uses, so
-  any later comparison is fold for fold.
+- the chromosome split of `vendor/igvf_tf_chrombpnet/folds/fold_<k>.json`. These are the same five chromosome folds
+  ChromBPNet uses, so any later comparison is fold for fold.
+
+`<genome>` is `<reference_root>/hg38/Sequence/IGVFFI0653VCGH.fasta`, the file the prep steps read too.
 
 The settings: Cherimoya 0.3.1's defaults, except `random_state` = 1234 + fold.
 - **Architecture:** 9 layers, 128 filters; 2,114 bp in, 1,000 bp out.
@@ -342,7 +373,8 @@ Leiden, most of an 08.0, is single-threaded, so more threads mostly sit idle. Ru
 **Command:**
 ```
 env BOX_DIR=<box> CHAIN_FINEMO_SLOTS=<finemo_slots> FINEMO_BATCH_SIZE=<finemo_batch> MOTIF_MIN_AGE_S=0 MOTIF_POLL_S=60 \
-    bash <igvf>/workflows/dcai/motif_chain.sh <inputs cheri<D>.tsv> <root>/compendia/<tag> <inputs cheri<D>.tsv>
+    bash vendor/igvf_tf_chrombpnet/workflows/dcai/motif_chain.sh <inputs cheri<D>.tsv> <root>/compendia/<tag> \
+        <inputs cheri<D>.tsv>
 ```
 
 - **09.0** (`motif-compendium`): MotifCompendium 1.0.19 in list mode. It clusters every dataset's TF-MoDISco
@@ -492,21 +524,25 @@ The pins:
 
 | what | where |
 |---|---|
-| igvf_tf_chrombpnet | `workflows/pipeline/igvf.pin` |
-| Cherimoya, tangermeme, torch, deepISA | `pixi.toml` and `pixi.lock` |
+| igvf_tf_chrombpnet's steps and their environments | `vendor/igvf_tf_chrombpnet/MANIFEST.tsv` (the commit, every file's sha256) |
+| chrombpnet, Cherimoya, tangermeme, torch, deepISA | `pixi.toml` and `pixi.lock` |
 | the frozen engine | `workflows/attribution/` and each project's `attribution_engine.json` |
 
 To change one:
 1. **Change it on a branch,** with the docs that describe it (this file, the stage READMEs).
-2. **igvf_tf_chrombpnet:** push the new commit to `chrombpnet2` and put its full hash in `igvf.pin`. Install any
-   igvf environment it changes before a box needs it: several first activations at once would each try to install
-   it.
+2. **igvf_tf_chrombpnet:** push the new commit to `chrombpnet2` and copy it in:
+   `bash workflows/pipeline/vendor_igvf.sh <igvf clone> <commit>`, which rewrites `MANIFEST.tsv`. Then `bash
+   workflows/pipeline/setup.sh` for any environment the copy's new lock changes. Install before a box needs it:
+   several first activations at once would each try to install it. If the copied steps name another chrombpnet
+   commit (`CHROMBPNET_REV`), move this repository's `chrombpnet` env to it in the same change; `tests/test_vendor.py`
+   checks the two agree.
 3. **pixi:** `pixi lock`, then check that environments you did not mean to change did not move. Diff each
    environment's package list in the lock before and after: `cherimoya-030` must stay as it was solved. Then `pixi
    install --locked -e <env>` on the login node.
 4. **Test in a box,** by the preflight: it requires `pixi run check` and `pixi run -e cherimoya test-pipeline`, and
    runs `pixi run -e cherimoya test-cherimoya` beside the stages (in STATUS.md); run `pixi run -e cherimoya-030
    test-engine` too when the engine's environment is touched. Then run one project's stages on the new
-   version before relying on it.
+   version before relying on it. For a new igvf_tf_chrombpnet commit or chrombpnet environment, compare the prep
+   and motif steps' files with a finished project's, one dataset of it run again into a scratch root.
 5. **Never edit** `attribute_fast.py`, `cheri_dls.py` or `dls_refs.py`. A changed byte makes every attribution the
    engine pin covers refuse to run.

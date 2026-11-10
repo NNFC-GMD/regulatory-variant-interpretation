@@ -245,7 +245,7 @@ def test_driver_false_refuses_the_driver_commands(tmp_path, capsys):
     assert pj.main([str(path), "coop-inputs"]) == pj.DRIVER_REFUSED
     assert not (tmp_path / "root" / "cherimoya" / "cooperativity").exists()
     assert pj.main([str(path), "show"]) == 0 and pj.main([str(path), "check", "fetch"]) == 1
-    assert pj.main([str(_yaml(tmp_path)), "env"]) == 0
+    assert pj.main([str(_yaml(tmp_path, reference_root=str(tmp_path / "refs"))), "env"]) == 0
     with pytest.raises(pj.ProjectError, match="true or false"):
         pj.load(_yaml(tmp_path, driver="no"))
 

@@ -168,7 +168,8 @@ Two checks of a whole dataset come with it, each writing a JSON report to
 
 `downstream.sh <list.txt> [...]` runs a box's datasets through all of it and
 then through igvf_tf_chrombpnet's own 06.0, 07.0 and 08.0 step files, unchanged
-(`REPO_ROOT` names the checkout; `CHERI_ROOT` and `BOX_DIR` are required too):
+(`REPO_ROOT` names the igvf_tf_chrombpnet tree, by default this repository's
+`vendor/igvf_tf_chrombpnet`; `CHERI_ROOT` and `BOX_DIR` are required):
 once `attr_status.py` calls every fold DONE, it converts the folds, runs the
 dataset check, 06.0 and the average check, then 07.0 beside 08.0 in the
 background (at most `CHERI_08_MAX` 08.0 runs at once on the node, taken in list

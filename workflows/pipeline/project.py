@@ -7,6 +7,8 @@ here, once, from root, prefix and the sample stems:
 
   <root>/fragments/<stem>.fragments.tsv.gz       the inputs (fetch_igvf.py writes them; igvf_tf_chrombpnet's config
                                                  check accepts this suffix, not .bed.gz)
+  <reference_root>/hg38/, motif/                 the genome, chrom sizes, blacklist and motif database, read by every
+                                                 step (setup.sh --references downloads them)
   <root>/portal/                                 other portal files and manifest.tsv (fetch_igvf.py)
   <root>/peaks/<ds>/<ds>.narrowPeak.gz           00.0.call_peaks           (prep)
   <root>/chrombpnet/configs/<ds>/config.yaml     make_configs.py           (prep)
@@ -38,9 +40,16 @@ the runners it calls report per task, and some of them always exit 0.
     project.py <project.yaml> share --out <file.tar> [--datasets a,b] [--with-signal] [--list]
                                                    the results, packed for someone without cluster access (share.py)
 
+    project.py <project.yaml> sbatch-args          submit.sh's sbatch options from the slurm: block, one per line
+
+The steps after Cherimoya's own (00.0-02.0, 06.0-11.0) are igvf_tf_chrombpnet's, copied unchanged into
+vendor/igvf_tf_chrombpnet/ (VENDOR); their folds are the copy's folds/, and every reference file, the genome
+included, comes from reference_root through the copy's own references.layout(), so the steps and this module cannot
+name different files.
+
 `driver: false` in project.yaml marks a project the driver must not run (one set up by hand before the driver
 existed, kept for its results): env and coop-inputs refuse it, so run_project.sh and submit.sh do too, while
-show, check, status, prune and share still work.
+show, check, status, prune and share still work, without reference_root.
 
 Needs only the standard library and PyYAML (the default pixi env), so it runs on the login node.
 """
@@ -48,9 +57,12 @@ Needs only the standard library and PyYAML (the default pixi env), so it runs on
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -58,6 +70,9 @@ import yaml
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "attribution"))
+REPO = HERE.parent.parent
+VENDOR = REPO / "vendor" / "igvf_tf_chrombpnet"
+"""igvf_tf_chrombpnet's steps, copied unchanged (VENDORED.md); MANIFEST.tsv names the commit."""
 
 STAGES = ("fetch", "prep", "train", "attribute", "downstream", "motifs", "cooperativity", "coop_matrix")
 """In order. fetch runs on the login node (fetch_igvf.py); run_project.sh runs the others in a box."""
@@ -79,12 +94,24 @@ SLOTS = {
     "finemo_slots": 5,  # 10.0 runs at once, one GPU each
     "finemo_batch": 200,
     "coop_cores": 16,
+    "prep_max": 0,  # prep chains at once; 0 = every dataset
 }
+"""The most each slot gets: what a whole Gefion node (8 H100, 216 CPUs, ~2 TB) runs. resolve_slots() scales them
+down to a smaller machine; a value project.yaml gives is used as it is."""
+MODISCO_GB = 60  # an 08.0's peak memory, with room (docs/pipeline.md: ~55 GB)
+PREP_GB = 64  # a prep chain's peak memory, with room (~63 GB)
+SLURM_KEYS = ("partition", "account", "gpus", "cpus", "time", "extra")
+RETIRED = {
+    "igvf": "igvf_tf_chrombpnet's steps are in vendor/igvf_tf_chrombpnet/ now",
+    "chrombpnet": "chrombpnet is the pixi env `chrombpnet` now (setup.sh installs it)",
+    "chrombpnet_env": "chrombpnet is the pixi env `chrombpnet` now (setup.sh installs it)",
+    "genome": "the genome comes from reference_root",
+    "folds_dir": "the folds are vendor/igvf_tf_chrombpnet/folds/",
+}
+"""Keys project.yaml no longer takes, and why."""
 DEFAULTS = {
-    "genome": "/dcai/projects/iu_0109/annotations/hg38/Sequence/IGVFFI0653VCGH.fasta",
-    "igvf": "/dcai/users/mateug/git/igvf_tf_chrombpnet",
-    "chrombpnet": "/dcai/users/mateug/git/chrombpnet",
-    "chrombpnet_env": "cuda13",
+    "reference_root": None,
+    "slurm": None,
     "stages": list(BOX_STAGES),
     "hold_minutes": 60,
     "shift_every": 100,
@@ -108,8 +135,13 @@ def load(path: Path) -> dict:
     raw = yaml.safe_load(path.read_text()) or {}
     if not isinstance(raw, dict):
         raise ProjectError(f"{path}: not a mapping")
-    known = {"project", "root", "prefix", "samples", "compendium", "cooperativity", "slots", "folds", "folds_dir",
-             "prune", *DEFAULTS}  # fmt: skip
+    retired = sorted(set(raw) & set(RETIRED))
+    if retired:
+        why = "; ".join(f"{k}: {RETIRED[k]}" for k in retired)
+        raise ProjectError(f"{path}: {retired} are no longer project.yaml keys ({why}); give reference_root instead "
+                           "(docs/install.md)")  # fmt: skip
+    known = {"project", "root", "prefix", "samples", "compendium", "cooperativity", "slots", "folds", "prune",
+             *DEFAULTS}  # fmt: skip
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ProjectError(f"{path}: unknown keys {unknown}")
@@ -127,17 +159,33 @@ def load(path: Path) -> dict:
     if not root.is_absolute():
         raise ProjectError(f"{path}: root must be an absolute path")
     p["root"] = str(root)
-    p.setdefault("folds_dir", str(Path(p["igvf"]) / "folds"))
+    p["references"] = None
+    p["genome"] = None
+    if p["reference_root"] is not None:
+        ref = Path(str(p["reference_root"]))
+        if not ref.is_absolute():
+            raise ProjectError(f"{path}: reference_root must be an absolute path")
+        p["reference_root"] = str(ref)
+        p["references"] = reference_files(ref)
+        p["genome"] = p["references"]["genome_fa"]
+    p["folds_dir"] = str(VENDOR / "folds")
     p["folds"] = [str(f) for f in p.get("folds") or DEFAULT_FOLDS]
     stages = list(p["stages"])
     bad = [s for s in stages if s not in STAGES[1:]]
     if bad:
         raise ProjectError(f"{path}: unknown stages {bad}; the box stages are {list(STAGES[1:])}")
     p["stages"] = [s for s in STAGES[1:] if s in stages]  # always in pipeline order
-    p["slots"] = {**SLOTS, **(p.get("slots") or {})}
+    p["slots"] = dict(p.get("slots") or {})  # what project.yaml gives; resolve_slots() fills the rest in the box
     bad = sorted(set(p["slots"]) - set(SLOTS))
     if bad:
         raise ProjectError(f"{path}: unknown slots {bad}")
+    for k, v in p["slots"].items():
+        if not isinstance(v, int) or isinstance(v, bool) or v < (0 if k == "prep_max" else 1):
+            raise ProjectError(f"{path}: slots {k} must be a positive integer, got {v!r}")
+    slurm = p["slurm"] or {}
+    if not isinstance(slurm, dict) or sorted(set(slurm) - set(SLURM_KEYS)):
+        raise ProjectError(f"{path}: slurm takes only {list(SLURM_KEYS)}, got {slurm!r}")
+    p["slurm"] = slurm
 
     samples, seen = [], set()
     for s in p["samples"]:
@@ -202,6 +250,108 @@ def _cooperativity(path: Path, raw: dict, samples: list[dict]) -> dict:
         raise ProjectError(f"{path}: cooperativity series must be 3 or more distinct groups, got {series}")
     return {"groups": groups, "comparisons": comparisons, "series": series,
             **{k: v for k, v in raw.items() if k not in ("groups", "comparisons", "series")}}  # fmt: skip
+
+
+def _vendored_references():
+    """The vendored igvf_tf_chrombpnet's lib/python/utils/references.py (standard library only), the module its steps
+    resolve every reference path with."""
+    spec = importlib.util.spec_from_file_location("igvf_references", VENDOR / "lib/python/utils/references.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+REFERENCE_FILES = ("genome_fa", "chrom_sizes", "chrom_sizes_main", "blacklist", "ref_db_meme")
+"""The reference files the steps the driver runs read (the .fai beside genome_fa too); tss_bed is optional (02.0's TSS
+enrichment)."""
+
+
+def reference_files(reference_root: Path) -> dict[str, str]:
+    lay = _vendored_references().layout(str(reference_root))
+    return {k: lay[k] for k in (*REFERENCE_FILES, "tss_bed")}
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# the machine the box runs on, and the slots it can hold
+
+
+def _clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+def machine() -> dict:
+    """The CPUs this process may use, the GPUs (CUDA_VISIBLE_DEVICES when it lists device numbers, else every GPU
+    nvidia-smi lists), and the memory in GB (the cgroup's limit when there is one, else MemTotal)."""
+    cpus = len(os.sched_getaffinity(0))
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None and re.fullmatch(r"\d+(,\d+)*", visible.strip()):
+        gpus = visible.strip().split(",")
+    else:
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], capture_output=True,
+                                 text=True, check=False, timeout=60).stdout  # fmt: skip
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        gpus = [x.strip() for x in out.splitlines() if x.strip().isdigit()]
+    mem_bytes = None
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                mem_bytes = int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    for limit in (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")):
+        try:
+            text = limit.read_text().strip()
+        except OSError:
+            continue
+        if text.isdigit() and (mem_bytes is None or int(text) < mem_bytes):
+            mem_bytes = int(text)
+    return {"cpus": cpus, "gpus": gpus, "mem_gb": (mem_bytes or 0) // 2**30}
+
+
+def resolve_slots(given: dict, m: dict, n_datasets: int) -> dict[str, int]:
+    """The slots for machine m: SLOTS' values, each scaled down so the stages fit the machine's CPUs and memory; a
+    value project.yaml gives is kept as it is. On a whole Gefion node (8 GPUs, 216 CPUs, ~2 TB) this is SLOTS itself."""
+    c, g, mem = max(1, m["cpus"]), max(1, len(m["gpus"])), m["mem_gb"]
+    s = dict(given)
+
+    def pick(key, value):
+        s.setdefault(key, value)
+
+    pick("train_per_gpu", SLOTS["train_per_gpu"])
+    pick("train_cores", _clamp(c // (g * s["train_per_gpu"]), 1, SLOTS["train_cores"]))
+    pick("attribute_per_gpu", SLOTS["attribute_per_gpu"])
+    pick("attribute_cores", _clamp(c // (g * s["attribute_per_gpu"]), 1, SLOTS["attribute_cores"]))
+    pick("modisco_max", _clamp(min(mem // MODISCO_GB, c // SLOTS["modisco_threads"]), 1, SLOTS["modisco_max"]))
+    pick("modisco_threads", _clamp(c // s["modisco_max"], 1, SLOTS["modisco_threads"]))
+    pick("finemo_slots", _clamp(g, 1, SLOTS["finemo_slots"]))
+    pick("finemo_batch", SLOTS["finemo_batch"])
+    pick("coop_cores", _clamp(c // g, 1, SLOTS["coop_cores"]))
+    pick("prep_max", _clamp(min(mem // PREP_GB, c // 8), 1, max(1, n_datasets)))
+    if s["prep_max"] == 0:
+        s["prep_max"] = max(1, n_datasets)
+    return {k: int(s[k]) for k in SLOTS}
+
+
+def sbatch_args(p: dict) -> list[str]:
+    """The slurm: block as sbatch options (submit.sh passes them on the command line, which beats the #SBATCH lines
+    of run_project.sbatch). Every key is optional: what is not given is the cluster's default."""
+    s = p["slurm"]
+    out = []
+    if s.get("partition"):
+        out.append(f"--partition={s['partition']}")
+    if s.get("account"):
+        out.append(f"--account={s['account']}")
+    if s.get("gpus"):
+        out.append(f"--gres=gpu:{int(s['gpus'])}")
+    if s.get("cpus"):
+        out.append(f"--cpus-per-task={int(s['cpus'])}")
+    if s.get("time"):
+        out.append(f"--time={s['time']}")
+    extra = s.get("extra") or []
+    out += shlex.split(extra) if isinstance(extra, str) else [str(x) for x in extra]
+    return out
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -323,8 +473,13 @@ def check(p: dict, stage: str) -> list[str]:
 # outputs for the box
 
 
-def env_lines(p: dict) -> list[str]:
+def env_lines(p: dict, m: dict | None = None) -> list[str]:
+    """Shell assignments for run_project.sh, with the slots for machine m (default: this one)."""
+    if not p["reference_root"]:
+        raise ProjectError(f"{p['file']}: reference_root is required to run the project (docs/install.md)")
+    m = machine() if m is None else m
     q = paths(p)
+    refs = p["references"]
     values = {
         "PROJECT": p["project"],
         "PROJECT_FILE": p["file"],
@@ -336,14 +491,17 @@ def env_lines(p: dict) -> list[str]:
         "PROJECT_STAGES": " ".join(p["stages"]),
         "PROJECT_GENOME": p["genome"],
         "PROJECT_FOLDS_DIR": p["folds_dir"],
-        "PROJECT_IGVF": p["igvf"],
-        "PROJECT_CHROMBPNET": p["chrombpnet"],
-        "PROJECT_CHROMBPNET_ENV": p["chrombpnet_env"],
+        "PROJECT_REFERENCE_ROOT": p["reference_root"],
+        "PROJECT_REFERENCE_FILES": " ".join([refs[k] for k in REFERENCE_FILES] + [refs["genome_fa"] + ".fai"]),
+        "PROJECT_VENDOR": str(VENDOR),
+        "PROJECT_GPUS": ",".join(m["gpus"]),
+        "PROJECT_CPUS": str(m["cpus"]),
+        "PROJECT_MEM_GB": str(m["mem_gb"]),
         "PROJECT_COMPENDIUM": p["compendium"],
         "PROJECT_HOLD_MIN": str(int(p["hold_minutes"])),
         "PROJECT_SHIFT_EVERY": str(int(p["shift_every"])),
         **{f"PROJECT_{k.upper()}": str(v) for k, v in q.items()},
-        **{f"SLOT_{k.upper()}": str(int(v)) for k, v in p["slots"].items()},
+        **{f"SLOT_{k.upper()}": str(v) for k, v in resolve_slots(p["slots"], m, len(p["datasets"])).items()},
     }
     return [f"{k}={shlex.quote(v)}" for k, v in values.items()]
 
@@ -351,6 +509,8 @@ def env_lines(p: dict) -> list[str]:
 def write_coop_inputs(p: dict) -> list[Path]:
     """Per dataset coop_isa.py's args file (lane.sh reads one argument per line), and combine.py's groups.tsv,
     comparisons.tsv and, with a series, series.tsv."""
+    if not p["genome"]:
+        raise ProjectError(f"{p['file']}: reference_root is required to write the cooperativity inputs")
     q = paths(p)
     written = []
     (q["coop"] / "args").mkdir(parents=True, exist_ok=True)
@@ -386,6 +546,7 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("stage", choices=STAGES)
     sub.add_parser("status")
     sub.add_parser("coop-inputs")
+    sub.add_parser("sbatch-args")
     pr = sub.add_parser("prune", help="dry run: the manifest of what would be deleted; --apply deletes it")
     pr.add_argument("--apply", type=Path, metavar="MANIFEST", help="a manifest a dry run wrote, read by a person")
     sh = sub.add_parser("share", help="pack the results into one tar")
@@ -399,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
     except (ProjectError, OSError, yaml.YAMLError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    if args.cmd in ("env", "coop-inputs") and not p["driver"]:
+    if args.cmd in ("env", "coop-inputs", "sbatch-args") and not p["driver"]:
         print(f"ERROR: {p['file']} says driver: false: this project is not run by the driver (run_project.sh, "
               "submit.sh); its README says how it was made", file=sys.stderr)  # fmt: skip
         return DRIVER_REFUSED
@@ -448,7 +609,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "show":
         print(json.dumps(p, indent=1))
     elif args.cmd == "env":
-        print("\n".join(env_lines(p)))
+        try:
+            print("\n".join(env_lines(p)))
+        except ProjectError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+    elif args.cmd == "sbatch-args":
+        print("\n".join(sbatch_args(p)))
     elif args.cmd == "check":
         missing = check(p, args.stage)
         for m in missing[:50]:
@@ -461,7 +628,12 @@ def main(argv: list[str] | None = None) -> int:
             missing = check(p, stage)
             print(f"{stage}\t{'done' if not missing else f'{len(missing)} missing'}")
     elif args.cmd == "coop-inputs":
-        for f in write_coop_inputs(p):
+        try:
+            written = write_coop_inputs(p)
+        except ProjectError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        for f in written:
             print(f)
     return 0
 

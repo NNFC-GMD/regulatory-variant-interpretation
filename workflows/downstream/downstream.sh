@@ -11,7 +11,7 @@
 #   check    to_chrombpnet_scores.py --check-dataset: the folds' masks and beds
 #            agree, then V1 against ChromBPNet's own 05.0 files for a dataset in
 #            the shared list, against the genome for the others
-#   06.0     the igvf checkout's 06.0.average_contrib_scores.sh (8 threads)
+#   06.0     igvf_tf_chrombpnet's 06.0.average_contrib_scores.sh (8 threads)
 #   v2       to_chrombpnet_scores.py --check-average: 06.0's average recomputed
 #   07.0     07.0.contribs_to_bigwig.sh (8 threads), beside
 #   08.0     08.0.run_modisco.sh (CHERI_08_THREADS threads), at most CHERI_08_MAX
@@ -62,9 +62,10 @@
 # Input:  dataset lists, one dataset per line (blank lines and # comments
 #   skipped). Environment: CHERI_ROOT (make_jobs.py's --out-root, with the
 #   configs make_downstream.py wrote), BOX_DIR (the box's directory: the record,
-#   the producers' holds), REPO_ROOT (the igvf_tf_chrombpnet checkout whose
-#   workflows/SLURM steps run, with what its steps need from the environment:
-#   workflows/dcai/env.sh, CHROMBPNET_REPO, CHROMBPNET_PIXI_ENV).
+#   the producers' holds), REPO_ROOT (the igvf_tf_chrombpnet tree whose
+#   workflows/SLURM steps run, default this repository's vendor/igvf_tf_chrombpnet,
+#   with what its steps need from the environment: workflows/dcai/env.sh,
+#   REFERENCE_ROOT, CHROMBPNET_ENV; run_project.sh sets them all).
 # Knobs:  CHERI_PIXI_MANIFEST  pixi.toml whose cherimoya env runs the converter
 #                              and the checks (default: this checkout's)
 #         CHERI_08_MAX         08.0 runs at once on the node (default 6); the
@@ -97,8 +98,9 @@ usage="usage: downstream.sh <list.txt> [<list.txt> ...]"
 (( $# > 0 )) || { echo "${usage}" >&2; exit 2; }
 : "${CHERI_ROOT:?set CHERI_ROOT to the make_jobs.py --out-root}"
 : "${BOX_DIR:?set BOX_DIR to the box directory}"
-: "${REPO_ROOT:?set REPO_ROOT to the igvf_tf_chrombpnet checkout whose steps run}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# igvf_tf_chrombpnet's steps: by default this repository's copy of them (vendor/igvf_tf_chrombpnet/VENDORED.md).
+REPO_ROOT="${REPO_ROOT:-${repo_root}/vendor/igvf_tf_chrombpnet}"
 here="${repo_root}/workflows/downstream"
 attribution="${repo_root}/workflows/attribution"
 steps_dir="${REPO_ROOT}/workflows/SLURM"

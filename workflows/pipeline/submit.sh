@@ -2,13 +2,15 @@
 # submit.sh -- submit one project's box (run_project.sbatch -> run_project.sh), after the checks that need no box.
 #
 #   1. this checkout has no uncommitted changes, and its HEAD is on a remote branch (the run is reproducible)
-#   2. igvf_tf_chrombpnet is at workflows/pipeline/igvf.pin, unmodified
+#   2. vendor/igvf_tf_chrombpnet is as its MANIFEST.tsv says (the copied igvf_tf_chrombpnet steps, unmodified)
 #   3. the project's inputs are in place (project.py check fetch) and the dry run resolves every stage
 #   4. no other box of this user is running or pending (DCAI: one box at a time)
-# then sbatch, with the log at <root>/box/slurm_<job>.log, and the start Slurm expects, in ET.
+# then sbatch, with the log at <root>/box/slurm_<job>.log, and the start Slurm expects, in ET. The partition,
+# account, GPUs, CPUs and time limit come from project.yaml's slurm: block (project.py sbatch-args), as sbatch
+# options, which beat run_project.sbatch's #SBATCH lines; what the block leaves out is the cluster's default.
 #
 # Usage: bash workflows/pipeline/submit.sh <project.yaml> [--stages "<stage> ..."]
-#        SUBMIT_FORCE=1 skips check 1 (a test); SBATCH_ACCOUNT defaults to iu_0109.
+#        SUBMIT_FORCE=1 skips check 1 (a test).
 set -uo pipefail
 project_file="$(realpath "${1:?usage: submit.sh <project.yaml> [--stages \"...\"]}")"
 shift
@@ -16,7 +18,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 here="${repo_root}/workflows/pipeline"
 # shellcheck source=workflows/pipeline/lib.sh
 source "${here}/lib.sh"
-export PATH="${HOME}/.pixi/bin:${PATH}" SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-iu_0109}"
+export PATH="${HOME}/.pixi/bin:${PATH}"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 state="$(code_state "${repo_root}")"
@@ -30,10 +32,12 @@ fi
 project_env="$(pixi run --frozen --manifest-path "${repo_root}/pixi.toml" -e default python "${here}/project.py" "${project_file}" env)" \
     || die "project.yaml does not load, or is not for the driver (driver: false)"
 eval "${project_env}"
-want="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' "${here}/igvf.pin")"
-have="$(git -C "${PROJECT_IGVF}" rev-parse HEAD 2> /dev/null)"
-[[ "${have}" == "${want}" ]] || die "${PROJECT_IGVF} is at ${have:-?}; workflows/pipeline/igvf.pin wants ${want}"
-[[ "$(code_state "${PROJECT_IGVF}")" != *+changes* ]] || die "${PROJECT_IGVF} has uncommitted changes"
+(cd "${PROJECT_VENDOR}" && awk -F'\t' '$1 !~ /^#/ && $1 != "path" { print $2 "  " $1 }' MANIFEST.tsv | sha256sum --quiet -c -) \
+    || die "vendor/igvf_tf_chrombpnet differs from its MANIFEST.tsv (never edit it; workflows/pipeline/vendor_igvf.sh)"
+sbatch_text="$(pixi run --frozen --manifest-path "${repo_root}/pixi.toml" -e default python "${here}/project.py" \
+    "${project_file}" sbatch-args)" || die "project.py sbatch-args failed"
+sbatch_opts=()
+[[ -n "${sbatch_text}" ]] && mapfile -t sbatch_opts <<< "${sbatch_text}"
 pixi run --frozen --manifest-path "${repo_root}/pixi.toml" -e default python "${here}/project.py" "${project_file}" check fetch \
     || die "inputs missing: run workflows/pipeline/fetch_igvf.py ${project_file} first"
 bash "${here}/run_project.sh" "${project_file}" --dry-run "$@" > /dev/null 2>&1 || die "the dry run fails: bash ${here}/run_project.sh ${project_file} --dry-run"
@@ -42,7 +46,7 @@ busy="$(squeue -u "${USER}" -h -o '%i %j %T' 2> /dev/null)"
 
 mkdir -p "${PROJECT_BOX}"
 # No --export: on DCAI it gets the job cancelled by root as it starts (docs/cluster.md). The checkout goes as an argument.
-out="$(sbatch --parsable --chdir "${PROJECT_BOX}" --output "${PROJECT_BOX}/slurm_%j.log" \
+out="$(sbatch --parsable --chdir "${PROJECT_BOX}" --output "${PROJECT_BOX}/slurm_%j.log" "${sbatch_opts[@]}" \
     "${here}/run_project.sbatch" "${repo_root}" "${project_file}" "$@")" || die "sbatch failed"
 job="${out%%;*}"
 log "submitted job ${job} for ${PROJECT} (RVI ${state}); log ${PROJECT_BOX}/slurm_${job}.log, box dir ${PROJECT_BOX}/${job}"

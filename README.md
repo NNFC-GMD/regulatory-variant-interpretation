@@ -74,7 +74,7 @@ its framework, driver and documentation live here.
 
 ```bash
 bash workflows/pipeline/setup.sh --references <dir>   # every environment, and the references (docs/install.md)
-bash workflows/pipeline/setup.sh --with-engine        # also cherimoya-030, the frozen attribution engine (AMSC)
+bash workflows/pipeline/setup.sh --with-engine        # also cherimoya-030, the frozen attribution engine
 
 # login node: lint only
 pixi run lint && pixi run check-bash && pixi run ruff format --check workflows tests

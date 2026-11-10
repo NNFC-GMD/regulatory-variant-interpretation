@@ -9,7 +9,7 @@
 #     downloaded and md5-checked by the vendored steps' own `src/cli.py download-references`.
 #   Safe to rerun: an installed environment is checked against its lock, a reference already in place is kept.
 # Input:  --references <dir>   where the references go (an absolute path; created if missing)
-#         --with-engine        also cherimoya-030 (only for the AMSC project's frozen attribution engine)
+#         --with-engine        also cherimoya-030 (only for the frozen attribution engine, workflows/attribution/)
 #         --dry-run            print the commands and what is missing, change nothing
 # Output: .pixi/envs/<env>/ here and in vendor/igvf_tf_chrombpnet/; <dir>/hg38/, <dir>/motif/, <dir>/metadata/
 # Usage:  bash workflows/pipeline/setup.sh --references /data/mimir/references

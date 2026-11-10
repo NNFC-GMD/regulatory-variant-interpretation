@@ -125,7 +125,8 @@ pseudobulk's fragment file already holds only its cells.
 
 ## Prepare (`prep`)
 
-`stage_prep` in `run_project.sh`, all datasets at once. These steps are CPU only.
+`stage_prep` in `run_project.sh`, `slots.prep_max` datasets at once (by default as many as the memory holds, ~64 GB each,
+up to every dataset). These steps are CPU only.
 
 ### Tn5 shift
 

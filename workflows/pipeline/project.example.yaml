@@ -49,8 +49,9 @@ reference_root: /data/mimir/references
 folds: ["0", "1", "2", "3", "4"]
 
 # Slurm (submit.sh; optional, and only for submit.sh: run_project.sh run by hand needs none). Each key becomes an
-# sbatch option; a key left out is the cluster's default. gpus is --gres=gpu:<n>, cpus --cpus-per-task, extra any
-# other options (a string or a list). On Gefion (docs/cluster.md):
+# sbatch option; a key left out is the cluster's default. gpus is --gres=gpu:<n>: give it wherever Slurm hands out
+# GPUs (Gefion does), or the box sees none and its preflight stops. cpus is --cpus-per-task, extra any other options
+# (a string or a list). On Gefion (docs/cluster.md):
 #   slurm: {partition: defq, account: iu_0109, gpus: 8, cpus: 216, time: "2-00:00:00"}
 slurm:
   partition: gpu

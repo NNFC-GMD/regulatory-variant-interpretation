@@ -148,6 +148,25 @@ def test_machine_reads_cuda_visible_devices(monkeypatch):
     assert m["gpus"] == ["2", "3"] and m["cpus"] >= 1 and m["mem_gb"] >= 0
 
 
+def test_the_memory_limit_is_the_process_s_own_cgroup_s(tmp_path):
+    # cgroup v2: a Slurm job's limit sits on the job, the process in a step below it; the smallest one counts
+    root = tmp_path / "sys"
+    step = root / "system.slice" / "job_7" / "step_0"
+    step.mkdir(parents=True)
+    (root / "system.slice" / "job_7" / "memory.max").write_text(f"{64 * 2**30}\n")
+    (step / "memory.max").write_text("max\n")
+    proc = tmp_path / "cgroup"
+    proc.write_text("0::/system.slice/job_7/step_0\n")
+    assert pj.cgroup_memory_limit(proc, root) == 64 * 2**30
+    # cgroup v1: the memory hierarchy only
+    (root / "memory" / "slurm" / "uid_1").mkdir(parents=True)
+    (root / "memory" / "slurm" / "uid_1" / "memory.limit_in_bytes").write_text(f"{32 * 2**30}\n")
+    proc.write_text("4:cpu,cpuacct:/slurm/uid_1\n3:memory:/slurm/uid_1\n")
+    assert pj.cgroup_memory_limit(proc, root) == 32 * 2**30
+    proc.write_text("0::/\n")
+    assert pj.cgroup_memory_limit(proc, tmp_path / "none") is None
+
+
 def test_slurm_block_becomes_sbatch_options(tmp_path):
     p = pj.load(_yaml(tmp_path, slurm={"partition": "gpu", "account": "lab", "gpus": 4, "cpus": 64,
                                        "time": "1-00:00:00", "extra": "--qos=high --constraint=h100"}))  # fmt: skip

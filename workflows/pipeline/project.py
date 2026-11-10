@@ -279,6 +279,38 @@ def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
 
+def cgroup_memory_limit(proc: Path = Path("/proc/self/cgroup"), root: Path = Path("/sys/fs/cgroup")) -> int | None:
+    """The smallest memory limit, in bytes, of this process's cgroup and its ancestors (cgroup v2 memory.max, v1
+    memory/.../memory.limit_in_bytes), where a Slurm job or a container sets one; None when there is none."""
+    limits = []
+    try:
+        lines = proc.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        if parts[1] == "":  # v2: one hierarchy
+            base, name = root, "memory.max"
+        elif "memory" in parts[1].split(","):
+            base, name = root / "memory", "memory.limit_in_bytes"
+        else:
+            continue
+        d = base / parts[2].lstrip("/")
+        while True:
+            try:
+                text = (d / name).read_text().strip()
+            except OSError:
+                text = ""
+            if text.isdigit():
+                limits.append(int(text))
+            if d == base or base not in d.parents:
+                break
+            d = d.parent
+    return min(limits) if limits else None
+
+
 def machine() -> dict:
     """The CPUs this process may use, the GPUs (CUDA_VISIBLE_DEVICES when it lists device numbers, else every GPU
     nvidia-smi lists), and the memory in GB (the cgroup's limit when there is one, else MemTotal)."""
@@ -300,13 +332,9 @@ def machine() -> dict:
                 mem_bytes = int(line.split()[1]) * 1024
     except OSError:
         pass
-    for limit in (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")):
-        try:
-            text = limit.read_text().strip()
-        except OSError:
-            continue
-        if text.isdigit() and (mem_bytes is None or int(text) < mem_bytes):
-            mem_bytes = int(text)
+    limit = cgroup_memory_limit()
+    if limit is not None and (mem_bytes is None or limit < mem_bytes):
+        mem_bytes = limit
     return {"cpus": cpus, "gpus": gpus, "mem_gb": (mem_bytes or 0) // 2**30}
 
 

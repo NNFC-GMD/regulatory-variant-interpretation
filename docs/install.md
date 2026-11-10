@@ -64,7 +64,7 @@ then runs a project on it. On Gefion, `docs/cluster.md` has the local values; ev
      (IGVFFI0653VCGH) and its `.fai`, the chrom sizes, the ENCODE blacklist (ENCFF356LFX), the MotifCompendium 1.0.19
      database and the GENCODE v43 TSSs.
    - Its last lines say what, if anything, is still missing. `--dry-run` prints the commands.
-   - `--with-engine` adds `cherimoya-030`, which only the AMSC project's frozen attribution engine uses.
+   - `--with-engine` adds `cherimoya-030`, which only the frozen attribution engine (`workflows/attribution/`) uses.
 
    That directory is every project's `reference_root`. One copy serves every project on the machine.
 4. **Check** (on the machine that will run boxes, or inside a first box): `pixi run check` and `pixi run -e cherimoya
@@ -76,7 +76,8 @@ then runs a project on it. On Gefion, `docs/cluster.md` has the local values; ev
 - **The project:** `project.yaml` (from `workflows/pipeline/project.example.yaml`) names the samples, the root and
   `reference_root`. Leave `slots:` out so they scale to the machine.
 - **With Slurm:** add a `slurm:` block (partition, account, GPUs, CPUs, time limit), then `bash
-  workflows/pipeline/submit.sh <project.yaml>`. One job is one whole node.
+  workflows/pipeline/submit.sh <project.yaml>`. One job is one whole node. Give `gpus:` wherever Slurm hands out
+  GPUs: a job that asks for none sees none, and the preflight stops.
 - **Without Slurm:** `bash workflows/pipeline/run_project.sh <project.yaml>` on the machine, under tmux or nohup.
   `CUDA_VISIBLE_DEVICES=0,1` keeps it to those GPUs; `taskset -c <cpus>` to those CPUs.
 - **First,** `bash workflows/pipeline/run_project.sh <project.yaml> --dry-run` prints every command, safe anywhere.

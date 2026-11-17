@@ -28,6 +28,9 @@ Edit it. `project.example.yaml` documents every key; the ones that matter first:
   BGZF file named `<stem>.fragments.tsv.gz`. Optional: `md5`, `index` (the .tbi's accession), `extra` (other portal
   files to keep) and `label`.
 
+  All of a sample's fragments are used. For single-cell data split by cell type, make one file per group first with
+  `pseudobulk.py`, which also prints these samples (docs/pipeline.md, "Single-cell data").
+
   A sample can instead be a ready signal bigWig and its peaks, with no fragments: `signal` (the absolute path of a
   `.bw`) and `peaks` (of a `.narrowPeak.gz`). Use this only for files made from fragments the way prep makes them:
   the bigWig is Tn5 insertions per base, unstranded, at +4/−4 (00.0.prepare_signal's `data_unstranded.bw`), and

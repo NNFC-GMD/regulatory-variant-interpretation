@@ -250,6 +250,37 @@ peaks come from the recipe above. Nothing after 00.0 reads the fragments, so pre
 - **What nothing checks:** that the bigWig is insertions at +4/−4 and not coverage, and that the peaks used this
   recipe. Write down where the files came from and how they were made in the project's `NOTES.md`.
 
+### Single-cell data: one pseudobulk per cell group
+
+A sample's fragments are all used: a pseudobulk's file must already be its cells. When the data are many wells (or
+lanes) of 10x fragments with every barcode, and a table gives each cell's group (e.g. its cell type),
+`pseudobulk.py` makes one fragments file per group, before the project is set up.
+
+**Command** (in a box: it reads every well's fragments once):
+```
+rvi_run default python workflows/pipeline/pseudobulk.py --cells <cells.csv> --group-column <col> \
+    --wells <wells.tsv> --out <root>/fragments --jobs <cpus/2>
+```
+- `--cells`: a table with a header; `--id-column` (by default `barcode`) is `<well>_<barcode>`, `--group-column`
+  the group. `--wells`: a TSV with the columns `well` and `path`, each well's 10x fragments (BGZF, with its `.tbi`).
+  `--dry-run` reads only these two tables and checks the inputs, so it runs on the login node; it prints the groups,
+  their stems, cells and wells, and the samples block.
+- **Per well:** for each contig (`tabix`, in C-locale order), mawk keeps the rows of the well's labelled cells and
+  writes column 4 as `<well>_<barcode>`, unique across wells; every other column is kept. A well where fewer than
+  90 % of its labelled cells have a fragment stops the run: the IDs do not match the barcodes.
+- **Per group:** `sort -m` of its wells' rows, bgzip, tabix, the rows counted again against the first step's, the
+  md5. The file is `<root>/fragments/<stem>.fragments.tsv.gz`, where `<stem>` is the group's name lower-cased with
+  `_` for anything else than a-z and 0-9; `fetch_igvf.py` then only checks it.
+- **Outputs beside them:** `pseudobulk.tsv` (per group: cells, cells with a fragment, fragments, wells, md5, bytes)
+  and `pseudobulk.json` (the inputs' md5s, every well's counts, the tools' versions, the RVI commit). The tool
+  prints the `samples:` block for project.yaml.
+- **Why a script:** no packaged tool does this. SnapATAC2's `export_fragments` needs every barcode of every well
+  imported first; figwig groups cells only in memory and writes no fragments; sinto filters BAMs. Prep's readers
+  need only the first three columns and no order, but the output is sorted and indexed, the 10x format, so any tool
+  can read it by region.
+- **Cost:** one decompression of every well, then one merge per group, all groups at once. bgzip, tabix and mawk
+  are the vendored `peaks` env's; sort is the system's GNU sort.
+
 ## Train (`train`)
 
 **Command:**

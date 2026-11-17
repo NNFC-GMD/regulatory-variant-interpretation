@@ -12,6 +12,7 @@ compendium: ex3                    # the tag of the project's motif compendium (
 samples:
   # fragments: an IGVF file accession (fetch_igvf.py downloads and md5-checks it), or the absolute path of a BGZF
   #   fragments file named <stem>.fragments.tsv.gz. All fragments are used: a pseudobulk's file is already its cells.
+  #   pseudobulk.py makes such files from single-cell fragments and a table of labelled cells, and prints this block.
   # md5: optional; checked against the file (and against the portal's, for an accession)
   # index: optional accession of the fragments' .tbi; extra: optional accessions kept in <root>/portal/ for the record
   # label: optional, for reports

@@ -15,6 +15,7 @@ TF-MoDISco motifs, one compendium, Fi-NeMo hits and DeepISA cooperativity, every
 | `run_project.sbatch` | one whole node for `run_project.sh` |
 | `run_project.sh` | the stages in order: preflight, prep, train, attribute, downstream, motifs, cooperativity, coop_matrix (only when project.yaml lists it), summary; `--dry-run` prints them. Without Slurm, run it on the machine |
 | `status.py` | `<root>/STATUS.md`: each stage's state and each dataset's headline numbers |
+| `pseudobulk.py` | single-cell fragments of many wells split into one pseudobulk per cell group, from a table of labelled cells, into `<root>/fragments/<stem>.fragments.tsv.gz`; prints the samples block (in a box; `--dry-run` on the login node; docs/pipeline.md, "Single-cell data") |
 | `prune.py` | `project.py <yaml> prune`: a finished project's derived intermediates, by rule, into a manifest a person reads; `--apply <manifest>` deletes exactly those files. Never what a stage check reads (docs/results.md) |
 | `share.py` | `project.py <yaml> share --out <file.tar>`: the results in one tar, with an md5 of each file, for someone without cluster access |
 | `lib.sh` | the shell helpers (log in ET, stage records, CPU blocks, the hold after a failure) |

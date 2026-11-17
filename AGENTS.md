@@ -2,18 +2,19 @@
 
 This repository (NNFC-GMD/regulatory-variant-interpretation) is the reference repository of **Mímir**, the NNFC
 initiative to prepare chromatin datasets, train sequence-to-function models, score variants and interpret them. All
-of its framework lives here: the end-to-end driver, every step that is not igvf_tf_chrombpnet's, and the
-documentation. If something about how to run the pipeline is not written down here, write it down here.
+of its framework lives here: the end-to-end driver, every step that is not igvf_tf_chrombpnet's, a copy of those
+that are, and the documentation. A clone of it alone runs a project from fragments to DeepISA (`docs/install.md`). If something about how to run the pipeline is not written down here, write it down here.
 
 ## Where to start
 
+- `docs/install.md`: setting up a machine (pixi, `setup.sh`, the references), with or without Slurm.
 - `docs/pipeline.md`: every step, what it does and why, its command, environment and cost.
 - `docs/new_project.md`: starting and running a project, step by step.
 - `docs/results.md`: what a finished project's files hold and how to read them; prune and share.
 - `docs/cluster.md`: the rules of the Gefion (DCAI) cluster.
-- `workflows/pipeline/`: the driver: `project.py` (the layout and the stage checks), `fetch_igvf.py`, `submit.sh`,
-  `run_project.sh`, `status.py`, `project.example.yaml`; and for finished projects `prune.py` (what may be deleted,
-  by rule, from a reviewed manifest) and `share.py` (the results in one tar).
+- `workflows/pipeline/`: the driver: `project.py` (the layout and the stage checks), `setup.sh`, `fetch_igvf.py`,
+  `submit.sh`, `run_project.sh`, `status.py`, `project.example.yaml`; and for finished projects `prune.py` (what may
+  be deleted, by rule, from a reviewed manifest) and `share.py` (the results in one tar).
 
 ## Map
 
@@ -26,11 +27,13 @@ documentation. If something about how to run the pipeline is not written down he
 | `workflows/comparison/` | ChromBPNet against Cherimoya, level by level, and the report |
 | `workflows/variant_scoring/`, `workflows/nulls/`, `workflows/qtl/` | variant effects, their nulls, and the QTL checks |
 | `workflows/cooperativity/` | DeepISA with Cherimoya, ours and the official rules |
+| `vendor/igvf_tf_chrombpnet/` | igvf_tf_chrombpnet's 00.0–02.0 and 06.0–11.0, copied unchanged from one commit, with their `pixi.toml`/`pixi.lock` and folds (`VENDORED.md`, `MANIFEST.tsv`) |
 | `docs/` | the documentation above |
 | `tests/` | the test suite (no data needed; some tests need torch, pandas or a GPU) |
 
-The preprocessing (00.0–02.0) and the motif steps (06.0–11.0) are igvf_tf_chrombpnet's, run unchanged at the commit
-in `workflows/pipeline/igvf.pin`.
+The preprocessing (00.0–02.0) and the motif steps (06.0–11.0) are igvf_tf_chrombpnet's, run unchanged from the copy
+in `vendor/igvf_tf_chrombpnet/`, at the commit its `MANIFEST.tsv` names. chrombpnet, which some of them run in, is
+the pixi env `chrombpnet`.
 
 ## Checking your work
 
@@ -50,6 +53,11 @@ in `workflows/pipeline/igvf.pin`.
   the record of the AMSC DeepISA run.
 - **Never edit `workflows/attribution/attribute_fast.py`, `cheri_dls.py` or `dls_refs.py`**, not even a comment.
   An engine pin hashes them, and a changed byte makes every attribution it covers refuse to run.
+- **Never edit `vendor/igvf_tf_chrombpnet/`.** Its `MANIFEST.tsv` hashes every file, and the preflight refuses a
+  change. A fix goes to igvf_tf_chrombpnet's `chrombpnet2`; then refresh the copy with `workflows/pipeline/vendor_igvf.sh`
+  and run the verification in docs/pipeline.md, "Changing a pinned version".
+- **Nothing machine-specific in code.** Paths to references, checkouts or clusters come from `project.yaml`
+  (`reference_root`, `slurm:`) or the command line; Gefion's values live in `docs/cluster.md`.
 - **Results never go in the repository.** Data, configs and outputs live under project roots; scripts take paths
   as arguments.
 - **Git:**

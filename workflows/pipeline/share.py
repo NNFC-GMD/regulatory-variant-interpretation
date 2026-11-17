@@ -116,7 +116,8 @@ def write_share(p: dict, files: list[Path], out: Path) -> dict:
         if RESULTS_DOC.is_file():
             members.append((RESULTS_DOC, f"{top}/docs/results.md"))
         for src, arc in members:
-            info = tar.gettarinfo(str(src), arcname=arc)
+            # the file a link points to (00.0 links a given signal bigWig as data_unstranded.bw), not the link
+            info = tar.gettarinfo(str(src.resolve()), arcname=arc)
             info.uid = info.gid = 0
             info.uname = info.gname = ""
             with open(src, "rb") as fh:

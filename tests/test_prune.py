@@ -245,7 +245,7 @@ def test_driver_false_refuses_the_driver_commands(tmp_path, capsys):
     assert pj.main([str(path), "coop-inputs"]) == pj.DRIVER_REFUSED
     assert not (tmp_path / "root" / "cherimoya" / "cooperativity").exists()
     assert pj.main([str(path), "show"]) == 0 and pj.main([str(path), "check", "fetch"]) == 1
-    assert pj.main([str(_yaml(tmp_path)), "env"]) == 0
+    assert pj.main([str(_yaml(tmp_path, reference_root=str(tmp_path / "refs"))), "env"]) == 0
     with pytest.raises(pj.ProjectError, match="true or false"):
         pj.load(_yaml(tmp_path, driver="no"))
 
@@ -290,3 +290,17 @@ def test_share_packs_the_results_with_md5s(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "\ncherimoya/tx_a/fold_0/cherimoya.fold_0.torch\n" in out and "MISSING cherimoya/tx_a/fold_0/fit.json" in out
     assert pj.main([str(path), "share", "--datasets", "tx_zz", "--list"]) == 2
+
+
+def test_share_packs_what_a_link_points_to(tmp_path):
+    # 00.0 links a given signal bigWig as data_unstranded.bw: the tar holds its bytes, not the link
+    p = pj.load(_yaml(tmp_path))
+    q = pj.paths(p, "tx_a")
+    real = _put(tmp_path, "elsewhere/a.bw", "bigwig bytes\n")
+    q["bigwig"].parent.mkdir(parents=True, exist_ok=True)
+    q["bigwig"].symlink_to(real)
+    out = tmp_path / "toy.tar"
+    share.write_share(p, [q["bigwig"]], out)
+    with tarfile.open(out) as tar:
+        member = tar.getmember("toy/" + q["bigwig"].relative_to(p["root"]).as_posix())
+        assert member.isfile() and tar.extractfile(member).read() == b"bigwig bytes\n"

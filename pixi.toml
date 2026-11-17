@@ -3,6 +3,9 @@ name = "regulatory-variant-interpretation"
 description = "Sequence-to-function models of chromatin accessibility, for interpreting regulatory variants"
 channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64"]
+# bioconda publishes no conda->PyPI name map: name its pybigwig (chrombpnet env), so the PyPI resolver does not install
+# pyBigWig a second time for chrombpnet's requirement.
+conda-pypi-map = { bioconda = "conda-pypi-map.json" }
 
 # Environments:
 #
@@ -13,6 +16,10 @@ platforms = ["linux-64"]
 #                  CUDA 13 torch, NVIDIA driver >= 580. The default for every
 #                  project, and pytest for the tests that need torch or pandas
 #                  (`pixi run -e cherimoya test-cherimoya`).
+#   chrombpnet     chrombpnet (NNFC-GMD/chrombpnet at a pinned commit), CPU only,
+#                  for the four pieces of it the vendored igvf_tf_chrombpnet
+#                  steps use: detect_shifts.py's cross-check, 01.0's
+#                  `chrombpnet prep nonpeaks`, 06.0 and 07.0.
 #   cherimoya-030  Cherimoya 0.3.0 with tangermeme 1.5.0, only for
 #                  workflows/attribution/attribute_fast.py: its engine refuses
 #                  any other versions (its tests: `pixi run -e cherimoya-030
@@ -56,7 +63,41 @@ deepisa = { git = "https://github.com/anderssonlab/deepISA", rev = "179091c3c272
 test-cherimoya = "pytest -q tests --ignore-glob='tests/test_dls_*.py'"
 # The tests of what workflows/pipeline/run_project.sh runs; its preflight requires them (and runs test-cherimoya
 # beside, reported in STATUS.md).
-test-pipeline = "pytest -q tests/test_pipeline_project.py tests/test_cooperativity.py tests/test_coop_matrix.py tests/test_run_task_attribute.py tests/test_make_downstream.py tests/test_make_jobs.py tests/test_attr_status.py tests/test_to_chrombpnet_scores.py tests/test_check_dataset.py tests/test_downstream.py tests/test_prune.py"
+test-pipeline = "pytest -q tests/test_pipeline_project.py tests/test_cooperativity.py tests/test_coop_matrix.py tests/test_run_task_attribute.py tests/test_make_downstream.py tests/test_make_jobs.py tests/test_attr_status.py tests/test_to_chrombpnet_scores.py tests/test_check_dataset.py tests/test_downstream.py tests/test_prune.py tests/test_vendor.py"
+
+# chrombpnet (NNFC-GMD/chrombpnet, branch stable-modern-gpu-support), at the commit igvf_tf_chrombpnet's steps run
+# with (CHROMBPNET_REV in vendor/igvf_tf_chrombpnet/lib/bash/common.sh). Installed as a package from git, so no
+# checkout is needed, and CPU only: the vendored steps use four pieces of it, none of which needs a GPU or a model.
+#   - detect_shifts.py cross-checks scPrinter's Tn5 shift with chrombpnet's auto_shift_detect;
+#   - 01.0 runs `chrombpnet prep nonpeaks`, the GC-matched background regions that become Cherimoya's training
+#     negatives (seeded, bedtools for the intervals);
+#   - 07.0 imports chrombpnet's bigwig_helper; 06.0 runs in this env but imports only h5py, hdf5plugin and numpy.
+# The versions that can change those outputs are pinned to the ones in chrombpnet's own cuda13 lock, the env every
+# project so far ran these steps with, and so are jax, numba and the date parser, for the same reason (jax and keras
+# come in as chrombpnet's requirements, CPU builds).
+[feature.chrombpnet.dependencies]
+python = "==3.13.15"
+numpy = "==2.5.3"
+pybigwig = "==0.3.25"
+bedtools = "==2.31.1"
+libdeflate = "==1.25"
+weasyprint = "==69.0"
+fonts-conda-ecosystem = "*"
+
+[feature.chrombpnet.pypi-dependencies]
+chrombpnet = { git = "https://github.com/NNFC-GMD/chrombpnet.git", rev = "05f5748f7fae32c30eb3ba4451d97668856627d1" }
+pandas = "==3.0.6"
+pyfaidx = "==0.9.0.4"
+h5py = "==3.16.0"
+hdf5plugin = "==7.1.0"
+scipy = "==1.18.1"
+python-dateutil = "==2.9.0.post0"
+jax = "==0.11.2"
+jaxlib = "==0.11.2"
+numba = "==0.67.0"
+
+[feature.chrombpnet.activation.env]
+KERAS_BACKEND = "jax"
 
 # The environment the AMSC campaign attributed with, kept as it was solved
 # (plus pytest, for the engine's own tests).
@@ -76,6 +117,7 @@ test-engine = "pytest -q tests/test_dls_cli.py tests/test_dls_engine.py tests/te
 [environments]
 cherimoya = { features = ["cherimoya"], no-default-feature = true, solve-group = "cherimoya-031" }
 cherimoya-030 = { features = ["cherimoya-030"], no-default-feature = true, solve-group = "cherimoya" }
+chrombpnet = { features = ["chrombpnet"], no-default-feature = true, solve-group = "chrombpnet" }
 
 [tasks]
 lint = "ruff check workflows tests"

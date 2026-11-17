@@ -221,7 +221,7 @@ def test_matrix_args_and_cpu_blocks(tmp_path):
 def _project(tmp_path: Path, **coop) -> Path:
     doc = {"project": "toy", "root": str(tmp_path / "root"), "prefix": "tx_", "compendium": "tx3",
            "samples": [{"stem": s, "fragments": f"/data/{s}.fragments.tsv.gz"} for s in ("a", "b", "c")],
-           "cooperativity": {"comparisons": [["a_c", "a", "c"]], **coop}}  # fmt: skip
+           "cooperativity": {"comparisons": [["a_c", "a", "c"]], **coop}, "reference_root": "/refs"}  # fmt: skip
     path = tmp_path / "project.yaml"
     path.write_text(yaml.safe_dump(doc))
     return path

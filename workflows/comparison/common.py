@@ -69,7 +69,8 @@ class Failed(Exception):
 
 def add_root_args(ap: argparse.ArgumentParser) -> None:
     """--cheri-root, --chrombpnet-root, --compendia-root, --comparison-root and --folds-dir, each defaulting to the
-    environment compare.sh exports (CHERI_ROOT, CHROMBPNET_ROOT, COMPENDIA_ROOT, COMPARISON_ROOT, REPO_ROOT/folds)."""
+    environment compare.sh exports (CHERI_ROOT, CHROMBPNET_ROOT, COMPENDIA_ROOT, COMPARISON_ROOT, REPO_ROOT/folds; the
+    folds default to the vendored copy without REPO_ROOT)."""
     env = os.environ.get
     repo = env("REPO_ROOT")
     ap.add_argument("--cheri-root", type=Path, default=env("CHERI_ROOT"), help="make_jobs.py's --out-root")
@@ -78,8 +79,10 @@ def add_root_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--compendia-root", type=Path, default=env("COMPENDIA_ROOT"),
                     help="09.0's compendia (<root>/<tag>/, <root>/inputs/)")  # fmt: skip
     ap.add_argument("--comparison-root", type=Path, default=env("COMPARISON_ROOT"), help="where the outputs go")
-    ap.add_argument("--folds-dir", type=Path, default=Path(repo) / "folds" if repo else None,
-                    help="igvf_tf_chrombpnet's folds/ (fold_<k>.json); default $REPO_ROOT/folds")  # fmt: skip
+    vendored = Path(__file__).resolve().parents[2] / "vendor" / "igvf_tf_chrombpnet" / "folds"
+    ap.add_argument("--folds-dir", type=Path, default=Path(repo) / "folds" if repo else vendored,
+                    help="igvf_tf_chrombpnet's folds/ (fold_<k>.json); default $REPO_ROOT/folds, else this "
+                         "repository's copy, vendor/igvf_tf_chrombpnet/folds")  # fmt: skip
 
 
 def require(args: argparse.Namespace, *names: str) -> None:

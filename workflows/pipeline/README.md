@@ -8,8 +8,8 @@ TF-MoDISco motifs, one compendium, Fi-NeMo hits and DeepISA cooperativity, every
 | File | What it does |
 |---|---|
 | `project.example.yaml` | every key of a project.yaml, with its default |
-| `project.py` | loads and checks project.yaml, derives every path, says which stages are done (`status`, `check <stage>`), writes DeepISA's inputs |
-| `fetch_igvf.py` | the IGVF portal files a project names, md5-checked, into `<root>/fragments/<stem>.fragments.tsv.gz` (login node) |
+| `project.py` | loads and checks project.yaml, derives every path, says which stages are done (`status`, `check <stage>`), writes DeepISA's inputs and the configs of samples given as a bigWig (`signal-configs`) |
+| `fetch_igvf.py` | the IGVF portal files a project names, md5-checked, into `<root>/fragments/<stem>.fragments.tsv.gz`; for a sample given as a bigWig and its peaks, checks both and copies the peaks into place (login node) |
 | `setup.sh` | once per machine: every environment from its lock file, and with `--references <dir>` the reference files (docs/install.md) |
 | `submit.sh` | with Slurm: the checks that need no box (clean, pushed checkout; the vendored steps as their manifest says; inputs; dry run; no other box), then `sbatch run_project.sbatch` with project.yaml's `slurm:` options |
 | `run_project.sbatch` | one whole node for `run_project.sh` |

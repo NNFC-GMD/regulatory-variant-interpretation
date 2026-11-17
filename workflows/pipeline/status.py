@@ -4,7 +4,8 @@
 run_project.sh writes it as its last stage; it can be run any time, also mid-run, also on the login node (standard
 library and PyYAML only; it reads files, never imports numpy). Per dataset:
 
-  shift        the Tn5 shift detect_shifts.py found in the fragments (plus/minus; 10x files: +4/-5)
+  shift        the Tn5 shift detect_shifts.py found in the fragments (plus/minus; 10x files: +4/-5); "bigWig"
+               for a sample given as a ready signal bigWig (its shift was applied when it was made)
   peaks        rows of the called narrowPeak (the igvf pseudobulking recipe)
   counts r     the mean over folds of Cherimoya's test count Pearson (cherimoya.fold_<k>.test.performance.tsv)
   profile JSD  the same for the median profile JSD
@@ -112,6 +113,8 @@ def build(p: dict) -> str:
         d = pj.paths(p, ds)
         sh = shifts.get(s["stem"]) or {}
         shift = f"{sh['plus_shift']:+d}/{sh['minus_shift']:+d}" if "plus_shift" in sh else "–"
+        if s["kind"] == "signal":
+            shift = "bigWig"
         perf = [performance(d["cheri"] / f"fold_{k}" / f"cherimoya.fold_{k}.test.performance.tsv") for k in p["folds"]]
         perf = [x for x in perf if x]
         r = sum(x.get("count_pearson", 0) for x in perf) / len(perf) if perf else None

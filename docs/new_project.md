@@ -27,6 +27,12 @@ Edit it. `project.example.yaml` documents every key; the ones that matter first:
 - **`samples`:** for each, a `stem` and its `fragments`, either an IGVF file accession or the absolute path of a
   BGZF file named `<stem>.fragments.tsv.gz`. Optional: `md5`, `index` (the .tbi's accession), `extra` (other portal
   files to keep) and `label`.
+
+  A sample can instead be a ready signal bigWig and its peaks, with no fragments: `signal` (the absolute path of a
+  `.bw`) and `peaks` (of a `.narrowPeak.gz`). Use this only for files made from fragments the way prep makes them:
+  the bigWig is Tn5 insertions per base, unstranded, at +4/−4 (00.0.prepare_signal's `data_unstranded.bw`), and
+  the peaks come from 00.0.call_peaks' recipe. Prep then starts at 00.1 for that sample (docs/pipeline.md, "A
+  sample given as a bigWig"). Keep such files under `<root>/inputs/`, which `prune.py` keeps.
 - **`cooperativity`:** `groups` (by stem; by default one per sample) and `comparisons`, `[name, group_a, group_b]`,
   where a change is b − a. Write out every comparison you want, e.g. each time point against the first and each
   against the next. For a time course, add `series`: the groups in order, for the trends along them.
@@ -52,6 +58,8 @@ What it does:
   and every file gets a row in `<root>/portal/manifest.tsv`.
 - A file already in place with the right md5 is kept, so it can be rerun. `--dry-run` only checks.
 - A local file is checked and linked in.
+- For a sample given as `signal` and `peaks`, it checks the bigWig and gzip headers and copies the peaks to
+  `<root>/peaks/<ds>/<ds>.narrowPeak.gz`. The bigWig stays where it is.
 - Controlled-access files are refused: fetch those yourself and give their paths.
 
 ## 3. Dry run (login node, or the machine)

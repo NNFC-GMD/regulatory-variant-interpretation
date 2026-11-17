@@ -14,7 +14,9 @@ own md5, when project.yaml gives one), and only then renamed into place:
   every file a row in <root>/portal/manifest.tsv: accession, stem, role, path, md5, bytes, portal summary, fetched (ET)
 
 A file already in place with the right md5 is kept. A sample whose fragments is a path is checked (BGZF, md5 when
-given) and linked into fragments/ only if its name differs. Only the IGVF portal is contacted. The files are public
+given) and linked into fragments/ only if its name differs. A sample given as signal and peaks (a ready bigWig and
+its narrowPeak.gz, no fragments) is checked (the bigWig and gzip headers), and its peaks are copied to
+<root>/peaks/<ds>/<ds>.narrowPeak.gz, where 00.1 reads them; both get a row, with their md5. Only the IGVF portal is contacted. The files are public
 (controlled_access false); a controlled-access file is refused, since it needs credentials this script does not
 handle.
 
@@ -26,9 +28,11 @@ Standard library and PyYAML only (the default pixi env); I/O-bound, so it runs o
 from __future__ import annotations
 
 import argparse
+import filecmp
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 import urllib.request
@@ -39,6 +43,7 @@ import project as pj  # noqa: E402
 
 PORTAL = "https://api.data.igvf.org"
 BGZF_MAGIC = b"\x1f\x8b\x08\x04"
+BIGWIG_MAGIC = (b"\x26\xfc\x8f\x88", b"\x88\x8f\xfc\x26")  # 0x888FFC26, in either byte order
 CHUNK = 8 << 20
 
 
@@ -73,6 +78,46 @@ def is_bgzf(path: Path) -> bool:
         head = fh.read(18)
     # gzip with FEXTRA, and the BGZF subfield 'BC' in the extra field
     return head[:4] == BGZF_MAGIC and head[12:14] == b"BC"
+
+
+def is_bigwig(path: Path) -> bool:
+    with open(path, "rb") as fh:
+        return fh.read(4) in BIGWIG_MAGIC
+
+
+def is_gzip(path: Path) -> bool:
+    with open(path, "rb") as fh:
+        return fh.read(2) == BGZF_MAGIC[:2]
+
+
+def place_given(p: dict, s: dict, dry: bool) -> list[dict]:
+    """A sample given as a signal bigWig and its peaks: both checked (headers), and the peaks copied to
+    <root>/peaks/<ds>/<ds>.narrowPeak.gz, where 00.1 and the prep check read them (a copy, not a link: the file is
+    small, and a link would go into share.py's tar as a link). The bigWig stays where it is: its config names it."""
+    sig, peaks = Path(s["signal"]), Path(s["peaks"])
+    if not sig.is_file() or not is_bigwig(sig):
+        raise RuntimeError(f"{sig} is missing or not a bigWig")
+    if not peaks.is_file() or not is_gzip(peaks):
+        raise RuntimeError(f"{peaks} is missing or not gzip-compressed")
+    dest = pj.paths(p, s["dataset"])["narrowpeak"]
+    if dest.resolve() == peaks.resolve():
+        state = "in place"
+    elif dest.is_file() and not dest.is_symlink() and filecmp.cmp(peaks, dest, shallow=False):
+        state = "kept"
+    elif dry:
+        state = "would copy"
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".partial")
+        shutil.copyfile(peaks, tmp)
+        os.replace(tmp, dest)
+        state = "copied"
+    return [
+        {"stem": s["stem"], "role": "signal", "accession": "", "path": str(sig), "md5": md5_of(sig),
+         "bytes": sig.stat().st_size, "summary": "a ready signal bigWig (project.yaml)", "state": "given"},
+        {"stem": s["stem"], "role": "peaks", "accession": "", "path": str(dest), "md5": md5_of(peaks),
+         "bytes": peaks.stat().st_size, "summary": str(peaks), "state": state},
+    ]  # fmt: skip
 
 
 def download(meta: dict, dest: Path, want_md5: str) -> None:
@@ -120,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     q = pj.paths(p)
     rows, failed = [], 0
     for s in p["samples"]:
-        frag = pj.fragments_file(p, s)
+        frag = pj.fragments_file(p, s) if s["kind"] == "fragments" else None
         jobs = []
         if s["accession"]:
             jobs.append(("fragments", s["accession"], frag, s["md5"]))
@@ -142,7 +187,17 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             rows.append({"stem": s["stem"], "role": role, **row})
             print(f"{s['stem']}\t{role}\t{acc}\t{row['state']}\t{row['path']}")
-        if not s["accession"]:  # a local path
+        if s["kind"] == "signal":
+            try:
+                given = place_given(p, s, args.dry_run)
+            except (RuntimeError, OSError) as exc:
+                print(f"ERROR: {s['stem']}: {exc}", file=sys.stderr)
+                failed += 1
+                continue
+            rows += given
+            for row in given:
+                print(f"{s['stem']}\t{row['role']}\t-\t{row['state']}\t{row['path']}")
+        elif not s["accession"]:  # a local path
             src = Path(s["fragments"])
             if not src.is_file() or not is_bgzf(src):
                 print(f"ERROR: {s['stem']}: {src} is missing or not BGZF", file=sys.stderr)

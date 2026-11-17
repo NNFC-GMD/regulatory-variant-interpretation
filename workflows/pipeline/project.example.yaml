@@ -19,6 +19,11 @@ samples:
      extra: [IGVFFI0000AAAC], label: "time point 0"}
   - {stem: t1, fragments: IGVFFI0000BBBA}
   - {stem: t2, fragments: /path/to/t2.fragments.tsv.gz}
+  # Or, instead of fragments, a ready signal bigWig and its peaks, made from the fragments the way prep's 00.0 makes
+  # them (Tn5 insertions per base, unstranded, at +4/-4; peaks from 00.0.call_peaks' recipe). Prep then starts at
+  # 00.1. Absolute paths; keep the files under <root>/inputs/, which prune.py keeps:
+  # - {stem: t3, signal: /data/mimir/example_course/inputs/t3.bw,
+  #    peaks: /data/mimir/example_course/inputs/t3.narrowPeak.gz}
 
 # The stages run_project.sh runs, in this order whatever the order here (fetch runs before, on the login node). The
 # default is the first six; coop_matrix (every dataset's DeepISA sites under every dataset's models: D x D coop_isa.py

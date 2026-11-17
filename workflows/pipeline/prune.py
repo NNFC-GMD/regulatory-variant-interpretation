@@ -87,6 +87,7 @@ ALWAYS = [
     _k("**/*.md", "notes, reports and READMEs, wherever they are"),
     _k("prune/**", "this tool's manifests and logs"),
     _k("fragments/**", "the inputs"),
+    _k("inputs/**", "inputs as received, e.g. a ready signal bigWig and its peaks (project.yaml's signal, peaks)"),
     _k("portal/**", "the portal's other files"),
     _k("compendia/**", "the motif compendia (hits are tied to them by md5)"),
     _k("box/**", "each box's logs and stage table"),

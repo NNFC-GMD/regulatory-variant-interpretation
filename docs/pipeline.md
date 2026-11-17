@@ -9,7 +9,7 @@ takes. `docs/install.md` sets up a machine; `docs/new_project.md` is the how-to;
 
 | stage | what | where the code is |
 |---|---|---|
-| fetch | the input fragment files, md5-checked | `workflows/pipeline/fetch_igvf.py` (login node) |
+| fetch | the input fragment files, md5-checked (or a ready bigWig and its peaks, checked) | `workflows/pipeline/fetch_igvf.py` (login node) |
 | **Prepare** (`prep`) | Tn5 shift, peaks, signal track, background regions, QC | igvf_tf_chrombpnet 00.0–02.0 (`vendor/`) |
 | **Train** (`train`) | Cherimoya, one model per chromosome fold | `workflows/train/` |
 | **Attribute** (`attribute`) | DeepLIFT/SHAP on the counts head, every peak, every fold | `cherimoya attribute`, `workflows/attribution/` |
@@ -123,6 +123,11 @@ The fragments must be BGZF; the peak caller and figwig read them as such. A loca
 `<stem>.fragments.tsv.gz` is linked in instead of fetched. All fragments are used, with no barcode filter: a
 pseudobulk's fragment file already holds only its cells.
 
+A sample given as `signal` and `peaks` (a ready bigWig and its narrowPeak, below) has nothing to download. Fetch
+checks that the bigWig starts with a bigWig's magic number and the peaks with gzip's. It copies the peaks to
+`<root>/peaks/<ds>/<ds>.narrowPeak.gz`, where 00.1 and the prep check read them, and records both files' md5 in
+`manifest.tsv`. The peaks are copied, not linked, because they are small and `share.py` would pack a link as a link.
+
 ## Prepare (`prep`)
 
 `stage_prep` in `run_project.sh`, `slots.prep_max` datasets at once (by default as many as the memory holds, ~64 GB each,
@@ -226,6 +231,24 @@ Output: `<root>/peaks/<ds>/<ds>.narrowPeak.gz`, `call_peaks.json` (the counts af
 
 Up to ~63 GB of RAM per chain. Peak calling and the signal scale with the number of fragments, and 01.0 is mostly a
 fixed genome scan. Files 30–60× smaller take minutes.
+
+### A sample given as a bigWig
+
+A sample can be `signal` (a bigWig) and `peaks` (a narrowPeak.gz) instead of `fragments`, when both were already made
+from the fragments the way 00.0 makes them: the bigWig holds Tn5 insertions per base, unstranded, at +4/−4, and the
+peaks come from the recipe above. Nothing after 00.0 reads the fragments, so prep needs only these two files.
+
+- **No shift and no `make_configs.py`.** `detect_shifts.py` and `make_configs.py` run only when the project has
+  fragments samples. `project.py signal-configs` writes this sample's config at the same path. It has the same keys
+  as `make_configs.py`'s except three changes: `signal_path` is the bigWig, `call_peaks: false`, and there are no
+  shift or pileup keys, which only 00.0 reads from fragments. `tests/test_pipeline_project.py` compares the two
+  configs key by key.
+- **00.0 only registers.** 00.0.call_peaks does nothing (`call_peaks: false`: the peaks are an input).
+  00.0.prepare_signal sees a bigWig (igvf's config parser infers `signal_type: bigwig` from the suffix). It links the
+  bigWig as `data_unstranded.bw` and writes its sidecar with the md5, with no conversion and no shift.
+- **00.1, 01.0 and 02.0 run as for any sample,** on the given peaks and bigWig.
+- **What nothing checks:** that the bigWig is insertions at +4/−4 and not coverage, and that the peaks used this
+  recipe. Write down where the files came from and how they were made in the project's `NOTES.md`.
 
 ## Train (`train`)
 

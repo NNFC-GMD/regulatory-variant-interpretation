@@ -7,11 +7,13 @@ here, once, from root, prefix and the sample stems:
 
   <root>/fragments/<stem>.fragments.tsv.gz       the inputs (fetch_igvf.py writes them; igvf_tf_chrombpnet's config
                                                  check accepts this suffix, not .bed.gz)
+  <signal> and <peaks> of project.yaml           or, for a sample given as a ready signal bigWig and its peaks, those
+                                                 two (fetch_igvf.py copies the peaks to <root>/peaks/<ds>/, below)
   <reference_root>/hg38/, motif/                 the genome, chrom sizes, blacklist and motif database, read by every
                                                  step (setup.sh --references downloads them)
   <root>/portal/                                 other portal files and manifest.tsv (fetch_igvf.py)
-  <root>/peaks/<ds>/<ds>.narrowPeak.gz           00.0.call_peaks           (prep)
-  <root>/chrombpnet/configs/<ds>/config.yaml     make_configs.py           (prep)
+  <root>/peaks/<ds>/<ds>.narrowPeak.gz           00.0.call_peaks           (prep; fetch for a given bigWig)
+  <root>/chrombpnet/configs/<ds>/config.yaml     make_configs.py           (prep; signal-configs for a given bigWig)
   <root>/chrombpnet/<ds>/preprocessing/          00.0 signal, 00.1 peaks, 01.0 fold negatives (prep)
   <root>/chrombpnet/<ds>/plots/signal_qc/        02.0                      (prep)
   <root>/cherimoya/<ds>/fold_<k>/                make_jobs.py, the fit, the attribution (train, attribute)
@@ -41,6 +43,13 @@ the runners it calls report per task, and some of them always exit 0.
                                                    the results, packed for someone without cluster access (share.py)
 
     project.py <project.yaml> sbatch-args          submit.sh's sbatch options from the slurm: block, one per line
+    project.py <project.yaml> signal-configs       write the igvf config of every sample given as a signal bigWig and
+                                                   its peaks, and print their paths (make_configs.py writes the
+                                                   others, from their fragments)
+
+A sample is either fragments (an IGVF accession or a path; prep detects the Tn5 shift, calls the peaks and counts the
+cuts, 00.0) or a ready signal bigWig and its peaks, made from fragments the way 00.0 does (signal and peaks): then 00.0
+only registers the bigWig, and prep starts at 00.1. Nothing after 00.0 reads the fragments.
 
 The steps after Cherimoya's own (00.0-02.0, 06.0-11.0) are igvf_tf_chrombpnet's, copied unchanged into
 vendor/igvf_tf_chrombpnet/ (VENDOR); their folds are the copy's folds/, and every reference file, the genome
@@ -83,6 +92,8 @@ BOX_STAGES = tuple(s for s in STAGES[1:] if s not in OPTIONAL_STAGES)
 NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 ACCESSION_RE = re.compile(r"^IGVFFI[0-9]{4}[A-Z]{4}$")
 FRAGMENTS_SUFFIX = ".fragments.tsv.gz"
+SIGNAL_SUFFIXES = (".bw", ".bigwig")  # what igvf's config parser takes for a bigWig (utils/config.py signal_type_for)
+PEAKS_SUFFIX = ".narrowPeak.gz"
 DEFAULT_FOLDS = ("0", "1", "2", "3", "4")
 SLOTS = {
     "train_per_gpu": 4,  # Cherimoya fits per H100: CPU/launch-bound, so several share a GPU
@@ -189,32 +200,45 @@ def load(path: Path) -> dict:
 
     samples, seen = [], set()
     for s in p["samples"]:
-        if not isinstance(s, dict) or "stem" not in s or "fragments" not in s:
-            raise ProjectError(f"{path}: each sample needs stem and fragments, got {s!r}")
+        if not isinstance(s, dict) or "stem" not in s:
+            raise ProjectError(f"{path}: each sample needs a stem, got {s!r}")
         stem = str(s["stem"])
         if not NAME_RE.match(stem) or stem in seen:
             raise ProjectError(f"{path}: sample stem {stem!r} is not unique or not {NAME_RE.pattern}")
         seen.add(stem)
-        frag = str(s["fragments"])
-        accession = frag if ACCESSION_RE.match(frag) else None
-        if accession is None and not Path(frag).is_absolute():
-            raise ProjectError(
-                f"{path}: sample {stem}: fragments is neither an IGVF file accession nor an absolute path"
-            )
+        unknown = sorted(set(s) - {"stem", "fragments", "md5", "index", "extra", "label", "signal", "peaks"})
+        if unknown:
+            raise ProjectError(f"{path}: sample {stem}: unknown keys {unknown}")
+        given = sorted(k for k in ("fragments", "signal", "peaks") if k in s)
+        if given not in (["fragments"], ["peaks", "signal"]):
+            raise ProjectError(f"{path}: sample {stem}: give fragments, or signal and peaks (a ready signal bigWig "
+                               f"and its narrowPeak), not {given or 'none of them'}")  # fmt: skip
         extra = [str(x) for x in s.get("extra") or []]
         for acc in ([s["index"]] if s.get("index") else []) + extra:
             if not ACCESSION_RE.match(str(acc)):
                 raise ProjectError(f"{path}: sample {stem}: {acc!r} is not an IGVF file accession")
-        samples.append({
-            "stem": stem,
-            "dataset": f"{p['prefix']}{stem}",
-            "fragments": frag,
-            "accession": accession,
-            "md5": s.get("md5"),
-            "index": s.get("index"),
-            "extra": extra,
-            "label": s.get("label", stem),
-        })  # fmt: skip
+        sample = {"stem": stem, "dataset": f"{p['prefix']}{stem}", "kind": "fragments", "fragments": None,
+                  "accession": None, "md5": s.get("md5"), "index": s.get("index"), "signal": None, "peaks": None,
+                  "extra": extra, "label": s.get("label", stem)}  # fmt: skip
+        if "fragments" in s:
+            frag = str(s["fragments"])
+            sample["fragments"] = frag
+            sample["accession"] = frag if ACCESSION_RE.match(frag) else None
+            if sample["accession"] is None and not Path(frag).is_absolute():
+                raise ProjectError(
+                    f"{path}: sample {stem}: fragments is neither an IGVF file accession nor an absolute path"
+                )
+        else:
+            if s.get("md5") or s.get("index"):
+                raise ProjectError(f"{path}: sample {stem}: md5 and index are the fragments' keys")
+            sig, peaks = str(s["signal"]), str(s["peaks"])
+            if not Path(sig).is_absolute() or not sig.lower().endswith(SIGNAL_SUFFIXES):
+                raise ProjectError(f"{path}: sample {stem}: signal must be the absolute path of a bigWig "
+                                   f"({' or '.join(SIGNAL_SUFFIXES)})")  # fmt: skip
+            if not Path(peaks).is_absolute() or not peaks.endswith(PEAKS_SUFFIX):
+                raise ProjectError(f"{path}: sample {stem}: peaks must be the absolute path of a {PEAKS_SUFFIX}")
+            sample.update(kind="signal", signal=sig, peaks=peaks)
+        samples.append(sample)
     p["samples"] = samples
     p["datasets"] = [s["dataset"] for s in samples]
     p["cooperativity"] = _cooperativity(path, p.get("cooperativity") or {}, samples)
@@ -450,7 +474,11 @@ def needed(p: dict, stage: str) -> list[Path]:
         raise ProjectError(f"unknown stage {stage}; stages are {list(STAGES)}")
     need: list = []
     if stage == "fetch":
-        need = [fragments_file(p, s) for s in p["samples"]]
+        for s in p["samples"]:
+            if s["kind"] == "fragments":
+                need.append(fragments_file(p, s))
+            else:  # the given bigWig, and its peaks where 00.1 reads them
+                need += [Path(s["signal"]), paths(p, s["dataset"])["narrowpeak"]]
     for ds in p["datasets"]:
         q = paths(p, ds)
         if stage == "prep":
@@ -515,6 +543,7 @@ def env_lines(p: dict, m: dict | None = None) -> list[str]:
         "PROJECT_PREFIX": p["prefix"],
         "PROJECT_DATASETS": " ".join(p["datasets"]),
         "PROJECT_N_DATASETS": str(len(p["datasets"])),
+        "PROJECT_N_FRAGMENTS": str(sum(s["kind"] == "fragments" for s in p["samples"])),
         "PROJECT_FOLDS": " ".join(p["folds"]),
         "PROJECT_STAGES": " ".join(p["stages"]),
         "PROJECT_GENOME": p["genome"],
@@ -564,6 +593,58 @@ def write_coop_inputs(p: dict) -> list[Path]:
     return written
 
 
+SIGNAL_CONFIG = """\
+# Generated by regulatory-variant-interpretation workflows/pipeline/project.py signal-configs -- edit that, not this
+# file. A dataset given as a ready signal bigWig and its peaks, not as fragments; every other key is what
+# workflows/dcai/make_configs.py writes for a fragments file.
+dataset_name: {name}
+assay: ATAC
+
+# Tn5 insertions per base, unstranded, already at chrombpnet's +4/-4: what 00.0.prepare_signal counts from fragments.
+# 00.0.prepare_signal registers it as the prepared bigwig (a link and its sidecar); no shift is detected or applied.
+signal_path: {signal}
+
+# The peaks are given (made from the fragments with 00.0.call_peaks' recipe): 00.0.call_peaks does nothing.
+call_peaks: false
+regions: {regions}
+# 00.1: one 1000-bp window per MACS summit row.
+peak_summit_window: 1000
+
+output_dir: {output_dir}
+peak_type: all
+folds: {folds}
+
+bias_factors: ["0.5", "0.6", "0.7", "0.8"]
+bias_suffixes_sweep: ["_05", "_06", "_07", "_08"]
+
+# Filled in by hand after 03.1 writes selected_bias_per_fold.tsv.
+fold_bias_suffix:
+{fold_bias_suffix}"""
+"""make_configs.py's template (vendored, at MANIFEST.tsv's commit) for a bigWig and given peaks: signal_path is the
+bigWig (igvf's config parser makes signal_type bigwig from its suffix), call_peaks is false, and the shift and
+pileup keys, which only 00.0 reads from fragments, are left out."""
+
+
+def write_signal_configs(p: dict) -> list[Path]:
+    """The igvf config of every sample given as signal and peaks, at the path make_configs.py would use."""
+    written = []
+    for s in p["samples"]:
+        if s["kind"] != "signal":
+            continue
+        d = paths(p, s["dataset"])
+        d["config"].parent.mkdir(parents=True, exist_ok=True)
+        d["config"].write_text(SIGNAL_CONFIG.format(
+            name=s["dataset"],
+            signal=json.dumps(s["signal"]),
+            regions=json.dumps(str(d["narrowpeak"])),
+            output_dir=json.dumps(str(d["output_dir"])),
+            folds=json.dumps(p["folds"]),
+            fold_bias_suffix="".join(f'  "{k}": ""\n' for k in p["folds"]),
+        ))  # fmt: skip
+        written.append(d["config"])
+    return written
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("project", type=Path, help="the project's project.yaml")
@@ -575,6 +656,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status")
     sub.add_parser("coop-inputs")
     sub.add_parser("sbatch-args")
+    sub.add_parser("signal-configs")
     pr = sub.add_parser("prune", help="dry run: the manifest of what would be deleted; --apply deletes it")
     pr.add_argument("--apply", type=Path, metavar="MANIFEST", help="a manifest a dry run wrote, read by a person")
     sh = sub.add_parser("share", help="pack the results into one tar")
@@ -588,7 +670,7 @@ def main(argv: list[str] | None = None) -> int:
     except (ProjectError, OSError, yaml.YAMLError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    if args.cmd in ("env", "coop-inputs", "sbatch-args") and not p["driver"]:
+    if args.cmd in ("env", "coop-inputs", "sbatch-args", "signal-configs") and not p["driver"]:
         print(f"ERROR: {p['file']} says driver: false: this project is not run by the driver (run_project.sh, "
               "submit.sh); its README says how it was made", file=sys.stderr)  # fmt: skip
         return DRIVER_REFUSED
@@ -644,6 +726,9 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     elif args.cmd == "sbatch-args":
         print("\n".join(sbatch_args(p)))
+    elif args.cmd == "signal-configs":
+        for f in write_signal_configs(p):
+            print(f)
     elif args.cmd == "check":
         missing = check(p, args.stage)
         for m in missing[:50]:

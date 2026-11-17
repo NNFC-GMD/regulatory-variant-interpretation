@@ -292,3 +292,111 @@ def test_main_links_a_local_bgzf_file_and_writes_the_manifest(tmp_path, monkeypa
     p = pj.load(path)
     assert pj.check(p, "fetch") == []
     json.dumps(pj.load(path))  # the project serialises (project.py show)
+
+
+# a sample given as a ready signal bigWig and its peaks
+
+
+def _vendored(name: str, rel: str):
+    """A module of the vendored igvf_tf_chrombpnet copy (stdlib-only ones), by path."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, pj.VENDOR / rel)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _signal_sample(tmp_path: Path, stem: str = "k") -> dict:
+    return {"stem": stem, "signal": str(tmp_path / "in" / f"{stem}.bw"),
+            "peaks": str(tmp_path / "in" / f"{stem}.narrowPeak.gz")}  # fmt: skip
+
+
+def test_a_sample_can_be_a_signal_bigwig_and_its_peaks(tmp_path):
+    frag = {"stem": "b", "fragments": str(tmp_path / "b.fragments.tsv.gz")}
+    p = pj.load(_yaml(tmp_path, samples=[frag, _signal_sample(tmp_path)], cooperativity={}))
+    b, k = p["samples"]
+    assert (b["kind"], k["kind"]) == ("fragments", "signal") and k["fragments"] is None and k["accession"] is None
+    assert p["datasets"] == ["tx_b", "tx_k"]
+    # fetch: the fragments of one, the bigWig and the peaks (where 00.1 reads them) of the other
+    narrowpeak = pj.paths(p, "tx_k")["narrowpeak"]
+    assert pj.check(p, "fetch") == [str(pj.fragments_file(p, b)), k["signal"], str(narrowpeak)]
+    env = dict(line.split("=", 1) for line in pj.env_lines(p, GEFION))
+    assert env["PROJECT_N_FRAGMENTS"] == "1" and env["PROJECT_N_DATASETS"] == "2"
+
+
+@pytest.mark.parametrize(
+    "sample, message",
+    [
+        ({"stem": "k", "fragments": "IGVFFI0000AAAA", "signal": "/x/k.bw", "peaks": "/x/k.narrowPeak.gz"},
+         "give fragments, or signal and peaks"),
+        ({"stem": "k", "signal": "/x/k.bw"}, "give fragments, or signal and peaks"),
+        ({"stem": "k"}, "none of them"),
+        ({"stem": "k", "signal": "x/k.bw", "peaks": "/x/k.narrowPeak.gz"}, "absolute path of a bigWig"),
+        ({"stem": "k", "signal": "/x/k.bedGraph", "peaks": "/x/k.narrowPeak.gz"}, "absolute path of a bigWig"),
+        ({"stem": "k", "signal": "/x/k.bw", "peaks": "/x/k.bed"}, "narrowPeak.gz"),
+        ({"stem": "k", "signal": "/x/k.bw", "peaks": "/x/k.narrowPeak.gz", "md5": "0" * 32}, "the fragments' keys"),
+        ({"stem": "k", "fragments": "IGVFFI0000AAAA", "fragment": "typo"}, "unknown keys"),
+    ],
+)  # fmt: skip
+def test_invalid_samples_are_refused(tmp_path, sample, message):
+    with pytest.raises(pj.ProjectError, match=message):
+        pj.load(_yaml(tmp_path, samples=[sample], cooperativity={}))
+
+
+def test_signal_configs_are_make_configs_with_the_bigwig_and_the_given_peaks(tmp_path):
+    (tmp_path / "frags").mkdir()
+    frag = _bgzf(tmp_path / "frags" / "b.fragments.tsv.gz")
+    path = _yaml(tmp_path, samples=[{"stem": "b", "fragments": str(frag)}, _signal_sample(tmp_path)], cooperativity={})
+    p = pj.load(path)
+    assert pj.write_signal_configs(p) == [pj.paths(p, "tx_k")["config"]]  # only the given bigWig's
+    shifts = tmp_path / "shifts.json"
+    shifts.write_text(json.dumps({"b": {"plus_shift": 4, "minus_shift": -5}}))
+    make_configs = _vendored("make_configs", "workflows/dcai/make_configs.py")
+    args = ["--fragments-dir", str(frag.parent), "--dataset-root", p["root"], "--shifts", str(shifts),
+            "--prefix", "tx_"]  # fmt: skip
+    assert make_configs.main(args) == 0
+    igvf_config = _vendored("igvf_config", "lib/python/utils/config.py")
+
+    def read(ds: str) -> dict:
+        text = pj.paths(p, ds)["config"].read_text()
+        builtin = igvf_config._parse_builtin(text)
+        assert builtin == yaml.safe_load(text)  # igvf's strict parser reads it as PyYAML does
+        return igvf_config.resolve(builtin)
+
+    b, k = read("tx_b"), read("tx_k")
+    fragments_only = {"plus_shift", "minus_shift", "bigwig_engine", "filter_main_chroms", "macs_input"}
+    own = {"dataset_name", "datasets", "bias_dataset", "signal_path", "signal_type", "signal_is_prepared_bigwig",
+           "call_peaks", "regions", "output_dir"}  # fmt: skip
+    assert set(k) == set(b) - fragments_only
+    assert {x: v for x, v in k.items() if x not in own} == {x: v for x, v in b.items() if x not in own | fragments_only}
+    assert k["signal_type"] == "bigwig" and k["signal_is_prepared_bigwig"] is True and k["call_peaks"] is False
+    assert k["signal_path"] == p["samples"][1]["signal"] and k["dataset_name"] == "tx_k"
+    q = pj.paths(p, "tx_k")
+    assert k["regions"] == str(q["narrowpeak"]) and k["output_dir"] == str(q["output_dir"])
+    assert b["regions"] == str(pj.paths(p, "tx_b")["narrowpeak"])  # the same layout as make_configs.py's
+    assert "call_peaks=false" in igvf_config.to_shell(k).splitlines()  # what 00.0.call_peaks reads: nothing to do
+    assert pj.main([str(path), "signal-configs"]) == 0
+
+
+def _bigwig_stub(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x26\xfc\x8f\x88" + b"\x00" * 60)  # a bigWig's magic number; fetch reads nothing further
+    return path
+
+
+def test_fetch_checks_a_given_bigwig_and_copies_its_peaks(tmp_path):
+    s = _signal_sample(tmp_path)
+    path = _yaml(tmp_path, samples=[s], cooperativity={})
+    _bigwig_stub(Path(s["signal"]))
+    Path(s["peaks"]).write_bytes(gzip.compress(b"chr1\t1\t100\tp\t0\t.\t1\t2\t3\t50\n"))
+    assert fi.main([str(path)]) == 0
+    p = pj.load(path)
+    dest = pj.paths(p, "tx_k")["narrowpeak"]
+    assert not dest.is_symlink() and dest.read_bytes() == Path(s["peaks"]).read_bytes()
+    assert pj.check(p, "fetch") == []
+    rows = [r.split("\t") for r in (tmp_path / "root" / "portal" / "manifest.tsv").read_text().splitlines()[1:]]
+    assert [r[2] for r in rows] == ["signal", "peaks"] and rows[0][3] == s["signal"] and rows[1][3] == str(dest)
+    assert fi.main([str(path)]) == 0  # a rerun keeps the copy
+    Path(s["signal"]).write_bytes(b"not a bigWig")
+    assert fi.main([str(path)]) == 1

@@ -9,7 +9,9 @@
 #                 machine; `pixi run check` and `pixi run -e cherimoya test-pipeline` pass
 #   prep          igvf_tf_chrombpnet (vendored): detect_shifts.py (the Tn5 shift in each file, pinned in the
 #                 configs), make_configs.py, then run_chain.sh per dataset, slots.prep_max at once:
-#                 00.0 call_peaks || 00.0 prepare_signal -> 00.1 -> 01.0 (fold negatives) -> 02.0 (QC)
+#                 00.0 call_peaks || 00.0 prepare_signal -> 00.1 -> 01.0 (fold negatives) -> 02.0 (QC).
+#                 A sample given as a signal bigWig and its peaks: no shift; project.py signal-configs writes its
+#                 config, and its 00.0 only registers the bigWig
 #   train         make_jobs.py, then train/run_box.sh: `cherimoya fit` for every dataset x fold
 #   attribute     make_downstream.py --engine cherimoya, then run_box.sh: `cherimoya attribute` on every peak
 #   downstream    downstream/downstream.sh: convert -> check -> 06.0 -> V2 -> 07.0 -> 08.0 (TF-MoDISco)
@@ -199,22 +201,29 @@ stage_preflight() {
 }
 
 stage_prep() {
-    if [[ ! -s "${PROJECT_SHIFTS}" ]]; then
+    : > "${box}/configs.txt"
+    # Samples given as fragments: the shift, then make_configs.py's configs. A sample given as a signal bigWig and its
+    # peaks has neither: project.py writes its config (signal-configs), and its 00.0 only registers the bigWig.
+    if (( PROJECT_N_FRAGMENTS > 0 )) && [[ ! -s "${PROJECT_SHIFTS}" ]]; then
         log "prep: the Tn5 shift of every fragments file (every ${PROJECT_SHIFT_EVERY}th fragment, genome-wide)"
         mkdir -p "$(dirname "${PROJECT_SHIFTS}")" 2> /dev/null
         (cd "${PROJECT_VENDOR}" && run igvf_run peaks python workflows/dcai/detect_shifts.py \
             --fragments-dir "${PROJECT_FRAGMENTS_DIR}" --genome "${PROJECT_GENOME}" \
-            --out "${PROJECT_SHIFTS}.partial" --jobs "${PROJECT_N_DATASETS}" --every "${PROJECT_SHIFT_EVERY}" \
+            --out "${PROJECT_SHIFTS}.partial" --jobs "${PROJECT_N_FRAGMENTS}" --every "${PROJECT_SHIFT_EVERY}" \
             --tmp-dir "${scratch}" \
             --chrombpnet-python "${chrombpnet_python}") \
             > "${logs}/detect_shifts.log" 2>&1 \
             || { log "ERROR: the shift is not trustworthy or detection failed: ${logs}/detect_shifts.log"; return 1; }
         (( dry )) || mv "${PROJECT_SHIFTS}.partial" "${PROJECT_SHIFTS}"
     fi
-    run igvf_run preprocess python "${PROJECT_VENDOR}/workflows/dcai/make_configs.py" \
-        --fragments-dir "${PROJECT_FRAGMENTS_DIR}" --dataset-root "${PROJECT_ROOT}" --shifts "${PROJECT_SHIFTS}" \
-        --prefix "${PROJECT_PREFIX}" > "${box}/configs.txt" 2> "${logs}/make_configs.log" \
-        || { log "ERROR: make_configs.py: ${logs}/make_configs.log"; return 1; }
+    if (( PROJECT_N_FRAGMENTS > 0 )); then
+        run igvf_run preprocess python "${PROJECT_VENDOR}/workflows/dcai/make_configs.py" \
+            --fragments-dir "${PROJECT_FRAGMENTS_DIR}" --dataset-root "${PROJECT_ROOT}" --shifts "${PROJECT_SHIFTS}" \
+            --prefix "${PROJECT_PREFIX}" >> "${box}/configs.txt" 2> "${logs}/make_configs.log" \
+            || { log "ERROR: make_configs.py: ${logs}/make_configs.log"; return 1; }
+    fi
+    run rvi_run default python "${here}/project.py" "${project_file}" signal-configs >> "${box}/configs.txt" \
+        2> "${logs}/signal_configs.log" || { log "ERROR: project.py signal-configs: ${logs}/signal_configs.log"; return 1; }
     (( dry )) && { run xargs -P "${SLOT_PREP_MAX}" -I{} bash "${PROJECT_VENDOR}/workflows/dcai/run_chain.sh" {}; return 0; }
     log "prep: $(wc -l < "${box}/configs.txt") chains, ${SLOT_PREP_MAX} at once (00.0 call_peaks || prepare_signal ->" \
         "00.1 -> 01.0 -> 02.0)"

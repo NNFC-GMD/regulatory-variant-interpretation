@@ -7,15 +7,20 @@ any machine; this page is what is particular to Gefion.
 
 ```yaml
 reference_root: /dcai/projects/iu_0109/annotations   # setup.sh --references filled it (2026-10-05)
-slurm: {partition: defq, account: iu_0109, gpus: 8, cpus: 216, time: "2-00:00:00"}
+slurm: {partition: defq, account: iu_0109, gpus: 8, cpus: 208, time: "2-00:00:00"}
 ```
 
 Leave `slots:` out: on a whole node they come out as the values in `project.example.yaml`.
 
 ## A job is a whole node
 
-- **Every Slurm job rents a whole dgx node.** That is 216 usable CPUs, about 2 TB of RAM and 8× H100 80 GB, billed
+- **Every Slurm job rents a whole dgx node.** That is 208 usable CPUs, about 2 TB of RAM and 8× H100 80 GB, billed
   per node-hour (about $24). Partition `defq`; the account `iu_0109` is required (the `slurm:` block above).
+  - Each node has 224 CPUs.
+  - Since November 2026, 16 are kept for the system (`scontrol show node`: `CoreSpecCount=8`, `CPUSpecList=104-111,216-223`).
+  - Before that, 216 were usable. A request for more than 208 is refused: "Requested node configuration is not
+    available".
+  - The slots resolve to the same values on 208 as on 216 (`project.py`, `resolve_slots`).
 - **So work is packed into one box.** Never submit many small jobs. The driver (`workflows/pipeline/run_project.sh`)
   runs a project's stages inside one allocation, many tasks at once.
 - **One box at a time.** Don't submit a second box, not even a held or chained one, while one is running or

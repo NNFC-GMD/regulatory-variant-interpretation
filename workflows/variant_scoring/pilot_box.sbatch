@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=216
+#SBATCH --cpus-per-task=208
 #SBATCH --mem=0
 #SBATCH --time=12:00:00
 #SBATCH --output=variant_pilot_%j.log

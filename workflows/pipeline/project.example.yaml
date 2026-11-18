@@ -12,6 +12,7 @@ compendium: ex3                    # the tag of the project's motif compendium (
 samples:
   # fragments: an IGVF file accession (fetch_igvf.py downloads and md5-checks it), or the absolute path of a BGZF
   #   fragments file named <stem>.fragments.tsv.gz. All fragments are used: a pseudobulk's file is already its cells.
+  #   pseudobulk.py makes such files from single-cell fragments and a table of labelled cells, and prints this block.
   # md5: optional; checked against the file (and against the portal's, for an accession)
   # index: optional accession of the fragments' .tbi; extra: optional accessions kept in <root>/portal/ for the record
   # label: optional, for reports
@@ -57,7 +58,7 @@ folds: ["0", "1", "2", "3", "4"]
 # sbatch option; a key left out is the cluster's default. gpus is --gres=gpu:<n>: give it wherever Slurm hands out
 # GPUs (Gefion does), or the box sees none and its preflight stops. cpus is --cpus-per-task, extra any other options
 # (a string or a list). On Gefion (docs/cluster.md):
-#   slurm: {partition: defq, account: iu_0109, gpus: 8, cpus: 216, time: "2-00:00:00"}
+#   slurm: {partition: defq, account: iu_0109, gpus: 8, cpus: 208, time: "2-00:00:00"}
 slurm:
   partition: gpu
   gpus: 8
@@ -65,7 +66,7 @@ slurm:
 
 # Box settings. Every slot is optional, and best left out: one left out is the value below scaled down to the
 # machine the box runs on (its GPUs, CPUs and memory; project.py resolve_slots, logged by the preflight). The values
-# below are what a whole Gefion node (8 H100, 216 CPUs, ~2 TB) gets; docs/pipeline.md says where each comes from. A
+# below are what a whole Gefion node (8 H100, 208 CPUs, ~2 TB) gets; docs/pipeline.md says where each comes from. A
 # value given here is used as it is, on any machine.
 # slots:
 #   train_per_gpu: 4        # Cherimoya fits per GPU (training is CPU/launch-bound)

@@ -3,7 +3,7 @@
 # Purpose: keep the GPUs of one node busy training and scoring Cherimoya models,
 #   one (dataset, fold) task at a time per slot, from tasks.tsv (make_jobs.py).
 #
-# DCAI rents whole nodes (216 cores, ~2 TB RAM, 8x H100) by node-time, so the
+# DCAI rents whole nodes (208 cores, ~2 TB RAM, 8x H100) by node-time, so the
 # tasks run inside one allocation: CHERI_SLOTS_PER_GPU workers per GPU, each
 # pinned to its GPU (CUDA_VISIBLE_DEVICES) and to its own block of
 # CHERI_CORES_PER_SLOT cores (taskset), take the next task from a queue

@@ -13,6 +13,7 @@ that are, and the documentation. A clone of it alone runs a project from fragmen
 - `docs/results.md`: what a finished project's files hold and how to read them; prune and share.
 - `docs/cluster.md`: the rules of the Gefion (DCAI) cluster.
 - `workflows/pipeline/`: the driver: `project.py` (the layout and the stage checks), `setup.sh`, `fetch_igvf.py`,
+  `pseudobulk.py` (single-cell fragments into one sample per cell group),
   `submit.sh`, `run_project.sh`, `status.py`, `project.example.yaml`; and for finished projects `prune.py` (what may
   be deleted, by rule, from a reviewed manifest) and `share.py` (the results in one tar).
 

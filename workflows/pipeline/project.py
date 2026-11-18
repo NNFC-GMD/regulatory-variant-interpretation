@@ -107,7 +107,7 @@ SLOTS = {
     "coop_cores": 16,
     "prep_max": 0,  # prep chains at once; 0 = every dataset
 }
-"""The most each slot gets: what a whole Gefion node (8 H100, 216 CPUs, ~2 TB) runs. resolve_slots() scales them
+"""The most each slot gets: what a whole Gefion node (8 H100, 208 CPUs, ~2 TB) runs. resolve_slots() scales them
 down to a smaller machine; a value project.yaml gives is used as it is."""
 MODISCO_GB = 60  # an 08.0's peak memory, with room (docs/pipeline.md: ~55 GB)
 PREP_GB = 64  # a prep chain's peak memory, with room (~63 GB)
@@ -364,7 +364,7 @@ def machine() -> dict:
 
 def resolve_slots(given: dict, m: dict, n_datasets: int) -> dict[str, int]:
     """The slots for machine m: SLOTS' values, each scaled down so the stages fit the machine's CPUs and memory; a
-    value project.yaml gives is kept as it is. On a whole Gefion node (8 GPUs, 216 CPUs, ~2 TB) this is SLOTS itself."""
+    value project.yaml gives is kept as it is. On a whole Gefion node (8 GPUs, 208 CPUs, ~2 TB) this is SLOTS itself."""
     c, g, mem = max(1, m["cpus"]), max(1, len(m["gpus"])), m["mem_gb"]
     s = dict(given)
 

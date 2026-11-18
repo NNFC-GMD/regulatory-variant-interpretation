@@ -103,7 +103,7 @@ def test_env_lines_are_shell_assignments(tmp_path):
     assert env["SLOT_FINEMO_SLOTS"] == "5" and env["PROJECT_N_DATASETS"] == "2"
     assert env["PROJECT_GPUS"] == "0,1,2,3,4,5,6,7" and env["PROJECT_CPUS"] == "216"
     assert shlex.split(env["PROJECT_REFERENCE_ROOT"]) == [str(tmp_path / "refs")]
-    refs = shlex.split(env["PROJECT_REFERENCE_FILES"])
+    refs = shlex.split(env["PROJECT_REFERENCE_FILES"])[0].split()  # one word in the shell, split by run_project.sh
     assert len(refs) == len(pj.REFERENCE_FILES) + 1 and refs[-1] == p["genome"] + ".fai"
     assert shlex.split(env["PROJECT_VENDOR"]) == [str(pj.VENDOR)]
 

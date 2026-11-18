@@ -91,3 +91,32 @@ def test_fold_split_overlap_is_refused(tmp_path):
     (tmp_path / "fold_0.json").write_text(json.dumps({**SPLIT, "valid": ["chr2"]}))
     with pytest.raises(ValueError, match="chr2"):
         mj.read_fold(tmp_path, "0")
+
+
+def test_tasks_list_the_datasets_with_the_most_peaks_first(tmp_path):
+    """The longest tasks start first, so the shortest are left for the end; a dataset's folds stay in order."""
+    configs = []
+    for ds, n in (("alpha", 2), ("beta", 5)):
+        out = tmp_path / "results" / ds
+        pre = out / "preprocessing"
+        (pre / "signal").mkdir(parents=True)
+        (pre / "signal" / "data_unstranded.bw").touch()
+        (pre / "peaks").mkdir()
+        (pre / "peaks" / f"{ds}_all_peaks_no_blacklist.narrowPeak").write_text("chr1\t0\t10\n" * n)
+        (pre / ds).mkdir()
+        for f in "01":
+            (pre / ds / f"output_all_fold_{f}_negatives.bed").touch()
+        cfg = tmp_path / "configs" / ds / "config.yaml"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(f'dataset_name: {ds}\noutput_dir: "{out}"\npeak_type: all\nfolds: ["0", "1"]\n')
+        configs.append(str(cfg))
+    folds = tmp_path / "folds"
+    folds.mkdir()
+    for f in "01":
+        (folds / f"fold_{f}.json").write_text(json.dumps(SPLIT))
+    (tmp_path / "genome.fa").touch()
+    assert mj.main(["--chrombpnet-configs", *configs, "--folds-dir", str(folds), "--genome",
+                    str(tmp_path / "genome.fa"), "--out-root", str(tmp_path / "cheri")]) == 0  # fmt: skip
+    rows = [r.split("\t")[:2] for r in (tmp_path / "cheri" / "tasks.tsv").read_text().splitlines()[1:]]
+    assert rows == [["beta", "0"], ["beta", "1"], ["alpha", "0"], ["alpha", "1"]]
+    assert mj.count_lines(tmp_path / "absent.narrowPeak") == 0

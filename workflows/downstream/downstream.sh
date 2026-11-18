@@ -39,8 +39,10 @@
 #   provenance no longer matches the attribution files): move its downstream
 #   outputs and .done/ aside to redo it.
 # 08.0's report: when 08.0 exits non-zero but its results h5 opens and has
-#   pos_patterns (report-simple failed after modisco motifs wrote it), the run
-#   is recorded as report_failed and marked done.
+#   pos_patterns (report-simple failed after modisco motifs wrote it), the
+#   report is made once more, on a copy of 08.0's MEME database with a blank
+#   line appended (retry_report: memelite 0.4.0 drops a database's last motif).
+#   If that fails too, the run is recorded as report_failed and marked done.
 #
 # Locks (node-local, in /dev/shm/$USER/box.<job>/cheri_downstream/): one per
 #   dataset, taken here and inherited by its 07.0 and 08.0, so two runs of this
@@ -478,8 +480,34 @@ do_07() {
     log "${ds}: 07.0 done (${step_seconds} s)"
 }
 
+# retry_report -- 08.0's report-simple again, on a copy of the MEME database 08.0 used (its metadata's motif_db)
+# with a blank line appended. memelite 0.4.0, in igvf_tf_chrombpnet's modisco env, stores a motif only when it reads
+# the line after the motif's matrix, so a database that ends right after its last motif loses that motif from the
+# report's logos while MEME's tomtom still matches it, and report-simple stops on a KeyError. Fixed in memelite
+# 0.5.0. The motifs are the same, so the report is the one a working parser gives. Returns 0 if motifs.html is made.
+retry_report() {
+    local db padded rc note=failed
+    db="$(grep -h -o 'motif_db=[^"]*' "${out}"/metadata/*_08.0.run_modisco_*.json 2> /dev/null | tail -n 1)"
+    db="${db#motif_db=}"
+    if [[ ! -s "${db}" ]]; then
+        log "${ds}: 08.0's report failed, and no motif_db in ${out}/metadata to make it again with"
+        return 1
+    fi
+    padded="${scratch}/$(basename "${db}").${BASHPID}.trailing_blank"
+    { cat "${db}"; echo; } > "${padded}" || return 1
+    log "${ds}: 08.0's report failed; report-simple again on ${db} with a blank line appended"
+    run_step 08.0_report 4 "${logs}/08.0.log" env NUMBA_CACHE_DIR="${logs}/numba_cache" \
+        pixi run --frozen --manifest-path "${REPO_ROOT}/pixi.toml" -e modisco \
+        modisco report-simple -i "${mod_h5}" -o "${report_dir}/" -m "${padded}"
+    rc=$?
+    rm -f "${padded}"
+    (( rc == 0 )) && [[ -s "${report_dir}/motifs.html" ]] && note="made on ${db} with a blank line appended"
+    record 08.0_report "${rc}" "${note}"
+    [[ "${note}" != failed ]]
+}
+
 do_08() {
-    local rc summary note
+    local rc summary note seconds rss started
     acquire_08_slot "$1"
     while pgrep -f -- "modisco motifs -i ${avg_h5}" > /dev/null; do
         log "${ds}: a modisco motifs on ${avg_h5} is running outside this run; 08.0 waits for it"
@@ -501,7 +529,15 @@ do_08() {
     summary="$(modisco_summary "${mod_h5}")"
     if [[ -f "${mod_h5}" && -n "${summary}" ]]; then
         note="${summary}"
-        (( rc == 0 )) || note="report_failed: ${summary}"
+        if (( rc != 0 )); then
+            seconds="${step_seconds}" rss="${step_rss}" started="${step_started}"
+            if [[ ! -s "${report_dir}/motifs.html" ]] && retry_report; then
+                note="${summary}; report made again"
+            else
+                note="report_failed: ${summary}"
+            fi
+            step_seconds="${seconds}" step_rss="${rss}" step_started="${started}"  # the 08.0 row is 08.0's own
+        fi
         record 08.0 "${rc}" "${note}"
         mark 08.0 "${note}"
         log "${ds}: 08.0 done, exit ${rc} (${step_seconds} s): ${note}"

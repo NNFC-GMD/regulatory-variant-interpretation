@@ -73,7 +73,7 @@ slurm:
 #   train_cores: 6
 #   attribute_per_gpu: 4    # `cherimoya attribute` processes per GPU (at most ~12 GB each)
 #   attribute_cores: 4
-#   modisco_max: 5          # TF-MoDISco (08.0) runs at once (~55 GB each)
+#   modisco_max: 12         # TF-MoDISco (08.0) runs at once (~55 GB, ~5-10 busy cores each)
 #   modisco_threads: 24
 #   finemo_slots: 5         # Fi-NeMo (10.0) runs at once, one GPU each
 #   finemo_batch: 200       # below 200 for a compendium of more than ~450 patterns (10.0's header)

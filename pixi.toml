@@ -63,7 +63,7 @@ deepisa = { git = "https://github.com/anderssonlab/deepISA", rev = "179091c3c272
 test-cherimoya = "pytest -q tests --ignore-glob='tests/test_dls_*.py'"
 # The tests of what workflows/pipeline/run_project.sh runs; its preflight requires them (and runs test-cherimoya
 # beside, reported in STATUS.md).
-test-pipeline = "pytest -q tests/test_pipeline_project.py tests/test_cooperativity.py tests/test_coop_matrix.py tests/test_run_task_attribute.py tests/test_make_downstream.py tests/test_make_jobs.py tests/test_attr_status.py tests/test_to_chrombpnet_scores.py tests/test_check_dataset.py tests/test_downstream.py tests/test_prune.py tests/test_vendor.py tests/test_pseudobulk.py tests/test_run_box.py"
+test-pipeline = "pytest -q tests/test_pipeline_project.py tests/test_cooperativity.py tests/test_coop_matrix.py tests/test_run_task_attribute.py tests/test_make_downstream.py tests/test_make_jobs.py tests/test_attr_status.py tests/test_to_chrombpnet_scores.py tests/test_check_dataset.py tests/test_downstream.py tests/test_prune.py tests/test_vendor.py tests/test_pseudobulk.py tests/test_run_box.py tests/test_tf_expression.py"
 
 # chrombpnet (NNFC-GMD/chrombpnet, branch stable-modern-gpu-support), at the commit igvf_tf_chrombpnet's steps run
 # with (CHROMBPNET_REV in vendor/igvf_tf_chrombpnet/lib/bash/common.sh). Installed as a package from git, so no

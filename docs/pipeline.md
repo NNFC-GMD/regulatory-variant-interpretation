@@ -515,8 +515,12 @@ fold k's models in both groups shows whether the folds agree: `robust` = signifi
 The bootstrap resamples peaks only, so it misses the noise of training a different model per dataset; the fold check
 covers part of it.
 
+**Expressed TFs** (`tf_expression.py`, not a stage): with the cells' RNA counts, each TF family's expression per
+group goes beside the tables. A change in cooperativity can follow from a TF being expressed in one cell state only.
+See `workflows/cooperativity/README.md`, section 11.
+
 `workflows/cooperativity/README.md` has the definitions and how they differ (section 4), how the pipeline runs it
-(section 8), and the coop_matrix stage (section 9).
+(section 8), the coop_matrix stage (section 9) and the expressed-TF annotation (section 11).
 
 ## Same sites under every model (`coop_matrix`, optional)
 

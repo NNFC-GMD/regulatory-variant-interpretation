@@ -1,9 +1,9 @@
 #!/bin/bash
 # setup.sh
 # Purpose: what a machine needs to run this repository's pipeline, from this checkout alone (docs/install.md):
-#   - the pixi environments, each from its lock file: this repository's default, cherimoya and chrombpnet, and the
-#     vendored igvf_tf_chrombpnet's peaks, preprocess, modisco, motif-compendium and finemo
-#     (vendor/igvf_tf_chrombpnet/pixi.toml and pixi.lock, the ones its steps were run with);
+#   - the pixi environments, each from its lock file: this repository's default, cherimoya and chrombpnet
+#     (pixi.toml), and the environments of the steps copied from igvf_tf_chrombpnet: peaks, preprocess, modisco,
+#     motif-compendium and finemo (envs/pixi.toml and envs/pixi.lock, this repository's; workflows/pipeline/envs.sh);
 #   - with --references, the reference files every step reads (project.yaml's reference_root): the IGVF GRCh38
 #     genome and its .fai, the chrom sizes, the ENCODE blacklist, the MotifCompendium database and the GENCODE TSSs,
 #     downloaded and md5-checked by the vendored steps' own `src/cli.py download-references`; and MotifCompendium's
@@ -12,7 +12,7 @@
 # Input:  --references <dir>   where the references go (an absolute path; created if missing)
 #         --with-engine        also cherimoya-030 (only for the frozen attribution engine, workflows/attribution/)
 #         --dry-run            print the commands and what is missing, change nothing
-# Output: .pixi/envs/<env>/ here and in vendor/igvf_tf_chrombpnet/; <dir>/hg38/, <dir>/motif/, <dir>/metadata/
+# Output: .pixi/envs/<env>/ and envs/.pixi/envs/<env>/ here; <dir>/hg38/, <dir>/motif/, <dir>/metadata/
 # Usage:  bash workflows/pipeline/setup.sh --references /data/mimir/references
 # Needs:  pixi (https://pixi.sh; `curl -fsSL https://pixi.sh/install.sh | bash` puts it in ~/.pixi/bin) and the
 #   network: conda-forge, bioconda, PyPI and GitHub for the environments (about 20 GB), the IGVF portal, ENCODE and
@@ -53,17 +53,19 @@ run() {
 
 rvi_envs=(default cherimoya chrombpnet)
 (( engine )) && rvi_envs+=(cherimoya-030)
-igvf_envs=(peaks preprocess modisco motif-compendium finemo)
+# shellcheck source=workflows/pipeline/envs.sh
+source "$(dirname "${BASH_SOURCE[0]}")/envs.sh"
+step_manifest="${RVI_ENVS_MANIFEST}"
 
 for e in "${rvi_envs[@]}"; do
     run pixi install --locked --manifest-path "${repo_root}/pixi.toml" -e "${e}"
 done
-for e in "${igvf_envs[@]}"; do
-    run pixi install --locked --manifest-path "${vendor}/pixi.toml" -e "${e}"
+for e in "${STEP_ENVS[@]}"; do
+    run pixi install --locked --manifest-path "${step_manifest}" -e "${e}"
 done
 if [[ -n "${refs}" ]]; then
     (( dry )) || mkdir -p "${refs}"
-    run pixi run --frozen --manifest-path "${vendor}/pixi.toml" -e preprocess \
+    run pixi run --frozen --manifest-path "${step_manifest}" -e preprocess \
         python "${vendor}/src/cli.py" download-references --reference-root "${refs}"
     # MotifCompendium's metadata (each motif's TFs), for workflows/cooperativity/tf_expression.py's TF families
     run pixi run --frozen --manifest-path "${repo_root}/pixi.toml" -e default \
@@ -75,8 +77,8 @@ missing=0
 for e in "${rvi_envs[@]}"; do
     [[ -d "${repo_root}/.pixi/envs/${e}" ]] || { echo "missing: env ${e} (${repo_root})"; missing=1; }
 done
-for e in "${igvf_envs[@]}"; do
-    [[ -d "${vendor}/.pixi/envs/${e}" ]] || { echo "missing: env ${e} (${vendor})"; missing=1; }
+for e in "${STEP_ENVS[@]}"; do
+    [[ -d "$(dirname "${step_manifest}")/.pixi/envs/${e}" ]] || { echo "missing: env ${e} (${step_manifest})"; missing=1; }
 done
 if [[ -n "${refs}" ]]; then
     python="${repo_root}/.pixi/envs/default/bin/python"

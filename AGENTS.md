@@ -28,13 +28,15 @@ that are, and the documentation. A clone of it alone runs a project from fragmen
 | `workflows/comparison/` | ChromBPNet against Cherimoya, level by level, and the report |
 | `workflows/variant_scoring/`, `workflows/nulls/`, `workflows/qtl/` | variant effects, their nulls, and the QTL checks |
 | `workflows/cooperativity/` | DeepISA with Cherimoya, ours and the official rules |
-| `vendor/igvf_tf_chrombpnet/` | igvf_tf_chrombpnet's 00.0–02.0 and 06.0–11.0, copied unchanged from one commit, with their `pixi.toml`/`pixi.lock` and folds (`VENDORED.md`, `MANIFEST.tsv`) |
+| `vendor/igvf_tf_chrombpnet/` | igvf_tf_chrombpnet's 00.0–02.0 and 06.0–11.0, copied unchanged from one commit, with their folds (`VENDORED.md`, `MANIFEST.tsv`) |
+| `envs/` | the environments of the copied steps (`pixi.toml`/`pixi.lock`), this repository's: they started as igvf_tf_chrombpnet's own, and the header lists every change since; `workflows/pipeline/envs.sh` points the steps at them |
 | `docs/` | the documentation above |
 | `tests/` | the test suite (no data needed; some tests need torch, pandas or a GPU) |
 
 The preprocessing (00.0–02.0) and the motif steps (06.0–11.0) are igvf_tf_chrombpnet's, run unchanged from the copy
-in `vendor/igvf_tf_chrombpnet/`, at the commit its `MANIFEST.tsv` names. chrombpnet, which some of them run in, is
-the pixi env `chrombpnet`.
+in `vendor/igvf_tf_chrombpnet/`, at the commit its `MANIFEST.tsv` names. Their software environments are this
+repository's, `envs/pixi.toml` (they started as the copy's own; its header lists every change since), and chrombpnet,
+which some of them run in, is the pixi env `chrombpnet`.
 
 ## Checking your work
 
@@ -54,9 +56,12 @@ the pixi env `chrombpnet`.
   the record of the AMSC DeepISA run.
 - **Never edit `workflows/attribution/attribute_fast.py`, `cheri_dls.py` or `dls_refs.py`**, not even a comment.
   An engine pin hashes them, and a changed byte makes every attribution it covers refuse to run.
-- **Never edit `vendor/igvf_tf_chrombpnet/`.** Its `MANIFEST.tsv` hashes every file, and the preflight refuses a
-  change. A fix goes to igvf_tf_chrombpnet's `chrombpnet2`; then refresh the copy with `workflows/pipeline/vendor_igvf.sh`
-  and run the verification in docs/pipeline.md, "Changing a pinned version".
+- **Never edit the copied files in `vendor/igvf_tf_chrombpnet/`** (`VENDORED.md` there is ours). Its
+  `MANIFEST.tsv` hashes every copied file, and the preflight refuses a change.
+  - A fix to the steps' code goes to igvf_tf_chrombpnet's `chrombpnet2`; then refresh the copy with
+    `workflows/pipeline/vendor_igvf.sh` and run the verification in docs/pipeline.md, "Changing a pinned version".
+  - A version the steps run with is ours to change, in `envs/pixi.toml`, with a line in its header. Then run the
+    same verification.
 - **Nothing machine-specific in code.** Paths to references, checkouts or clusters come from `project.yaml`
   (`reference_root`, `slurm:`) or the command line; Gefion's values live in `docs/cluster.md`.
 - **Results never go in the repository.** Data, configs and outputs live under project roots; scripts take paths

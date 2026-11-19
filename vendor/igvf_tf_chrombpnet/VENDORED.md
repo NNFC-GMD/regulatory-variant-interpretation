@@ -8,9 +8,10 @@ this repository runs from fragments to DeepISA on its own: no igvf_tf_chrombpnet
 - **The commit** is in `MANIFEST.tsv`, with the sha256 of every file. The driver's preflight
   (`workflows/pipeline/run_project.sh`), `submit.sh` and `tests/test_vendor.py` refuse a file that differs from
   its row.
-- **The environments** are the copy's own `pixi.toml` and `pixi.lock`, the ones its steps were run with:
-  `bash workflows/pipeline/setup.sh` installs `peaks`, `preprocess`, `modisco`, `motif-compendium` and `finemo` from
-  them. chrombpnet, which 01.0, 06.0, 07.0 and `detect_shifts.py` run in, is this repository's `chrombpnet`
+- **The environments** are this repository's `envs/pixi.toml` and `envs/pixi.lock`, which started as the copy's own,
+  byte for byte. `bash workflows/pipeline/setup.sh` installs `peaks`, `preprocess`, `modisco`, `motif-compendium`
+  and `finemo` from them, and `workflows/pipeline/envs.sh` points the copied steps at them (`*_ENV`). The copy's
+  `pixi.toml` and `pixi.lock` are kept here for reference only. chrombpnet, which 01.0, 06.0, 07.0 and `detect_shifts.py` run in, is this repository's `chrombpnet`
   environment: NNFC-GMD/chrombpnet installed from git at the commit `lib/bash/common.sh` names (`CHROMBPNET_REV`),
   with the versions that shape those steps' outputs pinned to that commit's own lock.
 - **The references** come from `project.yaml`'s `reference_root`, which the driver exports as `REFERENCE_ROOT`. The
@@ -44,7 +45,8 @@ the ones the driver cannot reach:
 - the default `config/` and `results/` paths, which the driver always overrides;
 - an error message's `status.sh`.
 
-The environment `qc` of the copy's `pixi.toml` is not installed: nothing here uses it. `download-references` runs
+The environments `default` and `qc` of `envs/pixi.toml` (igvf_tf_chrombpnet's lint and test environments) are not
+installed: nothing here uses them. `download-references` runs
 in `preprocess`.
 
 ## Never edit these files here

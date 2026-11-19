@@ -58,8 +58,8 @@ then runs a project on it. On Gefion, `docs/cluster.md` has the local values; ev
    ```
    - It installs eight environments:
      - this repository's `default`, `cherimoya` and `chrombpnet`;
-     - from the copied steps' `vendor/igvf_tf_chrombpnet/pixi.toml`: `peaks`, `preprocess`, `modisco`,
-       `motif-compendium` and `finemo`.
+     - the copied steps' environments, also this repository's, from `envs/pixi.toml`: `peaks`, `preprocess`,
+       `modisco`, `motif-compendium` and `finemo`.
    - It then runs the copied steps' `download-references` into the directory: the IGVF GRCh38 genome
      (IGVFFI0653VCGH) and its `.fai`, the chrom sizes, the ENCODE blacklist (ENCFF356LFX), the MotifCompendium 1.0.19
      database and the GENCODE v43 TSSs. Then `tf_expression.py fetch-metadata` adds MotifCompendium's metadata

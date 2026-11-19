@@ -58,6 +58,9 @@ usage="usage: qc_modisco_folds.sh [<list.txt> ...]"
 : "${CHERI_ROOT:?set CHERI_ROOT to the make_jobs.py --out-root}"
 : "${BOX_DIR:?set BOX_DIR to the box directory}"
 : "${REPO_ROOT:?set REPO_ROOT to the igvf_tf_chrombpnet checkout whose src/motif_qc.py runs}"
+# the steps' software environments: this repository's (envs/pixi.toml), not the checkout's own pixi.toml
+# shellcheck source=workflows/pipeline/envs.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../pipeline" && pwd)/envs.sh"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 here="${repo_root}/workflows/downstream"
 attribution="${repo_root}/workflows/attribution"

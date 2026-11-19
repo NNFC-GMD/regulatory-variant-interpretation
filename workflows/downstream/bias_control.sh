@@ -53,6 +53,9 @@ usage="usage: bias_control.sh <chrombpnet config.yaml> <fold> <out_dir>"
 (( $# == 3 )) || { echo "${usage}" >&2; exit 2; }
 : "${BOX_DIR:?set BOX_DIR to the box directory}"
 : "${REPO_ROOT:?set REPO_ROOT to the igvf_tf_chrombpnet checkout whose config.sh and src/motif_qc.py run}"
+# the steps' software environments: this repository's (envs/pixi.toml), not the checkout's own pixi.toml
+# shellcheck source=workflows/pipeline/envs.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../pipeline" && pwd)/envs.sh"
 abspath() { if [[ "$1" == /* ]]; then printf '%s\n' "$1"; else printf '%s\n' "${PWD}/$1"; fi; }
 config="$(abspath "$1")"
 fold="$2"

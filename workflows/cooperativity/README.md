@@ -508,3 +508,50 @@ It checks `combine.py --official` four ways per dataset:
 - the group scores of the changes are sum(i) / sum(|i|) over each group's qualified pairs.
 
 It prints one line per check and dataset and exits 1 if any fails. CPU only, about a minute for 5 datasets.
+
+## 11. Expressed TFs (`tf_expression.py`)
+
+A change in a TF's cooperativity between two cell states can follow from the TF being expressed in one state and not
+the other, rather than from a change in how it works with its partners. `tf_expression.py` puts each TF's expression
+beside the cooperativity tables, so the two can be read apart. It needs the cells' RNA counts, an AnnData h5ad, and
+the table that gave the cells their groups.
+
+```
+rvi_run cherimoya python workflows/cooperativity/tf_expression.py expression --h5ad <counts.h5ad> \
+    --cells <cells.csv> --group-column <col> --out <coop>/expression/genes
+rvi_run cherimoya python workflows/cooperativity/tf_expression.py annotate --expression <coop>/expression/genes \
+    --motif-metadata <reference_root>/motif/MotifCompendium-1.0.19-Database-Human.metadata.tsv \
+    --coop <coop> --prefix <project prefix>
+```
+
+- **Expression per group:** the h5ad's raw counts, read in chunks, are summed over each group's cells. A group is
+  named by its stem, as `pseudobulk.py` names a sample, so it is that sample's cooperativity group. The output is
+  `genes_by_group.tsv.gz`, with each gene's counts, CPM and the fraction of the group's cells with a count.
+- **TF families:**
+  - A TF in these tables is a MotifCompendium motif name without its `_<n>`, as `combine.py` names a site's TF.
+  - Its genes come from MotifCompendium's metadata (`TF`, every source motif's TF; the union over the family's
+    motifs). `setup.sh --references` fetches the table, from the database's commit, md5-checked.
+  - Genes match case- and punctuation-blind (NKX61 = NKX6-1).
+  - In a group, the family's CPM and fraction are its best member's, and `expressed` = fraction ≥ `--min-frac`
+    (0.05).
+- **Columns added**, in copies under `<coop>/expression/combined/` and `<coop>/expression/official/` (the originals
+  are left as they are):
+  - per comparison and TF:
+    - `top_gene`, `cpm`, `frac` and `expressed` on each side;
+    - `log2fc_expr`;
+    - `expression_changes`, true when the TF is expressed on one side only or its CPM changes at least
+      `--min-fold` (2)-fold;
+    - `members_up`, `members_down` and `members_changed`. These are the family's genes whose CPM changes at least
+      2-fold and that are expressed (at least `--min-frac` of cells) on the higher side, as `GENE(xFOLD)`. They
+      matter because the best member can be a broadly expressed relative that hides the lineage factor: in jl134,
+      TRPS1 stands for GATA in every cell type while GATA1 rises 4-fold from HSC to erythroid cells.
+  - per comparison and TF pair: each TF's `expressed` on each side and `log2fc_expr`, and `expression_changes` if
+    either TF's does;
+  - per dataset: the TF's (or each TF's) expression in the dataset's group, and `both_expressed` for a pair;
+  - per series (trend tables): `expressed_<group>` and `cpm_<group>`.
+
+  A TF that is a motif's own name (no annotation) has no family, and its columns are empty.
+- **Reading a change:** a significant change with `expression_changes` true, or with lineage members in
+  `members_up` or `members_down`, may be the expression changing. One with the family expressed on both sides at
+  about the same level, and no member moving, is the better candidate for a change in cooperativity itself.
+

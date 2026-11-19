@@ -6,7 +6,8 @@
 #     (vendor/igvf_tf_chrombpnet/pixi.toml and pixi.lock, the ones its steps were run with);
 #   - with --references, the reference files every step reads (project.yaml's reference_root): the IGVF GRCh38
 #     genome and its .fai, the chrom sizes, the ENCODE blacklist, the MotifCompendium database and the GENCODE TSSs,
-#     downloaded and md5-checked by the vendored steps' own `src/cli.py download-references`.
+#     downloaded and md5-checked by the vendored steps' own `src/cli.py download-references`; and MotifCompendium's
+#     metadata (each motif's TFs, for the expressed-TF annotation), by tf_expression.py fetch-metadata.
 #   Safe to rerun: an installed environment is checked against its lock, a reference already in place is kept.
 # Input:  --references <dir>   where the references go (an absolute path; created if missing)
 #         --with-engine        also cherimoya-030 (only for the frozen attribution engine, workflows/attribution/)
@@ -64,6 +65,9 @@ if [[ -n "${refs}" ]]; then
     (( dry )) || mkdir -p "${refs}"
     run pixi run --frozen --manifest-path "${vendor}/pixi.toml" -e preprocess \
         python "${vendor}/src/cli.py" download-references --reference-root "${refs}"
+    # MotifCompendium's metadata (each motif's TFs), for workflows/cooperativity/tf_expression.py's TF families
+    run pixi run --frozen --manifest-path "${repo_root}/pixi.toml" -e default \
+        python "${repo_root}/workflows/cooperativity/tf_expression.py" fetch-metadata --reference-root "${refs}"
 fi
 
 # What is still missing (a dry run: what would be).

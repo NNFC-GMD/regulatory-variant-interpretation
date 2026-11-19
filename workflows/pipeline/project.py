@@ -96,11 +96,11 @@ SIGNAL_SUFFIXES = (".bw", ".bigwig")  # what igvf's config parser takes for a bi
 PEAKS_SUFFIX = ".narrowPeak.gz"
 DEFAULT_FOLDS = ("0", "1", "2", "3", "4")
 SLOTS = {
-    "train_per_gpu": 4,  # Cherimoya fits per H100: CPU/launch-bound, so several share a GPU
+    "train_per_gpu": 4,  # Cherimoya fits per H100; large datasets share it GPU-bound (4 at once: ~4x slower each)
     "train_cores": 6,
     "attribute_per_gpu": 4,  # `cherimoya attribute`'s fast path plans at most 12 GB per process
     "attribute_cores": 4,
-    "modisco_max": 5,  # 08.0 runs at once
+    "modisco_max": 12,  # 08.0 runs at once: each keeps ~5-10 cores busy (MODISCO_CORES)
     "modisco_threads": 24,  # Leiden, most of an 08.0, is single-threaded
     "finemo_slots": 5,  # 10.0 runs at once, one GPU each
     "finemo_batch": 200,
@@ -110,6 +110,7 @@ SLOTS = {
 """The most each slot gets: what a whole Gefion node (8 H100, 208 CPUs, ~2 TB) runs. resolve_slots() scales them
 down to a smaller machine; a value project.yaml gives is used as it is."""
 MODISCO_GB = 60  # an 08.0's peak memory, with room (docs/pipeline.md: ~55 GB)
+MODISCO_CORES = 12  # the cores an 08.0 keeps busy on average, with room: 11 at once on 208 CPUs averaged 5-10 each
 PREP_GB = 64  # a prep chain's peak memory, with room (~63 GB)
 SLURM_KEYS = ("partition", "account", "gpus", "cpus", "time", "extra")
 RETIRED = {
@@ -375,8 +376,9 @@ def resolve_slots(given: dict, m: dict, n_datasets: int) -> dict[str, int]:
     pick("train_cores", _clamp(c // (g * s["train_per_gpu"]), 1, SLOTS["train_cores"]))
     pick("attribute_per_gpu", SLOTS["attribute_per_gpu"])
     pick("attribute_cores", _clamp(c // (g * s["attribute_per_gpu"]), 1, SLOTS["attribute_cores"]))
-    pick("modisco_max", _clamp(min(mem // MODISCO_GB, c // SLOTS["modisco_threads"]), 1, SLOTS["modisco_max"]))
-    pick("modisco_threads", _clamp(c // s["modisco_max"], 1, SLOTS["modisco_threads"]))
+    pick("modisco_max", _clamp(min(mem // MODISCO_GB, c // MODISCO_CORES), 1, SLOTS["modisco_max"]))
+    # twice each run's share of the CPUs (most of a run is single-threaded), never more than the machine has
+    pick("modisco_threads", _clamp(min(c, 2 * c // s["modisco_max"]), 1, SLOTS["modisco_threads"]))
     pick("finemo_slots", _clamp(g, 1, SLOTS["finemo_slots"]))
     pick("finemo_batch", SLOTS["finemo_batch"])
     pick("coop_cores", _clamp(c // g, 1, SLOTS["coop_cores"]))

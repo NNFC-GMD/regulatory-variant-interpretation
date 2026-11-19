@@ -292,9 +292,13 @@ env CHERI_ROOT=<root>/cherimoya CHERI_STAGES=fit CHERI_SLOTS_PER_GPU=<train_per_
 ```
 
 `make_jobs.py` writes one `fit.json` per dataset and fold (`<root>/cherimoya/<ds>/fold_<k>/`) and `tasks.tsv`.
-`run_box.sh` keeps every GPU busy: several workers per GPU, each pinned to its own cores. It starts them slot by
-slot across the GPUs, so a short queue still uses every GPU. Each worker runs `run_task.sh <fold> fit`, which is
-`cherimoya fit -p fit.json`.
+`run_box.sh` keeps every GPU busy: GPUs × `train_per_gpu` workers, each pinned to its own cores.
+- **A task's GPU** is chosen when the task is taken: the one with the fewest tasks running. So a short queue, or the
+  tail of a long one, spreads over every GPU. Before, workers were tied to GPUs, and the tail piled onto the GPUs
+  whose first tasks ended first: in one 11-dataset box, the last 23 attributions ran on 4 of 8 GPUs.
+- **The order:** `make_jobs.py` lists the datasets with the most peaks first, so the longest tasks start first.
+- **The record:** `claims.tsv`, in the run's box directory, has each choice and the loads it saw.
+- **The task:** each worker runs `run_task.sh <fold> fit`, which is `cherimoya fit -p fit.json`.
 
 The inputs are igvf's:
 - the 00.0 bigwig, already +4/−4;
@@ -404,7 +408,13 @@ Per dataset, once every fold's attribution is done:
   - NNFC-GMD/tfmodisco's fork of modisco 2.5.2, with an inverted-index neighbour search; it gives identical results,
     faster;
   - `-w 500`, a budget of 500,000 seqlets (`modisco_max_seqlets`, igvf's default);
-  - output `contrib_scores/<ds>/modisco/modisco_counts_results.h5`.
+  - output `contrib_scores/<ds>/modisco/modisco_counts_results.h5`, and the report `counts_report/motifs.html`
+    (`modisco report-simple`, matches from MEME's tomtom).
+  - **If the report fails with the h5 complete,** `downstream.sh` makes it once more, on a copy of the MEME database
+    with a blank line appended (`retry_report`). The modisco env's memelite 0.4.0 drops a database's last motif when
+    nothing follows its matrix. tomtom still matches it, and the report stops on a KeyError (fixed in memelite 0.5.0,
+    which igvf_tf_chrombpnet's lock does not have yet). If the retry fails too, 08.0 is marked `report_failed` and
+    counts as done.
 
 Each step leaves a marker in `<root>/cherimoya/<ds>/downstream/.done/`. A rerun skips marked steps and redoes an
 output without a marker.
@@ -422,6 +432,12 @@ output without a marker.
 
 Leiden, most of an 08.0, is single-threaded, so more threads mostly sit idle. Run several 08.0 at once instead
 (`modisco_max`). 08.0 time grows faster than linearly with the seqlet count.
+- **How many at once:** `resolve_slots` allows as many as the memory (60 GB each) and the CPUs (12 busy cores each,
+  `MODISCO_CORES`) take, up to 12. Each run gets up to twice its share of the CPUs in threads, at most 24.
+- **Measured:** 11 08.0 of about 290,000 peaks each ran at once on a 208-CPU node. Each kept 5-10 cores busy on
+  average and used 8-45 GB; each took 4.5-8.6 h. The node's load stayed below 170.
+- **Changing it in a running box:** write a number to `<box>/cheri_downstream.08_max`. `downstream.sh` reads it
+  before each 08.0 starts.
 
 ### motifs
 
@@ -499,8 +515,12 @@ fold k's models in both groups shows whether the folds agree: `robust` = signifi
 The bootstrap resamples peaks only, so it misses the noise of training a different model per dataset; the fold check
 covers part of it.
 
+**Expressed TFs** (`tf_expression.py`, not a stage): with the cells' RNA counts, each TF family's expression per
+group goes beside the tables. A change in cooperativity can follow from a TF being expressed in one cell state only.
+See `workflows/cooperativity/README.md`, section 11.
+
 `workflows/cooperativity/README.md` has the definitions and how they differ (section 4), how the pipeline runs it
-(section 8), and the coop_matrix stage (section 9).
+(section 8), the coop_matrix stage (section 9) and the expressed-TF annotation (section 11).
 
 ## Same sites under every model (`coop_matrix`, optional)
 

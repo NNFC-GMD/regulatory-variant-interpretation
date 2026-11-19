@@ -142,6 +142,14 @@ def fit_parameters(cfg, fold, paths, chroms, genome, exclusion_list, seed_base, 
     return params
 
 
+def count_lines(path: Path) -> int:
+    """Lines of a file (a dataset's peaks), 0 if it is missing."""
+    if not path.exists():
+        return 0
+    with open(path, "rb") as fh:
+        return sum(1 for _ in fh)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--chrombpnet-configs", nargs="+", type=Path, required=True,
@@ -167,7 +175,7 @@ def main(argv=None) -> int:
     if not args.genome.exists():
         logger.error("genome not found: %s", args.genome)
         return 1
-    rows, n_missing = [], 0
+    rows, n_missing, n_peaks = [], 0, {}
     for config in sorted(args.chrombpnet_configs):
         cfg = read_config(config)
         for fold in cfg["folds"]:
@@ -195,6 +203,14 @@ def main(argv=None) -> int:
             n_missing += bool(missing)
             rows.append((cfg["dataset_name"], fold, str(workdir), "no" if missing else "yes",
                          "yes" if paths["chrombpnet_predictions"].exists() else "no"))  # fmt: skip
+            if cfg["dataset_name"] not in n_peaks:
+                n_peaks[cfg["dataset_name"]] = count_lines(paths["peaks"])
+
+    # The datasets with the most peaks first (a dataset's folds stay in order): their tasks run longest, so starting
+    # them first leaves the shortest tasks for the end, where some GPUs would otherwise wait on one long task.
+    rows.sort(key=lambda r: (-n_peaks[r[0]], r[0]))
+    order = list(dict.fromkeys(r[0] for r in rows))
+    logger.info("tasks in order of peaks: %s", ", ".join(f"{d} ({n_peaks[d]:,})" for d in order))
 
     args.out_root.mkdir(parents=True, exist_ok=True)
     with open(args.out_root / "tasks.tsv", "w") as fh:

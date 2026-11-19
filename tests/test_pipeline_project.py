@@ -130,7 +130,8 @@ def test_slots_scale_to_the_machine():
                      "coop_cores": 16, "prep_max": 1}  # fmt: skip
     # half a node: the per-slot cores stay, the at-once counts shrink
     half = pj.resolve_slots({}, {"cpus": 96, "gpus": ["0", "1", "2", "3"], "mem_gb": 1000}, 5)
-    assert half["train_cores"] == 6 and half["modisco_max"] == 4 and half["finemo_slots"] == 4 and half["prep_max"] == 5
+    assert half["train_cores"] == 6 and half["modisco_max"] == 8 and half["finemo_slots"] == 4 and half["prep_max"] == 5
+    assert half["modisco_threads"] == 24  # twice its share (2 * 96 // 8), at most 24
     # whatever the machine, the GPU stages fit its CPUs
     for m in ({"cpus": 8, "gpus": ["0"], "mem_gb": 32}, {"cpus": 64, "gpus": ["0", "1"], "mem_gb": 0}, GEFION):
         s = pj.resolve_slots({}, m, 3)

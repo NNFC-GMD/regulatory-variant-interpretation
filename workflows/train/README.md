@@ -91,9 +91,11 @@ pixi run -e cherimoya python workflows/train/plot_comparison.py \
     --paired <dir>/comparison_paired.tsv --out <dir>/comparison_counts
 ```
 
-`run_box.sh` starts its workers slot by slot across the GPUs (the first slot
-of every GPU, then the second, ...), so a queue shorter than the slots still
-spreads over every GPU. Each worker runs `run_task.sh <fold> <stages>`:
+`run_box.sh` runs GPUs x slots workers, each on its own cores, and gives each
+task the GPU with the fewest tasks running when the task is taken
+(`claims.tsv` records each choice). So a queue shorter than the slots, or the
+tail of a long one, spreads over every GPU. `make_jobs.py` lists the datasets
+with the most peaks first. Each worker runs `run_task.sh <fold> <stages>`:
 `fit`, `compare` and `attribute` (not part of `all`; see
 `../downstream/README.md`). `CHERI_PIXI_ENV` names the environment of fit and
 compare (default `cherimoya`); `CHERI_ATTR_ENGINE` picks the attribution engine

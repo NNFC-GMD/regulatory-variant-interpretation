@@ -4,10 +4,13 @@
 #   one (dataset, fold) task at a time per slot, from tasks.tsv (make_jobs.py).
 #
 # DCAI rents whole nodes (208 cores, ~2 TB RAM, 8x H100) by node-time, so the
-# tasks run inside one allocation: CHERI_SLOTS_PER_GPU workers per GPU, each
-# pinned to its GPU (CUDA_VISIBLE_DEVICES) and to its own block of
-# CHERI_CORES_PER_SLOT cores (taskset), take the next task from a queue
-# under a lock and run run_task.sh on it. The default 9-layer, 128-filter model
+# tasks run inside one allocation: GPUs x CHERI_SLOTS_PER_GPU workers, each
+# pinned to its own block of CHERI_CORES_PER_SLOT cores (taskset), take the
+# next task from a queue under a lock and run run_task.sh on it. The GPU is
+# chosen per task, when it is taken: the one with the fewest tasks running
+# (CUDA_VISIBLE_DEVICES), so a short queue, or the tail of a long one, spreads
+# over every GPU instead of piling onto the GPUs whose earlier tasks ended
+# first (claims.tsv records each choice and the loads it saw). The default 9-layer, 128-filter model
 # is small for an H100, so two trainings share a GPU by default. The same
 # script runs inside an allocation that is already busy with other work
 # (`srun --jobid <job> --overlap`): CHERI_GPUS and CHERI_CORE_OFFSET then keep
@@ -29,9 +32,13 @@
 #   CHERI_ONLY            only these datasets, space-separated (default: every ready row)
 #   CHERI_MAX_TASKS       stop after this many tasks have started (default: no limit)
 #   CHERI_ORDER           forward (default) or reverse: the order the queue is taken in
+#                         (make_jobs.py lists the datasets with the most peaks first)
+#   CHERI_TASK_CMD        the task runner (default workflows/train/run_task.sh; for tests)
+#   CHERI_SCRATCH_ROOT    node-local scratch (default /raid if writable, else /dev/shm)
 #
 # Output: under ${CHERI_ROOT}/box/<job id>/: logs/<dataset>.fold_<k>.log,
-#         status.tsv (dataset, fold, exit, seconds, gpu), resources.tsv; and
+#         status.tsv (dataset, fold, exit, seconds, gpu), claims.tsv (dataset,
+#         fold, gpu, the running tasks per GPU when it was chosen), resources.tsv; and
 #         each task's outputs in its fold directory.
 # Usage:  CHERI_ROOT=<dir> sbatch workflows/train/run_box.sbatch
 #         or, inside a running allocation:
@@ -56,6 +63,7 @@ slots_per_gpu="${CHERI_SLOTS_PER_GPU:-2}"
 cores_per_slot="${CHERI_CORES_PER_SLOT:-8}"
 core_offset="${CHERI_CORE_OFFSET:-0}"
 max_tasks="${CHERI_MAX_TASKS:-0}"
+task_cmd="${CHERI_TASK_CMD:-${repo_root}/workflows/train/run_task.sh}"
 if [[ -n "${CHERI_GPUS:-}" ]]; then
     IFS=, read -r -a gpus <<< "${CHERI_GPUS}"
 else
@@ -86,6 +94,7 @@ printf 'dataset\tfold\tstages\texit\tseconds\tgpu\n' > "${status}"
 # what another run in this same job is still using.
 scratch_root=/dev/shm
 [[ -d /raid && -w /raid ]] && scratch_root=/raid
+scratch_root="${CHERI_SCRATCH_ROOT:-${scratch_root}}"
 for old in "${scratch_root}/${USER}/cheri."*; do
     [[ -d "${old}" ]] || continue
     old_job="${old##*/cheri.}"
@@ -113,11 +122,20 @@ echo "[$(date)] box ${box_id} on $(hostname): ${n_tasks} task(s), stages ${stage
      "GPUs ${gpus[*]} x ${slots_per_gpu} slot(s), ${cores_per_slot} cores each from core ${core_offset}"
 echo "           logs ${box_dir}/logs"
 
-# claim -- print the next queued task and drop it from the queue, under a lock.
+# Tasks running per GPU, one file each, read and written under the queue's lock.
+load_dir="${box_dir}/.gpu_load"
+mkdir -p "${load_dir}"
+for gpu in "${gpus[@]}"; do echo 0 > "${load_dir}/${gpu}"; done
+claims="${box_dir}/claims.tsv"
+printf 'dataset\tfold\tgpu\tloads\ttime\n' > "${claims}"
+
+# claim -- print the next queued task and the GPU it runs on, and drop the task from the queue, under a lock. The
+# GPU is the one with the fewest tasks running (the first of them in CHERI_GPUS' order on a tie); its count goes up
+# by one until release. A free worker always finds one below CHERI_SLOTS_PER_GPU, since workers = GPUs x slots.
 claim() {
     (
         flock -x 9
-        local line
+        local line gpu best="" min=-1 n loads=()
         line="$(head -n 1 "${queue}")"
         [[ -z "${line}" ]] && exit 1
         if (( max_tasks > 0 )); then
@@ -126,20 +144,37 @@ claim() {
             (( started >= max_tasks )) && exit 1
             echo $(( started + 1 )) > "${box_dir}/.started"
         fi
+        for gpu in "${gpus[@]}"; do
+            n="$(cat "${load_dir}/${gpu}")"
+            loads+=( "${gpu}:${n}" )
+            if (( min < 0 || n < min )); then min="${n}"; best="${gpu}"; fi
+        done
+        echo $(( min + 1 )) > "${load_dir}/${best}"
         sed -i 1d "${queue}"
-        printf '%s\n' "${line}"
+        printf '%s\t%s\t%s\t%s\n' "$(cut -f1,2 <<< "${line}")" "${best}" "$(IFS=,; echo "${loads[*]}")" \
+            "$(date +%FT%T)" >> "${claims}"
+        printf '%s\t%s\n' "${line}" "${best}"
+    ) 9> "${queue}.lock"
+}
+
+# release <gpu> -- one task fewer running on the GPU.
+release() {
+    (
+        flock -x 9
+        echo $(( $(cat "${load_dir}/$1") - 1 )) > "${load_dir}/$1"
     ) 9> "${queue}.lock"
 }
 
 worker() {
-    local gpu="$1" cores="$2" task dataset fold workdir rc t0
+    local cores="$1" task dataset fold workdir gpu rc t0
     while task="$(claim)"; do
-        IFS=$'\t' read -r dataset fold workdir <<< "${task}"
+        IFS=$'\t' read -r dataset fold workdir gpu <<< "${task}"
         t0=${SECONDS}
         CUDA_VISIBLE_DEVICES="${gpu}" CHERI_THREADS="${cores_per_slot}" \
-            taskset -c "${cores}" bash "${repo_root}/workflows/train/run_task.sh" "${workdir}" "${stages}" \
+            taskset -c "${cores}" bash "${task_cmd}" "${workdir}" "${stages}" \
             >> "${box_dir}/logs/${dataset}.fold_${fold}.log" 2>&1
         rc=$?
+        release "${gpu}"
         (( rc == 4 )) && continue   # another run has this fold
         (
             flock -x 8
@@ -163,19 +198,14 @@ sampler &
 sampler_pid=$!
 trap 'kill "${sampler_pid}" 2>/dev/null; rm -rf "${scratch}"' EXIT
 
-# Workers start slot by slot across the GPUs (the first slot of every GPU, then the second, ...), so a queue
-# shorter than the slots spreads over every GPU instead of filling the first ones.
+# One worker per slot, each with its own block of cores; each task's GPU is chosen when it is taken (claim).
 pids=()
-slot=0
-for (( s = 0; s < slots_per_gpu; s++ )); do
-    for gpu in "${gpus[@]}"; do
-        first=$(( core_offset + slot * cores_per_slot ))
-        worker "${gpu}" "$(IFS=,; echo "${allowed[*]:${first}:${cores_per_slot}}")" &
-        pids+=( $! )
-        slot=$(( slot + 1 ))
-        # Let the first task compile and fill the cache before the others need it.
-        (( slot == 1 && n_tasks > 1 )) && sleep "${CHERI_STAGGER:-120}"
-    done
+for (( slot = 0; slot < n_slots; slot++ )); do
+    first=$(( core_offset + slot * cores_per_slot ))
+    worker "$(IFS=,; echo "${allowed[*]:${first}:${cores_per_slot}}")" &
+    pids+=( $! )
+    # Let the first task compile and fill the cache before the others need it.
+    (( slot == 0 && n_tasks > 1 )) && sleep "${CHERI_STAGGER:-120}"
 done
 wait "${pids[@]}"
 

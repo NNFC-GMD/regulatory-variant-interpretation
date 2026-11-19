@@ -76,11 +76,26 @@ with h5py.File(sys.argv[1], "w") as fh:
     fh.create_group("pos_patterns/pattern_0")
     fh.attrs["window_size"] = 500' "${avg}/modisco/modisco_counts_results.h5" || exit 1
 fi
+if [[ -n "${FAKE_08_DB:-}" ]]; then  # as 08.0's run metadata records its MEME database
+    mkdir -p "${out}/metadata"
+    printf '{"inputs": ["motif_db=%s"]}\n' "${FAKE_08_DB}" > "${out}/metadata/20260101T000000+0000_08.0.run_modisco_ab12.json"
+fi
 [[ "${FAKE_08_EXIT:-0}" == 0 ]] || { say 08.0 failed; exit "${FAKE_08_EXIT}"; }
 echo report > "${avg}/modisco/counts_report/motifs.html"
 say 08.0 end
 """,
 }
+
+
+FAKE_MODISCO = """#!/bin/bash
+# modisco report-simple -i H5 -o DIR/ -m DB: the report only when DB ends with a blank line (as memelite 0.4.0 parses)
+[[ "$1" == report-simple ]] || exit 2
+shift
+while (( $# )); do case "$1" in -i) h5="$2"; shift 2 ;; -o) dir="$2"; shift 2 ;; -m) db="$2"; shift 2 ;; *) shift ;; esac; done
+echo "report-simple ${h5} ${db}" >> "${FAKE_LOG}"
+[[ -z "$(tail -n 1 "${db}")" ]] || { echo "KeyError: 'LAST_MOTIF'" >&2; exit 1; }
+mkdir -p "${dir}" && echo report > "${dir}motifs.html"
+"""
 
 
 class Box:
@@ -102,6 +117,8 @@ class Box:
         bin_dir.mkdir()
         (bin_dir / "pixi").write_text(FAKE_PIXI)
         (bin_dir / "pixi").chmod(0o755)
+        (bin_dir / "modisco").write_text(FAKE_MODISCO)
+        (bin_dir / "modisco").chmod(0o755)
         self.log = tmp_path / "steps.log"
         self.log.touch()
         self.job = f"pytest{os.getpid()}.{tmp_path.name}"
@@ -245,6 +262,26 @@ def test_08_0_report_failure_with_a_good_h5_counts_as_done(box, tmp_path):
     assert result.returncode == 0, _out(result)
     assert "report_failed: 1 pos patterns" in (b.done() / "08.0").read_text()
     assert [r[2] for r in b.record() if r[1] == "08.0"] == ["1"]
+
+
+def test_08_0_report_failure_on_the_last_motif_is_made_again_on_a_padded_database(box, tmp_path):
+    """memelite 0.4.0 drops a MEME file's last motif; the report is made again on a copy with a blank line appended."""
+    b = box()
+    make_dataset(tmp_path, "ds", convert=False)
+    db = tmp_path / "motifs.meme"
+    db.write_text(
+        "MEME version 4\n\nMOTIF LAST_MOTIF\nletter-probability matrix: alength= 4 w= 1\n0.25 0.25 0.25 0.25\n"
+    )
+    result = b.run("ds", FAKE_08_EXIT="1", FAKE_08_DB=str(db))
+    assert result.returncode == 0, _out(result)
+    marker = (b.done() / "08.0").read_text()
+    assert "report_failed" not in marker and "1 pos patterns, window_size 500; report made again" in marker
+    rows = {r[1]: r for r in b.record()}
+    assert rows["08.0"][2] == "1" and rows["08.0_report"][2] == "0" and str(db) in rows["08.0_report"][6]
+    report = next(tmp_path.rglob("counts_report/motifs.html"))
+    assert report.read_text() == "report\n"
+    assert db.read_text().endswith("0.25\n")  # the database itself is untouched
+    assert not list(b.scratch.rglob("*.trailing_blank"))  # the copy is removed
 
 
 def test_08_0_without_results_gives_the_dataset_up_and_the_others_go_on(box, tmp_path):

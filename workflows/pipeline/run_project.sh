@@ -101,15 +101,18 @@ mkdir -p "${logs}"
 # igvf_tf_chrombpnet's steps (vendor/igvf_tf_chrombpnet/, copied unchanged) read their environment from its
 # workflows/dcai/env.sh, whose defaults are Gefion's; everything they use is set here first, so none of those applies:
 # the copy as REPO_ROOT, the project's data, the reference files (the same reference_root project.py takes the genome
-# from), chrombpnet as this repository's `chrombpnet` env, and a python for their stdlib-only helpers.
+# from), their software environments as this repository's (envs.sh: envs/pixi.toml, and the `chrombpnet` env), and a
+# python for their stdlib-only helpers.
 export REPO_ROOT="${PROJECT_VENDOR}" DATASET_ROOT="${PROJECT_ROOT}" REFERENCE_ROOT="${PROJECT_REFERENCE_ROOT}"
 export CHROMBPNET_ENV="pixi:${repo_root}/pixi.toml#chrombpnet"
+# shellcheck source=workflows/pipeline/envs.sh
+source "${here}/envs.sh"
 export BOOTSTRAP_PYTHON="${repo_root}/.pixi/envs/default/bin/python"
 chrombpnet_python="${repo_root}/.pixi/envs/chrombpnet/bin/python"
 # shellcheck source=/dev/null
 source "${PROJECT_VENDOR}/workflows/dcai/env.sh"
 unset METADATA_DIR
-igvf_run() { pixi run --frozen --manifest-path "${PROJECT_VENDOR}/pixi.toml" -e "$@"; }
+igvf_run() { step_run "$@"; }  # a command in one of the steps' environments (envs.sh)
 # The bare `python3` of motif_chain.sh and downstream.sh (stdlib-only helpers) is the default env's, so the machine
 # needs no python of its own.
 shims="${scratch}/bin"
@@ -134,9 +137,9 @@ stage_preflight() {
     for e in default cherimoya chrombpnet; do
         [[ -d "${repo_root}/.pixi/envs/${e}" ]] || { log "ERROR: no env ${e}: bash workflows/pipeline/setup.sh"; bad=1; }
     done
-    for e in peaks preprocess modisco motif-compendium finemo; do
-        [[ -d "${PROJECT_VENDOR}/.pixi/envs/${e}" ]] \
-            || { log "ERROR: no vendored igvf env ${e}: bash workflows/pipeline/setup.sh"; bad=1; }
+    for e in "${STEP_ENVS[@]}"; do
+        [[ -d "${repo_root}/envs/.pixi/envs/${e}" ]] \
+            || { log "ERROR: no env ${e} (envs/pixi.toml): bash workflows/pipeline/setup.sh"; bad=1; }
     done
     for f in ${PROJECT_REFERENCE_FILES}; do
         [[ -s "${f}" ]] || { log "ERROR: no reference file ${f}: bash workflows/pipeline/setup.sh --references" \

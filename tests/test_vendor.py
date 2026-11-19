@@ -18,7 +18,7 @@ VENDOR = REPO / "vendor" / "igvf_tf_chrombpnet"
 NOT_COPIED = {"VENDORED.md", "MANIFEST.tsv"}
 """The copy's own files: written here, not copied."""
 DRIVER_ENVS = {"peaks", "preprocess", "modisco", "motif-compendium", "finemo"}
-"""The vendored environments run_project.sh and setup.sh use."""
+"""The environments of the copied steps: envs/pixi.toml (envs.sh points the steps at them)."""
 UNREACHED = (
     re.compile(r"^config(/|$)"),  # dataset configs by name; the driver passes each config's path
     re.compile(r"^results(/|$)"),  # igvf's own output tree; every step gets its project's output_dir
@@ -96,18 +96,45 @@ def test_every_import_of_the_copied_python_resolves():
     assert missing == []
 
 
-def test_the_environments_the_driver_uses_are_the_copy_s_and_ours():
-    igvf = tomllib.loads((VENDOR / "pixi.toml").read_text())
-    assert DRIVER_ENVS <= set(igvf["environments"])
+def test_the_steps_environments_are_ours_and_every_one_the_copied_steps_read_is_set():
+    envs = tomllib.loads((REPO / "envs" / "pixi.toml").read_text())
+    assert DRIVER_ENVS <= set(envs["environments"])
     ours = tomllib.loads((REPO / "pixi.toml").read_text())
     assert {"default", "cherimoya", "chrombpnet"} <= set(ours["environments"]) | {"default"}
     # chrombpnet at the commit the copied steps name (CHROMBPNET_REV in lib/bash/common.sh)
     common = (VENDOR / "lib" / "bash" / "common.sh").read_text()
     rev = re.search(r'CHROMBPNET_REV="\$\{CHROMBPNET_REV:-([0-9a-f]{40})\}"', common)
     assert rev and ours["feature"]["chrombpnet"]["pypi-dependencies"]["chrombpnet"]["rev"] == rev.group(1)
-    for script in ("run_project.sh", "setup.sh"):
-        text = (REPO / "workflows" / "pipeline" / script).read_text()
-        assert all(e in text for e in DRIVER_ENVS), script
+    # every <NAME>_ENV the copied steps read, with the copy's own pixi.toml as its default, is set by envs.sh to
+    # envs/pixi.toml's environment of that name
+    read = dict(re.findall(r'"\$\{([A-Z_]+_ENV):-pixi:\$\{REPO_ROOT\}/pixi\.toml#([a-z-]+)\}"', common))
+    assert set(read.values()) == DRIVER_ENVS
+    script = REPO / "workflows" / "pipeline" / "envs.sh"
+    env = {k: v for k, v in os.environ.items() if k not in read}
+    out = subprocess.run(["bash", "-c", 'source "$1"; shift; for v in "$@"; do printf "%s=%s\\n" "$v" "${!v}"; done; '
+                          'printf "STEP_ENVS=%s\\n" "${STEP_ENVS[*]}"', "_", str(script), *read],
+                         capture_output=True, text=True, check=True, env=env).stdout  # fmt: skip
+    got = dict(line.split("=", 1) for line in out.splitlines())
+    for var, name in read.items():
+        assert got[var] == f"pixi:{REPO}/envs/pixi.toml#{name}", var
+    assert set(got["STEP_ENVS"].split()) == DRIVER_ENVS
+    for name in ("run_project.sh", "setup.sh"):
+        assert "envs.sh" in (REPO / "workflows" / "pipeline" / name).read_text(), name
+    for name in ("downstream.sh", "qc_modisco_folds.sh", "bias_control.sh"):
+        assert "envs.sh" in (REPO / "workflows" / "downstream" / name).read_text(), name
+
+
+def test_our_lock_is_the_copy_s_but_for_the_changes_envs_pixi_toml_names():
+    """envs/pixi.lock started as the copy's pixi.lock; every package but the ones its header lists is the same."""
+
+    def packages(path):
+        return set(re.findall(r"^ +- (?:conda|pypi): (\S+)$", path.read_text(), flags=re.M))
+
+    ours, copy = packages(REPO / "envs" / "pixi.lock"), packages(VENDOR / "pixi.lock")
+    changed = {re.sub(r".*/", "", u).split("-")[0] for u in ours ^ copy}
+    assert changed == {"memelite"}, sorted(ours ^ copy)
+    header = (REPO / "envs" / "pixi.toml").read_text().split("[workspace]")[0]
+    assert all(name in header for name in changed)
 
 
 def test_env_sh_finds_the_copy_and_keeps_what_the_driver_sets(tmp_path):

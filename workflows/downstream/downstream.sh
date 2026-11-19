@@ -103,6 +103,9 @@ usage="usage: downstream.sh <list.txt> [<list.txt> ...]"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # igvf_tf_chrombpnet's steps: by default this repository's copy of them (vendor/igvf_tf_chrombpnet/VENDORED.md).
 REPO_ROOT="${REPO_ROOT:-${repo_root}/vendor/igvf_tf_chrombpnet}"
+# the steps' software environments: this repository's (envs/pixi.toml), not the copy's own pixi.toml
+# shellcheck source=workflows/pipeline/envs.sh
+source "${repo_root}/workflows/pipeline/envs.sh"
 here="${repo_root}/workflows/downstream"
 attribution="${repo_root}/workflows/attribution"
 steps_dir="${REPO_ROOT}/workflows/SLURM"
@@ -497,8 +500,7 @@ retry_report() {
     { cat "${db}"; echo; } > "${padded}" || return 1
     log "${ds}: 08.0's report failed; report-simple again on ${db} with a blank line appended"
     run_step 08.0_report 4 "${logs}/08.0.log" env NUMBA_CACHE_DIR="${logs}/numba_cache" \
-        pixi run --frozen --manifest-path "${REPO_ROOT}/pixi.toml" -e modisco \
-        modisco report-simple -i "${mod_h5}" -o "${report_dir}/" -m "${padded}"
+        pixi run --frozen --manifest-path "${RVI_ENVS_MANIFEST}" -e modisco modisco report-simple -i "${mod_h5}" -o "${report_dir}/" -m "${padded}"
     rc=$?
     rm -f "${padded}"
     (( rc == 0 )) && [[ -s "${report_dir}/motifs.html" ]] && note="made on ${db} with a blank line appended"

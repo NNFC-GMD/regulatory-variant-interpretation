@@ -37,7 +37,12 @@ Everything runs from this repository's checkout (`docs/install.md`):
   `VENDORED.md` says what is copied and how to refresh it.
   - `MANIFEST.tsv` names the commit (`2446d6f`) and the sha256 of every file. The preflight and `submit.sh` refuse
     a changed byte.
-  - The copy's own `pixi.toml` and `pixi.lock` give its environments.
+  - **Its software environments are this repository's:** `envs/pixi.toml` and `envs/pixi.lock`.
+    - They started as the copy's own `pixi.toml` and `pixi.lock`, byte for byte, so every package is the version the
+      steps were verified with.
+    - Changes since are listed in `envs/pixi.toml`'s header: memelite 0.5.0 in `modisco`.
+    - `workflows/pipeline/envs.sh` points the copied steps at them, through the `*_ENV` variables their
+      `lib/bash/common.sh` reads. The copy's own `pixi.toml` and `pixi.lock` stay in `vendor/`, unused.
 - **[chrombpnet](https://github.com/NNFC-GMD/chrombpnet)** (`stable-modern-gpu-support`, at the commit the copied
   steps name) is this repository's CPU environment `chrombpnet`, installed from git, so no checkout is needed. 01.0
   runs `chrombpnet prep nonpeaks` in it, 07.0 imports its bigwig writer, 06.0 runs in it, and `detect_shifts.py` uses
@@ -95,14 +100,15 @@ Either way:
 | RVI | `cherimoya` | Cherimoya 0.3.1, tangermeme 1.6.0, torch 2.14 (CUDA 13), deepISA 0.1.0: fit, `cherimoya attribute`, the conversion, `motif_names.py`, `coop_isa.py`, `combine.py`, `test-cherimoya` |
 | RVI | `cherimoya-030` | Cherimoya 0.3.0 and tangermeme 1.5.0: only the frozen `attribute_fast.py` engine and its tests (`test-engine`) |
 | RVI | `chrombpnet` | chrombpnet (NNFC-GMD, 05f5748) on CPU: 01.0, 06.0, 07.0; `detect_shifts.py --chrombpnet-python`. The versions that shape those outputs are pinned to chrombpnet's own `cuda13` lock, the env earlier projects ran these steps in |
-| vendor | `peaks` | MACS3 PR #756, `detect_shifts.py`, 00.0 call_peaks |
-| vendor | `preprocess` | 00.0 prepare_signal (figwig), 00.1, 02.0, `make_configs.py`, `download-references` |
-| vendor | `modisco` | 08.0, TF-MoDISco from NNFC-GMD/tfmodisco |
-| vendor | `motif-compendium` | 09.0, MotifCompendium 1.0.19 |
-| vendor | `finemo` | 10.0 and 11.0, Fi-NeMo 0.41 |
+| envs | `peaks` | MACS3 PR #756, `detect_shifts.py`, 00.0 call_peaks |
+| envs | `preprocess` | 00.0 prepare_signal (figwig), 00.1, 02.0, `make_configs.py`, `download-references` |
+| envs | `modisco` | 08.0, TF-MoDISco from NNFC-GMD/tfmodisco; memelite 0.5.0 for its report |
+| envs | `motif-compendium` | 09.0, MotifCompendium 1.0.19 |
+| envs | `finemo` | 10.0 and 11.0, Fi-NeMo 0.41 |
 
-"vendor" is `vendor/igvf_tf_chrombpnet/pixi.toml`, the copied steps' own manifest and lock. `setup.sh` installs
-all eight; `cherimoya-030` only with `--with-engine`.
+"envs" is `envs/pixi.toml`: this repository's environments for the copied steps (`workflows/pipeline/envs.sh`).
+They started as the copy's own manifest and lock, byte for byte; `envs/pixi.toml`'s header lists the changes since.
+`setup.sh` installs all eight; `cherimoya-030` only with `--with-engine`.
 
 Cherimoya's model code (`cherimoya.py`, `cheri.py`, `io.py`, `wrappers.py`, `training.py`) is the same in 0.3.0 and
 0.3.1, so both environments load every model.
@@ -606,13 +612,16 @@ The pins:
 To change one:
 1. **Change it on a branch,** with the docs that describe it (this file, the stage READMEs).
 2. **igvf_tf_chrombpnet:** push the new commit to `chrombpnet2` and copy it in:
-   `bash workflows/pipeline/vendor_igvf.sh <igvf clone> <commit>`, which rewrites `MANIFEST.tsv`. Then `bash
-   workflows/pipeline/setup.sh` for any environment the copy's new lock changes. Install before a box needs it:
+   `bash workflows/pipeline/vendor_igvf.sh <igvf clone> <commit>`, which rewrites `MANIFEST.tsv`. The copy's
+   environments are not used: a version the steps need goes into `envs/pixi.toml` (step 3), with a line in its
+   header. Then `bash workflows/pipeline/setup.sh`. Install before a box needs it:
    several first activations at once would each try to install it. If the copied steps name another chrombpnet
    commit (`CHROMBPNET_REV`), move this repository's `chrombpnet` env to it in the same change; `tests/test_vendor.py`
    checks the two agree.
-3. **pixi:** `pixi lock`, then check that environments you did not mean to change did not move. Diff each
-   environment's package list in the lock before and after: `cherimoya-030` must stay as it was solved. Then `pixi
+3. **pixi:** `pixi lock` (and `pixi lock --manifest-path envs/pixi.toml` for the steps' environments), then check
+   that environments you did not mean to change did not move. Diff each environment's package list in the lock
+   before and after: `cherimoya-030` must stay as it was solved. `tests/test_vendor.py` checks that
+   `envs/pixi.lock` differs from the copy's lock only in the packages `envs/pixi.toml`'s header names. Then `pixi
    install --locked -e <env>` on the login node.
 4. **Test in a box,** by the preflight: it requires `pixi run check` and `pixi run -e cherimoya test-pipeline`, and
    runs `pixi run -e cherimoya test-cherimoya` beside the stages (in STATUS.md); run `pixi run -e cherimoya-030

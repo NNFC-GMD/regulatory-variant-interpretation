@@ -51,9 +51,12 @@ its framework, driver and documentation live here.
 - `cooperativity/`: TF cooperativity by in-silico ablation of motif sites
   (DeepISA's definitions) with Cherimoya models. See its README.
 - `vendor/igvf_tf_chrombpnet/`: igvf_tf_chrombpnet's preprocessing (00.0-02.0)
-  and motif steps (06.0-11.0), copied unchanged from one commit, with their
-  own `pixi.toml`/`pixi.lock` and the chromosome folds. Its `VENDORED.md` says
-  what is copied and how to refresh it; `MANIFEST.tsv` hashes every file.
+  and motif steps (06.0-11.0), copied unchanged from one commit, with the
+  chromosome folds. Its `VENDORED.md` says what is copied and how to refresh
+  it; `MANIFEST.tsv` hashes every file.
+- `envs/`: the environments those steps run in, this repository's
+  (`pixi.toml`/`pixi.lock`; `workflows/pipeline/envs.sh` points the steps at
+  them). They started as the copy's own, and the header lists the changes.
 - `docs/`: the install guide, the pipeline reference, the new-project guide,
   the results, the cluster rules.
 - `tests/`: the tests. They need no data; some need torch, pandas or a GPU, so
@@ -67,8 +70,8 @@ its framework, driver and documentation live here.
     06.0, 07.0).
   - `cherimoya-030`: Cherimoya 0.3.0 and tangermeme 1.5.0, only for the frozen
     `attribute_fast.py` engine and its tests.
-  - The vendored steps' own: `peaks`, `preprocess`, `modisco`,
-    `motif-compendium`, `finemo` (`vendor/igvf_tf_chrombpnet/pixi.toml`).
+  - The copied steps': `peaks`, `preprocess`, `modisco`, `motif-compendium`,
+    `finemo` (`envs/pixi.toml`).
 
 ## Commands
 

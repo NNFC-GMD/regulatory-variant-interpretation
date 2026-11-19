@@ -536,16 +536,22 @@ rvi_run cherimoya python workflows/cooperativity/tf_expression.py annotate --exp
     (0.05).
 - **Columns added**, in copies under `<coop>/expression/combined/` and `<coop>/expression/official/` (the originals
   are left as they are):
-  - per comparison and TF: `top_gene`, `cpm`, `frac` and `expressed` on each side; `log2fc_expr`; and
-    `expression_changes`, true when the TF is expressed on one side only or its CPM changes at least `--min-fold`
-    (2)-fold;
+  - per comparison and TF:
+    - `top_gene`, `cpm`, `frac` and `expressed` on each side;
+    - `log2fc_expr`;
+    - `expression_changes`, true when the TF is expressed on one side only or its CPM changes at least
+      `--min-fold` (2)-fold;
+    - `members_up`, `members_down` and `members_changed`. These are the family's genes whose CPM changes at least
+      2-fold and that are expressed (at least `--min-frac` of cells) on the higher side, as `GENE(xFOLD)`. They
+      matter because the best member can be a broadly expressed relative that hides the lineage factor: in jl134,
+      TRPS1 stands for GATA in every cell type while GATA1 rises 4-fold from HSC to erythroid cells.
   - per comparison and TF pair: each TF's `expressed` on each side and `log2fc_expr`, and `expression_changes` if
     either TF's does;
   - per dataset: the TF's (or each TF's) expression in the dataset's group, and `both_expressed` for a pair;
   - per series (trend tables): `expressed_<group>` and `cpm_<group>`.
 
   A TF that is a motif's own name (no annotation) has no family, and its columns are empty.
-- **Reading a change:** a significant change with `expression_changes` true may be the expression changing. One with
-  the TF expressed on both sides at about the same level is the better candidate for a change in cooperativity
-  itself.
+- **Reading a change:** a significant change with `expression_changes` true, or with lineage members in
+  `members_up` or `members_down`, may be the expression changing. One with the family expressed on both sides at
+  about the same level, and no member moving, is the better candidate for a change in cooperativity itself.
 

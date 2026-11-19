@@ -27,7 +27,10 @@ annotate: TF families from MotifCompendium's metadata table (MotifCompendium-<ve
   <coop>/official/ with these columns added, as <coop>/expression/<combined|official>/<table>.tsv:
     a comparison's TF (group_a, group_b, tf): top_gene, cpm, frac, expressed for each side (_a, _b); log2fc_expr =
       log2((cpm_b + 1) / (cpm_a + 1)); expression_changes = expressed on one side only, or |log2fc_expr| >=
-      log2(--min-fold);
+      log2(--min-fold). The best member can be a broadly expressed relative that hides a lineage factor (TRPS1 for
+      GATA1), so also members_up and members_down: the family's genes whose CPM changes at least --min-fold-fold
+      between the sides and that are expressed (frac >= --min-frac) on the higher side, as GENE(xFOLD), and
+      members_changed, how many;
     a comparison's TF pair (pair "A + B" or tf_pair "A|B"): each TF's expressed_a, expressed_b and log2fc_expr
       (tf1_, tf2_), and expression_changes if either TF's does;
     a dataset's TF or TF pair (dataset, tf, pair or tf_pair): its group = dataset without --prefix; the TF's, or each
@@ -213,8 +216,25 @@ def family_expression(expr, fams: dict[str, list[str]], min_frac: float):
                                                                 "n_expressed", "expressed"])  # fmt: skip
 
 
-def annotate_table(df, lookup, prefix: str, min_fold: float):
-    """df with the expression columns its shape takes (see the module docstring), or None if it takes none."""
+def member_changes(members: dict, genes: dict, ga: str, gb: str, min_frac: float, min_fold: float):
+    """(up, down): the members whose CPM changes at least min_fold-fold from group ga to gb and that are expressed
+    on the higher side, as GENE(xFOLD), largest change first."""
+    up, down = [], []
+    for key in members:
+        a, b = genes.get((ga, key)), genes.get((gb, key))
+        if a is None or b is None:
+            continue
+        fold = (b["cpm"] + 1) / (a["cpm"] + 1)
+        if fold >= min_fold and b["frac"] >= min_frac:
+            up.append((fold, f"{b['gene']}(x{fold:.1f})"))
+        elif fold <= 1 / min_fold and a["frac"] >= min_frac:
+            down.append((1 / fold, f"{a['gene']}(x{1 / fold:.1f})"))
+    return [g for _, g in sorted(up, reverse=True)], [g for _, g in sorted(down, reverse=True)]
+
+
+def annotate_table(df, lookup, prefix: str, min_fold: float, members=None, genes=None, min_frac: float = 0.05):
+    """df with the expression columns its shape takes (see the module docstring), or None if it takes none.
+    members: family -> its genes' keys; genes: (group, key) -> gene, cpm, frac (for members_up and members_down)."""
 
     def get(tf, group, col):
         v = lookup.get((tf, group))
@@ -246,6 +266,12 @@ def annotate_table(df, lookup, prefix: str, min_fold: float):
         out["log2fc_expr"] = fc
         out["expression_changes"] = [changes(a, b, f) for a, b, f in
                                      zip(vals["expressed", "a"], vals["expressed", "b"], fc)]  # fmt: skip
+        if members is not None and genes is not None:
+            moved = [member_changes(members[t], genes, x, y, min_frac, min_fold) if t in members else (None, None)
+                     for t, x, y in zip(df["tf"], df["group_a"], df["group_b"])]  # fmt: skip
+            out["members_up"] = [None if u is None else ",".join(u) for u, _ in moved]
+            out["members_down"] = [None if d is None else ",".join(d) for _, d in moved]
+            out["members_changed"] = [None if u is None else len(u) + len(d) for u, d in moved]
         return out
     if {"group_a", "group_b"} <= cols and pair_col:
         split = df[pair_col].str.split(PAIR_SEPARATORS[pair_col], n=1, regex=False)
@@ -302,11 +328,17 @@ def annotate(args) -> dict:
     fam_table.to_csv(out_dir / "tf_families.tsv", sep="\t", index=False)
     per_group.to_csv(out_dir / "tf_expression.tsv", sep="\t", index=False, float_format="%.6g")
     lookup = {(r.family, r.group): r._asdict() for r in per_group.itertuples(index=False)}
+    members = {f: {norm(m) for m in ms} for f, ms in fams.items()}
+    genes = {}
+    for r in expr.itertuples(index=False):  # per group and gene key, the best of genes sharing a key
+        k = (r.group, norm(r.gene))
+        if k not in genes or r.cpm > genes[k]["cpm"]:
+            genes[k] = {"gene": r.gene, "cpm": float(r.cpm), "frac": float(r.frac)}
     written = []
     for sub in ("combined", "official"):
         for table in sorted((args.coop / sub).glob("*.tsv")):
             df = pd.read_csv(table, sep="\t", dtype=str)
-            annotated = annotate_table(df, lookup, args.prefix, args.min_fold)
+            annotated = annotate_table(df, lookup, args.prefix, args.min_fold, members, genes, args.min_frac)
             if annotated is None:
                 continue
             dest = out_dir / sub / table.name

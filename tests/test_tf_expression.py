@@ -136,3 +136,33 @@ def test_the_metadata_comes_from_the_motif_database_s_commit_and_sits_beside_it(
     assert url.startswith("https://raw.githubusercontent.com/kundajelab/MotifCompendium/7e9d1c2")
     assert url.endswith("/pipeline/data/MotifCompendium-Database-Human.metadata.tsv")
     assert dest == tmp_path / "motif" / "MotifCompendium-1.0.19-Database-Human.metadata.tsv"
+
+
+def test_a_lineage_member_hidden_behind_a_broad_relative_is_listed(tmp_path):
+    """The family's best member (TRPS1) is the same on both sides, so the family-level flag stays false; GATA1 rising
+    and SPI1-like falling members are listed."""
+    expr = tmp_path / "expr"
+    expr.mkdir()
+    rows = [
+        ("hsc", "TRPS1", 300.0, 0.5),
+        ("ery", "TRPS1", 300.0, 0.5),
+        ("hsc", "GATA1", 20.0, 0.08),
+        ("ery", "GATA1", 90.0, 0.25),  # x4.3, expressed in ery
+        ("hsc", "GATA2", 100.0, 0.24),
+        ("ery", "GATA2", 30.0, 0.10),  # x3.3 down, expressed in hsc
+        ("hsc", "GATA3", 0.0, 0.0),
+        ("ery", "GATA3", 9.0, 0.01),
+    ]  # x10 but in 1 % of cells: not listed
+    pd.DataFrame(rows, columns=["group", "gene", "cpm", "frac"]).assign(gene_id="x", counts=1).to_csv(
+        expr / "genes_by_group.tsv.gz", sep="\t", index=False
+    )
+    meta = tmp_path / "meta.tsv"
+    meta.write_text("name\tTF\nGATA_0\tGATA1,GATA2,GATA3,TRPS1\n")
+    coop = tmp_path / "coop"
+    (coop / "combined").mkdir(parents=True)
+    (coop / "official").mkdir()
+    (coop / "combined" / "changes_tfs.tsv").write_text("comparison\tgroup_a\tgroup_b\ttf\nh_e\thsc\tery\tGATA\n")
+    te.main(["annotate", "--expression", str(expr), "--motif-metadata", str(meta), "--coop", str(coop)])
+    r = pd.read_csv(coop / "expression" / "combined" / "changes_tfs.tsv", sep="\t").iloc[0]
+    assert r["tf_top_gene_a"] == "TRPS1" and not r["expression_changes"]
+    assert r["members_up"] == "GATA1(x4.3)" and r["members_down"] == "GATA2(x3.3)" and r["members_changed"] == 2
